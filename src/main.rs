@@ -21,7 +21,7 @@ enum AppMsg {
     Progress(usize, usize),
     Error(String),
     Finished,
-    AnalysisResult(f32), // Nowa wiadomość z wynikiem analizy
+    AnalysisResult(f32),
 }
 
 struct AudioBatchApp {
@@ -30,8 +30,8 @@ struct AudioBatchApp {
     normalize_volume: bool,
     target_lufs: f32,
     is_processing: bool,
-    is_analyzing: bool, // Nowy stan
-    average_lufs: Option<f32>, // Przechowywanie wyniku analizy
+    is_analyzing: bool,
+    average_lufs: Option<f32>,
     logs: Vec<String>,
     current_progress: usize,
     total_files: usize,
@@ -45,7 +45,7 @@ impl Default for AudioBatchApp {
         Self {
             input_dir: String::new(),
             output_dir: String::new(),
-            normalize_volume: false, // Zmieniono z true na false
+            normalize_volume: false,
             target_lufs: -14.0,
             is_processing: false,
             is_analyzing: false,
@@ -65,7 +65,7 @@ impl AudioBatchApp {
             let folder_path = path.to_path_buf();
             self.is_analyzing = true;
             self.average_lufs = None;
-            self.logs.push(format!("Rozpoczęto analizę folderu: {}", folder_path.display()));
+            self.logs.push(format!("Started folder analysis: {}", folder_path.display()));
             
             let tx = self.sender.clone();
             thread::spawn(move || {
@@ -95,9 +95,9 @@ impl AudioBatchApp {
                 if count > 0 {
                     let avg = sum_lufs / count as f32;
                     let _ = tx.send(AppMsg::AnalysisResult(avg));
-                    let _ = tx.send(AppMsg::Log(format!("Analiza zakończona. Średni LUFS: {:.2}", avg)));
+                    let _ = tx.send(AppMsg::Log(format!("Analysis finished. Average LUFS: {:.2}", avg)));
                 } else {
-                    let _ = tx.send(AppMsg::Error("Nie znaleziono plików audio do analizy.".into()));
+                    let _ = tx.send(AppMsg::Error("No audio files found for analysis.".into()));
                 }
                 let _ = tx.send(AppMsg::Finished);
                 ctx.request_repaint();
@@ -123,7 +123,7 @@ impl AudioBatchApp {
         let tx = self.sender.clone();
 
         thread::spawn(move || {
-            let _ = tx.send(AppMsg::Log("Rozpoczęto skanowanie katalogu...".into()));
+            let _ = tx.send(AppMsg::Log("Scanning directory...".into()));
             ctx.request_repaint();
 
             let files: Vec<PathBuf> = WalkDir::new(&input_path)
@@ -139,15 +139,15 @@ impl AudioBatchApp {
 
             for (i, file) in files.iter().enumerate() {
                 if let Err(e) = process_single_file(file, &input_path, &output_path, lufs_option) {
-                    let _ = tx.send(AppMsg::Error(format!("Błąd {}: {}", file.display(), e)));
+                    let _ = tx.send(AppMsg::Error(format!("Error {}: {}", file.display(), e)));
                 } else {
-                    let _ = tx.send(AppMsg::Log(format!("Przetworzono: {}", file.display())));
+                    let _ = tx.send(AppMsg::Log(format!("Processed: {}", file.display())));
                 }
                 let _ = tx.send(AppMsg::Progress(i + 1, total));
                 ctx.request_repaint();
             }
 
-            let _ = tx.send(AppMsg::Log("Przetwarzanie zakończone.".into()));
+            let _ = tx.send(AppMsg::Log("Processing finished.".into()));
             let _ = tx.send(AppMsg::Finished);
             ctx.request_repaint();
         });
@@ -179,13 +179,13 @@ impl eframe::App for AudioBatchApp {
         self.handle_messages();
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Voice-Over compression and normalization (ADPCM 4-bit)");
+            ui.heading("Voice-Over Compression and Normalization (ADPCM 4-bit)");
 
             ui.add_space(10.0);
             ui.group(|ui| {
-                ui.label("Ustawienia ścieżek:");
+                ui.label("Path Settings:");
                 ui.horizontal(|ui| {
-                    ui.label("Źródło: ");
+                    ui.label("Source: ");
                     ui.text_edit_singleline(&mut self.input_dir);
                     if ui.button("📁").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
@@ -195,7 +195,7 @@ impl eframe::App for AudioBatchApp {
                 });
 
                 ui.horizontal(|ui| {
-                    ui.label("Wynik:  ");
+                    ui.label("Output: ");
                     ui.text_edit_singleline(&mut self.output_dir);
                     if ui.button("📁").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
@@ -208,18 +208,18 @@ impl eframe::App for AudioBatchApp {
             ui.add_space(10.0);
             
             ui.group(|ui| {
-                ui.label("Głośność (Loudness):");
+                ui.label("Loudness:");
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.normalize_volume, "Normalizuj głośność");
+                    ui.checkbox(&mut self.normalize_volume, "Normalize volume");
                     
-                    if ui.button("🔍 Zbadaj głośność folderu...").on_hover_text("Wybierz folder, aby sprawdzić jego średni poziom głośności").clicked() {
+                    if ui.button("🔍 Analyze folder loudness...").on_hover_text("Select a folder to check its average loudness level").clicked() {
                         self.start_analysis(ctx.clone());
                     }
                 });
 
                 if let Some(avg) = self.average_lufs {
-                    ui.colored_label(egui::Color32::KHAKI, format!("Średni poziom Twoich plików: {:.2} LUFS", avg));
-                    if ui.button("Ustaw jako docelowy").clicked() {
+                    ui.colored_label(egui::Color32::KHAKI, format!("Average level of your files: {:.2} LUFS", avg));
+                    if ui.button("Set as target").clicked() {
                         self.target_lufs = avg.round();
                     }
                 }
@@ -227,7 +227,7 @@ impl eframe::App for AudioBatchApp {
                 ui.add_enabled_ui(self.normalize_volume, |ui| {
                     ui.add(
                         egui::Slider::new(&mut self.target_lufs, -23.0..=-6.0)
-                            .text("Docelowy LUFS-I"),
+                            .text("Target LUFS-I"),
                     );
                 });
             });
@@ -236,14 +236,14 @@ impl eframe::App for AudioBatchApp {
             
             let can_start = !self.is_processing && !self.is_analyzing && !self.input_dir.is_empty() && !self.output_dir.is_empty();
             ui.add_enabled_ui(can_start, |ui| {
-                if ui.button("🚀 ROZPOCZNIJ PRZETWARZANIE").clicked() {
+                if ui.button("🚀 START PROCESSING").clicked() {
                     self.start_processing(ctx.clone());
                 }
             });
 
             if self.is_processing || self.is_analyzing {
                 ui.add_space(10.0);
-                let label = if self.is_analyzing { "Analizowanie..." } else { "Przetwarzanie..." };
+                let label = if self.is_analyzing { "Analyzing..." } else { "Processing..." };
                 let progress = if self.total_files > 0 {
                     self.current_progress as f32 / self.total_files as f32
                 } else {
@@ -257,7 +257,7 @@ impl eframe::App for AudioBatchApp {
 
             ui.add_space(10.0);
             ui.separator();
-            ui.label("Logi:");
+            ui.label("Logs:");
             
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -276,7 +276,6 @@ impl eframe::App for AudioBatchApp {
     }
 }
 
-// Pomocnicza funkcja do pobierania statystyk bez pełnego procesu
 fn get_file_stats(input: &Path) -> Result<LoudnormStats> {
     let filter = "loudnorm=I=-14:TP=-1.5:LRA=1.0:print_format=json";
     let output = Command::new("ffmpeg")
@@ -285,7 +284,7 @@ fn get_file_stats(input: &Path) -> Result<LoudnormStats> {
         .args(["-vn", "-af", filter, "-f", "null", "-"])
         .stderr(Stdio::piped())
         .output()
-        .context("Błąd FFmpeg podczas analizy")?;
+        .context("FFmpeg error during analysis")?;
 
     let stderr_str = String::from_utf8_lossy(&output.stderr);
     extract_loudnorm_stats(&stderr_str)
@@ -319,19 +318,19 @@ fn process_single_file(
     cmd.args(["-c:a", "adpcm_ima_wav"]).arg(&output);
 
     let final_output = cmd.stderr(Stdio::piped()).output()
-        .context("Nie udało się uruchomić ffmpeg (Konwersja)")?;
+        .context("Failed to run FFmpeg (Conversion)")?;
 
     if !final_output.status.success() {
         let err = String::from_utf8_lossy(&final_output.stderr);
-        return Err(anyhow!("Błąd FFmpeg: {}", err));
+        return Err(anyhow!("FFmpeg Error: {}", err));
     }
 
     Ok(())
 }
 
 fn extract_loudnorm_stats(stderr: &str) -> Result<LoudnormStats> {
-    let start_idx = stderr.rfind("{").context("Brak JSON w wyjściu ffmpeg")?;
-    let end_idx = stderr.rfind("}").context("Brak JSON w wyjściu ffmpeg")?;
+    let start_idx = stderr.rfind("{").context("Missing JSON in FFmpeg output")?;
+    let end_idx = stderr.rfind("}").context("Missing JSON in FFmpeg output")?;
     let json_str = &stderr[start_idx..=end_idx];
     let stats: LoudnormStats = serde_json::from_str(json_str)?;
     Ok(stats)

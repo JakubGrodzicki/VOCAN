@@ -187,7 +187,7 @@ impl eframe::App for AudioBatchApp {
                 ui.horizontal(|ui| {
                     ui.label("Source: ");
                     ui.text_edit_singleline(&mut self.input_dir);
-                    if ui.button("📁").clicked() {
+                    if ui.button("Browse...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.input_dir = path.display().to_string();
                         }
@@ -197,7 +197,7 @@ impl eframe::App for AudioBatchApp {
                 ui.horizontal(|ui| {
                     ui.label("Output: ");
                     ui.text_edit_singleline(&mut self.output_dir);
-                    if ui.button("📁").clicked() {
+                    if ui.button("Browse...").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.output_dir = path.display().to_string();
                         }
@@ -212,7 +212,7 @@ impl eframe::App for AudioBatchApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.normalize_volume, "Normalize volume");
                     
-                    if ui.button("🔍 Analyze folder loudness...").on_hover_text("Select a folder to check its average loudness level").clicked() {
+                    if ui.button("Analyze folder loudness...").on_hover_text("Select a folder to check its average loudness level").clicked() {
                         self.start_analysis(ctx.clone());
                     }
                 });
@@ -236,14 +236,14 @@ impl eframe::App for AudioBatchApp {
             
             let can_start = !self.is_processing && !self.is_analyzing && !self.input_dir.is_empty() && !self.output_dir.is_empty();
             ui.add_enabled_ui(can_start, |ui| {
-                if ui.button("🚀 START PROCESSING").clicked() {
+                if ui.button("START PROCESSING").clicked() {
                     self.start_processing(ctx.clone());
                 }
             });
 
             if self.is_processing || self.is_analyzing {
                 ui.add_space(10.0);
-                let label = if self.is_analyzing { "Analyzing..." } else { "Processing..." };
+                let label = if self.is_analyzing { "Analyzing" } else { "Processing" };
                 let progress = if self.total_files > 0 {
                     self.current_progress as f32 / self.total_files as f32
                 } else {

@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use serde::Deserialize;

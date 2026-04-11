@@ -108,7 +108,7 @@ Files with other extensions are ignored to avoid processing sidecar metadata.
 
 ## License
 
-This project is distributed under the MIT License. See the `LICENSE` file for details (if included). The `ffmpeg` binary is subject to its own license terms (LGPL/GPL).
+This project is distributed under the MIT License. The `ffmpeg` binary is subject to its own license terms (LGPL/GPL).
 
 ## Contributing
 

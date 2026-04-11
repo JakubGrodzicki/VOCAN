@@ -54,14 +54,14 @@ The _Analyze folder loudness_ feature scans an entire directory (recursively), m
 
 ### Pre‑built Binary (Windows / Linux)
 
-1. Download the latest release from the [Releases](https://github.com/yourusername/vocan/releases) page.
+1. Download the latest release from the [Releases](https://github.com/JakubGrodzicki/VOCAN/releases/tag/Production) page.
 2. Place `ffmpeg.exe` (Windows) or `ffmpeg` (Linux) in the same folder as `vocan`.
 3. Run the executable.
 
 ### Building from Source
 
 ```bash
-git clone [https://github.com/yourusername/vocan.git](https://github.com/yourusername/vocan.git)
+git clone git@github.com:JakubGrodzicki/VOCAN.git
 cd vocan
 cargo build --release
 ```

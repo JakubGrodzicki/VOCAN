@@ -8,7 +8,7 @@ use std::thread;
 use walkdir::WalkDir;
 
 // ---------------------------------------------------------------------------
-// Typy danych
+// Data Types
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Debug)]
@@ -20,15 +20,15 @@ struct LoudnormStats {
     target_offset: String,
 }
 
-/// Opisuje metodę normalizacji użytą dla pliku — używane do logowania.
+/// Describes the normalization method used for a file — used for logging.
 enum NormResult {
-    /// Standardowy 2-pass EBU R128 (pliki >= ~3s).
+    /// Standard 2-pass EBU R128 (files >= ~3s).
     Standard,
-    /// 2-pass EBU R128 z paddingiem ciszą (pliki ~1-3s, zwracające -inf bez paddingu).
+    /// 2-pass EBU R128 with silence padding (files ~1-3s, returning -inf without padding).
     Padded,
-    /// Normalizacja szczytowa (pliki < 1s, zbyt krótkie dla calkowan ia EBU R128).
+    /// Peak normalization (files < 1s, too short for EBU R128 integration).
     Peak { gain_db: f32 },
-    /// Konwersja bez normalizacji (skrajny fallback — sygnał cichy lub pusty).
+    /// Conversion without normalization (extreme fallback — silent or empty signal).
     Skipped,
 }
 
@@ -41,7 +41,7 @@ enum AppMsg {
 }
 
 // ---------------------------------------------------------------------------
-// Stan aplikacji
+// Application State
 // ---------------------------------------------------------------------------
 
 struct AudioBatchApp {
@@ -49,7 +49,7 @@ struct AudioBatchApp {
     output_dir: String,
     normalize_volume: bool,
     target_lufs: f32,
-    /// Docelowy peak (dBFS) uzywany dla plikow < 1s (peak normalization).
+    /// Target peak (dBFS) used for files < 1s (peak normalization).
     target_peak_dbfs: f32,
     is_processing: bool,
     is_analyzing: bool,
@@ -380,7 +380,7 @@ impl eframe::App for AudioBatchApp {
 }
 
 // ---------------------------------------------------------------------------
-// FFmpeg helpers — wykrywanie
+// FFmpeg helpers — Detection
 // ---------------------------------------------------------------------------
 
 /// Resolves the ffmpeg executable path.
@@ -424,13 +424,13 @@ fn find_ffmpeg() -> Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// FFmpeg helpers — pomiary
+// FFmpeg helpers — Measurements
 // ---------------------------------------------------------------------------
 
-/// Zwraca sample rate pliku zrodlowego.
+/// Returns the sample rate of the source file.
 ///
-/// Loudnorm wewnetrznie resampluje do 192 kHz — bez jawnego `-ar` kodek
-/// ADPCM IMA WAV moze dostac nieprawidlowa czestotliwosc probkowania.
+/// Loudnorm internally resamples to 192 kHz — without an explicit `-ar`, the
+/// ADPCM IMA WAV codec might receive an incorrect sampling frequency.
 fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
     let output = Command::new(ffmpeg)
         .args(["-hide_banner", "-i"])
@@ -453,7 +453,7 @@ fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
     None
 }
 
-/// Zwraca czas trwania pliku w sekundach.
+/// Returns the duration of the file in seconds.
 fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
     let output = Command::new(ffmpeg)
         .args(["-hide_banner", "-i"])
@@ -484,10 +484,10 @@ fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
     None
 }
 
-/// Mierzy zintegrowana glosnosc (LUFS-I) do analizy pogladowej foldera.
+/// Measures the integrated loudness (LUFS-I) for folder overview analysis.
 ///
-/// Uzywa standardowego EBU R128 bez paddingu — plik < ~3s zwroci `None`.
-/// `measured_I` jest niezalezne od wybranego targetu, wiec uzywamy -23 LUFS (EBU R128).
+/// Uses standard EBU R128 without padding — files < ~3s will return `None`.
+/// `measured_I` is independent of the selected target, so we use -23 LUFS (EBU R128).
 fn measure_lufs(input: &Path, ffmpeg: &Path) -> Result<Option<f32>> {
     let filter = "loudnorm=I=-23:TP=-1.5:LRA=1.0:print_format=json";
     let output = Command::new(ffmpeg)
@@ -507,10 +507,10 @@ fn measure_lufs(input: &Path, ffmpeg: &Path) -> Result<Option<f32>> {
     }
 }
 
-/// Pass 1 normalizacji (standardowy, bez paddingu).
+/// Normalization Pass 1 (standard, no padding).
 ///
-/// Zwraca `None` gdy `measured_I = -inf` (plik za krotki).
-/// Target musi byc identyczny z pass 2 — `target_offset` jest liczony wzgledem niego.
+/// Returns `None` when `measured_I = -inf` (file too short).
+/// The target must be identical to Pass 2 — `target_offset` is calculated relative to it.
 fn get_file_stats(
     input: &Path,
     ffmpeg: &Path,
@@ -537,21 +537,21 @@ fn get_file_stats(
     }
 }
 
-/// Pass 1 normalizacji z paddingiem ciszą — dla plikow ~1-3s.
+/// Normalization Pass 1 with silence padding — for files ~1-3s.
 ///
-/// Dopelnia sygnal ciszą do `pad_to_secs` sekund, dzieki czemu algorytm
-/// EBU R128 ma wystarczajaco blokow do analizy. Cisza jest ponizej progu
-/// bramkowania bezwzglednego (-70 LUFS), wiec nie zaburza wyniku `measured_I`.
+/// Pads the signal with silence to `pad_to_secs` seconds, ensuring the
+/// EBU R128 algorithm has enough blocks for analysis. Silence is below the
+/// absolute gating threshold (-70 LUFS), so it does not distort the `measured_I` result.
 ///
-/// Zwraca `None` jesli nawet z paddingiem pomiar sie nie powiedzie.
+/// Returns `None` if the measurement fails even with padding.
 fn get_file_stats_padded(
     input: &Path,
     ffmpeg: &Path,
     target_lufs: f32,
     pad_to_secs: f32,
 ) -> Result<Option<LoudnormStats>> {
-    // apad dodaje cisze na koncu; atrim przycina do pad_to_secs zeby nie
-    // tworzyc niepotrzebnie dlugich buforow w pamieci.
+    // apad adds silence at the end; atrim trims to pad_to_secs to avoid
+    // creating unnecessarily large memory buffers.
     let filter = format!(
         "apad=pad_dur={pad},atrim=end={pad},\
          loudnorm=I={target}:TP=-1.5:LRA=1.0:print_format=json",
@@ -575,7 +575,7 @@ fn get_file_stats_padded(
     }
 }
 
-/// Mierzy poziom szczytowy pliku (dBFS) filtrem `volumedetect`.
+/// Measures the file's peak level (dBFS) using the `volumedetect` filter.
 fn measure_peak_dbfs(input: &Path, ffmpeg: &Path) -> Result<f32> {
     let output = Command::new(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
@@ -587,7 +587,7 @@ fn measure_peak_dbfs(input: &Path, ffmpeg: &Path) -> Result<f32> {
 
     let stderr_str = String::from_utf8_lossy(&output.stderr);
 
-    // Format linii: "[Parsed_volumedetect_0 @ ...] max_volume: -3.5 dB"
+    // Line format: "[Parsed_volumedetect_0 @ ...] max_volume: -3.5 dB"
     for line in stderr_str.lines() {
         if line.contains("max_volume:") {
             let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -607,20 +607,20 @@ fn measure_peak_dbfs(input: &Path, ffmpeg: &Path) -> Result<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Przetwarzanie pliku
+// File Processing
 // ---------------------------------------------------------------------------
 
-/// Przetwarza jeden plik: hybryda normalizacji + konwersja do ADPCM IMA WAV.
+/// Processes a single file: hybrid normalization + conversion to ADPCM IMA WAV.
 ///
-/// Strategia normalizacji (gdy wlaczona przez uzytkownika):
+/// Normalization strategy (when enabled by user):
 ///
-///   1. Proba standardowego 2-pass loudnorm (pliki >= ~3s).
-///   2. Jesli measured_I = -inf, sprawdz czas trwania:
-///      a. >= 1s  -> 2-pass loudnorm z paddingiem ciszą do max(5s, czas+1s).
-///                   Pass 2 dziala na ORYGINALE — cisza w analizie jest gated out.
-///      b. < 1s   -> normalizacja szczytowa do `target_peak_dbfs`.
-///                   Gain ograniczony do +40 dB zeby nie wzmacniac szumu/ciszy.
-///   3. Skrajny fallback (sygnal pusty/cichy mimo paddingu): konwersja bez normalizacji.
+///   1. Attempt standard 2-pass loudnorm (files >= ~3s).
+///   2. If measured_I = -inf, check duration:
+///      a. >= 1s  -> 2-pass loudnorm with silence padding to max(5s, duration+1s).
+///                   Pass 2 operates on the ORIGINAL — padded silence is gated out.
+///      b. < 1s   -> Peak normalization to `target_peak_dbfs`.
+///                   Gain capped at +40 dB to avoid amplifying noise/silence.
+///   3. Extreme fallback (silent/empty signal despite padding): convert without normalization.
 fn process_single_file(
     input: &Path,
     input_base: &Path,
@@ -642,7 +642,7 @@ fn process_single_file(
     cmd.args(["-y", "-hide_banner", "-i"]).arg(input).arg("-vn");
 
     let norm_result = if let Some(lufs) = target_lufs {
-        // --- Proba 1: standardowy 2-pass ---
+        // --- Attempt 1: standard 2-pass ---
         match get_file_stats(input, ffmpeg, lufs)? {
             Some(stats) => {
                 apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr);
@@ -652,28 +652,28 @@ fn process_single_file(
                 let duration = get_duration(input, ffmpeg).unwrap_or(0.0);
 
                 if duration >= 1.0 {
-                    // --- Proba 2: 2-pass z paddingiem (pliki ~1-3s) ---
-                    // Pad do max(5s, duration+1s) — pewna minimalna dlugosc dla EBU R128.
+                    // --- Attempt 2: 2-pass with padding (files ~1-3s) ---
+                    // Pad to max(5s, duration+1s) — ensuring a safe minimum length for EBU R128.
                     let pad_secs = f32::max(5.0, duration + 1.0);
                     match get_file_stats_padded(input, ffmpeg, lufs, pad_secs)? {
                         Some(stats) => {
-                            // Pass 2 na ORYGINALE (bez paddingu):
-                            // measured_* z analizy paddowanej sa prawidlowe,
-                            // bo cisza ponizej -70 LUFS jest gated out przez EBU R128.
+                            // Pass 2 on ORIGINAL (no padding):
+                            // measured_* from padded analysis are correct because
+                            // silence below -70 LUFS is gated out by EBU R128.
                             apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr);
                             NormResult::Padded
                         }
                         None => {
-                            // Nawet z paddingiem sygnal jest niesłyszalny.
+                            // Even with padding, the signal is inaudible.
                             NormResult::Skipped
                         }
                     }
                 } else {
-                    // --- Proba 3: peak normalization (pliki < 1s) ---
+                    // --- Attempt 3: peak normalization (files < 1s) ---
                     match measure_peak_dbfs(input, ffmpeg) {
                         Ok(peak_dbfs) if peak_dbfs.is_finite() => {
                             let gain_db = target_peak_dbfs - peak_dbfs;
-                            // Ogranicz gain — zbyt duze wzmocnienie oznacza pusty/szumowy sygnal.
+                            // Limit gain — too much amplification indicates an empty/noisy signal.
                             if gain_db <= 40.0 {
                                 cmd.args([
                                     "-af",
@@ -690,7 +690,7 @@ fn process_single_file(
             }
         }
     } else {
-        // Normalizacja wylaczona przez uzytkownika.
+        // Normalization disabled by user.
         NormResult::Skipped
     };
 
@@ -709,14 +709,14 @@ fn process_single_file(
     Ok(norm_result)
 }
 
-/// Aplikuje argumenty pass 2 loudnorm do istniejacego Command.
+/// Applies Pass 2 loudnorm arguments to an existing Command.
 ///
-/// Wydzielone do osobnej funkcji — uzywane zarowno dla sciezki standardowej
-/// jak i paddowanej, bo argumenty FFmpeg sa identyczne.
+/// Extracted to a separate function — used for both standard and padded paths,
+/// as the FFmpeg arguments are identical.
 ///
-/// LRA=1.0  — bardzo waska dynamika, minimalizuje bledy kwantyzacji 4-bit ADPCM.
-/// linear=true — czysty gain liniowy bez dodatkowej kompresji w pass 2.
-/// -ar — przywraca oryginalny sample rate po wewnetrznym resamplu loudnorm (192 kHz).
+/// LRA=1.0 — very narrow dynamic range, minimizes 4-bit ADPCM quantization errors.
+/// linear=true — clean linear gain without extra compression in Pass 2.
+/// -ar — restores original sample rate after internal loudnorm resampling (192 kHz).
 fn apply_loudnorm_pass2(
     cmd: &mut Command,
     target_lufs: f32,
@@ -746,7 +746,7 @@ fn extract_loudnorm_stats(stderr: &str) -> Result<LoudnormStats> {
 }
 
 // ---------------------------------------------------------------------------
-// main
+// Main
 // ---------------------------------------------------------------------------
 
 fn main() -> eframe::Result<()> {

@@ -61,7 +61,7 @@ The _Analyze folder loudness_ feature scans an entire directory (recursively), m
 ### Building from Source
 
 ```bash
-git clone [git@github.com:JakubGrodzicki/VOCAN.git](git@github.com:JakubGrodzicki/VOCAN.git)
+git clone git@github.com:JakubGrodzicki/VOCAN.git
 cd vocan
 cargo build --release
 ```

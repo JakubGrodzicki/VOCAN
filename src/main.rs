@@ -371,7 +371,7 @@ impl eframe::App for AudioBatchApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.automixer, "Automixer");
                     ui.label(
-                        egui::RichText::new("(EQ → De-esser → Compressor, applied before normalization)")
+                        egui::RichText::new("(EQ -> De-esser -> Compressor, applied before normalization)")
                             .weak()
                             .italics(),
                     );

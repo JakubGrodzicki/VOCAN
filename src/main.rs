@@ -4,7 +4,8 @@ use eframe::egui;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc::{self, Receiver, Sender}};
 use std::thread;
 use walkdir::WalkDir;
 
@@ -38,6 +39,7 @@ enum AppMsg {
     Progress(usize, usize),
     Error(String),
     Finished,
+    Stopped,
     AnalysisResult(f32),
 }
 
@@ -52,6 +54,8 @@ struct AudioBatchApp {
     target_lufs: f32,
     /// Target peak (dBFS) used for files < 1s (peak normalization).
     target_peak_dbfs: f32,
+    /// Applies a fixed processing chain (EQ → De-esser → Compressor) before normalization.
+    automixer: bool,
     is_processing: bool,
     is_analyzing: bool,
     average_lufs: Option<f32>,
@@ -61,6 +65,8 @@ struct AudioBatchApp {
     receiver: Receiver<AppMsg>,
     sender: Sender<AppMsg>,
     ffmpeg_path: PathBuf,
+    /// Shared cancellation flag — set to `true` to request the worker thread to stop.
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl AudioBatchApp {
@@ -72,6 +78,7 @@ impl AudioBatchApp {
             normalize_volume: false,
             target_lufs: -14.0,
             target_peak_dbfs: -3.0,
+            automixer: false,
             is_processing: false,
             is_analyzing: false,
             average_lufs: None,
@@ -81,6 +88,7 @@ impl AudioBatchApp {
             receiver,
             sender,
             ffmpeg_path,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -89,16 +97,18 @@ impl AudioBatchApp {
             let folder_path = path.to_path_buf();
             self.is_analyzing = true;
             self.average_lufs = None;
+            self.cancel_flag.store(false, Ordering::Relaxed);
             self.logs
                 .push(format!("Started folder analysis: {}", folder_path.display()));
 
             let tx = self.sender.clone();
             let ffmpeg_path = self.ffmpeg_path.clone();
+            let cancel = Arc::clone(&self.cancel_flag);
             thread::spawn(move || {
                 let files: Vec<PathBuf> = WalkDir::new(&folder_path)
                     .into_iter()
                     .filter_map(|e| e.ok())
-                    .filter(|e| e.file_type().is_file())
+                    .filter(|e| e.file_type().is_file() && is_audio_file(e.path()))
                     .map(|e| e.path().to_path_buf())
                     .collect();
 
@@ -107,6 +117,13 @@ impl AudioBatchApp {
                 let mut count = 0usize;
 
                 for (i, file) in files.iter().enumerate() {
+                    if cancel.load(Ordering::Relaxed) {
+                        let _ = tx.send(AppMsg::Log("Analysis stopped by user.".into()));
+                        let _ = tx.send(AppMsg::Stopped);
+                        ctx.request_repaint();
+                        return;
+                    }
+
                     let _ = tx.send(AppMsg::Progress(i + 1, total));
                     ctx.request_repaint();
 
@@ -154,6 +171,7 @@ impl AudioBatchApp {
         self.logs.clear();
         self.current_progress = 0;
         self.total_files = 0;
+        self.cancel_flag.store(false, Ordering::Relaxed);
 
         let input_path = PathBuf::from(&self.input_dir);
         let output_path = PathBuf::from(&self.output_dir);
@@ -164,9 +182,11 @@ impl AudioBatchApp {
             None
         };
         let target_peak = self.target_peak_dbfs;
+        let automixer = self.automixer;
 
         let tx = self.sender.clone();
         let ffmpeg_path = self.ffmpeg_path.clone();
+        let cancel = Arc::clone(&self.cancel_flag);
 
         thread::spawn(move || {
             let _ = tx.send(AppMsg::Log("Scanning directory...".into()));
@@ -175,7 +195,7 @@ impl AudioBatchApp {
             let files: Vec<PathBuf> = WalkDir::new(&input_path)
                 .into_iter()
                 .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
+                .filter(|e| e.file_type().is_file() && is_audio_file(e.path()))
                 .map(|e| e.path().to_path_buf())
                 .collect();
 
@@ -184,12 +204,20 @@ impl AudioBatchApp {
             ctx.request_repaint();
 
             for (i, file) in files.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(AppMsg::Log("Processing stopped by user.".into()));
+                    let _ = tx.send(AppMsg::Stopped);
+                    ctx.request_repaint();
+                    return;
+                }
+
                 match process_single_file(
                     file,
                     &input_path,
                     &output_path,
                     lufs_option,
                     target_peak,
+                    automixer,
                     &ffmpeg_path,
                 ) {
                     Err(e) => {
@@ -247,6 +275,10 @@ impl AudioBatchApp {
                     self.total_files = total;
                 }
                 AppMsg::Finished => {
+                    self.is_processing = false;
+                    self.is_analyzing = false;
+                }
+                AppMsg::Stopped => {
                     self.is_processing = false;
                     self.is_analyzing = false;
                 }
@@ -333,6 +365,27 @@ impl eframe::App for AudioBatchApp {
                 });
             });
 
+            ui.add_space(10.0);
+
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.automixer, "Automixer");
+                    ui.label(
+                        egui::RichText::new("(EQ → De-esser → Compressor, applied before normalization)")
+                            .weak()
+                            .italics(),
+                    );
+                });
+                if self.automixer {
+                    ui.add_space(4.0);
+                    let warning = "⚠  Attention! There is no way to create a universal mixing \
+                        tool. This is the closest I can think of to a universal mixing chain \
+                        without doing proper mixing, but the results may drastically vary based \
+                        on the provided material. Use with caution!";
+                    ui.colored_label(egui::Color32::from_rgb(255, 200, 80), warning);
+                }
+            });
+
             ui.add_space(15.0);
 
             let can_start = !self.is_processing
@@ -353,10 +406,26 @@ impl eframe::App for AudioBatchApp {
                 } else {
                     0.0
                 };
-                ui.add(egui::ProgressBar::new(progress).text(format!(
-                    "{}: {}/{}",
-                    label, self.current_progress, self.total_files
-                )));
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .text(format!(
+                                "{}: {}/{}",
+                                label, self.current_progress, self.total_files
+                            ))
+                            .desired_width(ui.available_width() - 80.0),
+                    );
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("⏹ Stop").color(egui::Color32::from_rgb(255, 90, 90)),
+                        ))
+                        .on_hover_text("Stop after the current file finishes")
+                        .clicked()
+                    {
+                        self.cancel_flag.store(true, Ordering::Relaxed);
+                        self.logs.push("Stop requested — waiting for current file...".into());
+                    }
+                });
             }
 
             ui.add_space(10.0);
@@ -384,7 +453,20 @@ impl eframe::App for AudioBatchApp {
 // FFmpeg helpers — Detection
 // ---------------------------------------------------------------------------
 
-/// Resolves the ffmpeg executable path.
+/// Returns `true` for file extensions that ffmpeg can decode as audio.
+/// Used to skip sidecar files (.reapeaks, .txt, .png, etc.) that WalkDir picks up.
+fn is_audio_file(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "wav" | "wave" | "mp3" | "flac" | "aiff" | "aif" | "ogg" | "opus"
+                | "m4a" | "aac" | "wma" | "mp2" | "ac3" | "dts" | "mka"
+        )
+    )
+}
 ///
 /// Priority:
 ///   1. `ffmpeg` available on PATH (verified by running `ffmpeg -version`)
@@ -516,11 +598,16 @@ fn get_file_stats(
     input: &Path,
     ffmpeg: &Path,
     target_lufs: f32,
+    prefix: Option<&str>,
 ) -> Result<Option<LoudnormStats>> {
-    let filter = format!(
+    let loudnorm = format!(
         "loudnorm=I={target}:TP=-1.5:LRA=1.0:print_format=json",
         target = target_lufs
     );
+    let filter = match prefix {
+        Some(p) => format!("{},{}", p, loudnorm),
+        None => loudnorm,
+    };
     let output = Command::new(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
@@ -550,15 +637,23 @@ fn get_file_stats_padded(
     ffmpeg: &Path,
     target_lufs: f32,
     pad_to_secs: f32,
+    prefix: Option<&str>,
 ) -> Result<Option<LoudnormStats>> {
     // apad adds silence at the end; atrim trims to pad_to_secs to avoid
     // creating unnecessarily large memory buffers.
-    let filter = format!(
-        "apad=pad_dur={pad},atrim=end={pad},\
-         loudnorm=I={target}:TP=-1.5:LRA=1.0:print_format=json",
-        pad = pad_to_secs,
-        target = target_lufs,
+    let loudnorm = format!(
+        "loudnorm=I={target}:TP=-1.5:LRA=1.0:print_format=json",
+        target = target_lufs
     );
+    let pad_chain = format!(
+        "apad=pad_dur={pad},atrim=end={pad},{loudnorm}",
+        pad = pad_to_secs,
+        loudnorm = loudnorm,
+    );
+    let filter = match prefix {
+        Some(p) => format!("{},{}", p, pad_chain),
+        None => pad_chain,
+    };
     let output = Command::new(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
@@ -577,11 +672,15 @@ fn get_file_stats_padded(
 }
 
 /// Measures the file's peak level (dBFS) using the `volumedetect` filter.
-fn measure_peak_dbfs(input: &Path, ffmpeg: &Path) -> Result<f32> {
+fn measure_peak_dbfs(input: &Path, ffmpeg: &Path, prefix: Option<&str>) -> Result<f32> {
+    let filter = match prefix {
+        Some(p) => format!("{},volumedetect", p),
+        None => "volumedetect".to_string(),
+    };
     let output = Command::new(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
-        .args(["-vn", "-af", "volumedetect", "-f", "null", "-"])
+        .args(["-vn", "-af", &filter, "-f", "null", "-"])
         .stderr(Stdio::piped())
         .output()
         .context("FFmpeg error during peak measurement")?;
@@ -608,6 +707,62 @@ fn measure_peak_dbfs(input: &Path, ffmpeg: &Path) -> Result<f32> {
 }
 
 // ---------------------------------------------------------------------------
+// Automixer chain
+// ---------------------------------------------------------------------------
+
+/// Builds a fixed processing filter chain intended as a "closest-to-universal"
+/// mixing pre-processor for voice-over material.
+///
+/// Chain order: EQ → De-esser → Compressor
+///
+/// EQ bands:
+///   - HPF  70 Hz, Q 1.0, 18 dB/oct (3-pole) — remove rumble and proximity buildup
+///   - Bell  90 Hz, Q 2.478, −2.0 dB          — tighten low-mid mud
+///   - Bell 175 Hz, Q 1.0,   −2.22 dB         — reduce boxy buildup
+///   - Bell 360 Hz, Q 1.0,   −1.23 dB         — reduce nasal honk
+///   - Bell 1350 Hz, Q 1.4,  +1.4 dB          — add presence / intelligibility
+///   - Bell 4246 Hz, Q 2.0,  −1.36 dB         — tame harshness
+///   - High shelf 8000 Hz, Q 1.0, +1.0 dB     — gentle air boost
+///
+/// De-esser: balanced intensity, targeting the 6–8 kHz sibilance band.
+/// Compressor: heavy (−12 dB threshold, 4:1 ratio) with 4 dB makeup gain.
+fn automixer_filter_chain() -> String {
+    // 18 dB/oct HPF at 70 Hz:
+    // ffmpeg's `highpass` supports only 1 or 2 poles natively.
+    // We cascade a 2-pole (12 dB/oct, Q=1.0) and a 1-pole (6 dB/oct) to get 18 dB/oct
+    // while preserving the Q=1.0 character on the resonant section.
+    let hpf = "highpass=f=70:poles=2:width_type=q:width=1.0,highpass=f=70:poles=1";
+
+    // Bell / peaking filters via `equalizer` (width_type=q → Q factor).
+    let eq_90   = "equalizer=f=90:width_type=q:width=2.478:g=-2.0";
+    let eq_175  = "equalizer=f=175:width_type=q:width=1.0:g=-2.22";
+    let eq_360  = "equalizer=f=360:width_type=q:width=1.0:g=-1.23";
+    let eq_1350 = "equalizer=f=1350:width_type=q:width=1.4:g=1.4";
+    let eq_4246 = "equalizer=f=4246:width_type=q:width=2.0:g=-1.36";
+
+    // High shelf at 8 kHz.
+    let shelf_8k = "highshelf=f=8000:width_type=q:width=1.0:g=1.0";
+
+    // De-esser — balanced: intensity 0.4, max de-essing 0.5, center ~0.5 (≈ 7 kHz).
+    // s=o → output the de-essed signal (not the raw side chain).
+    let deesser = "deesser=i=0.4:m=0.5:f=0.5:s=o";
+
+    // Compressor — heavy but musical.
+    //   threshold: −12 dBFS → linear amplitude ≈ 0.251  (10^(−12/20))
+    //   ratio: 4:1
+    //   attack: 5 ms  — fast enough to catch transients without choking them
+    //   release: 80 ms — natural decay for speech
+    //   makeup: 4 dB  — compensate for gain reduction
+    let comp = "acompressor=threshold=0.251:ratio=4:attack=5:release=80:makeup=4";
+
+    // hpf already contains a comma-separated pair, so join everything manually.
+    format!(
+        "{},{},{},{},{},{},{},{},{}",
+        hpf, eq_90, eq_175, eq_360, eq_1350, eq_4246, shelf_8k, deesser, comp
+    )
+}
+
+// ---------------------------------------------------------------------------
 // File Processing
 // ---------------------------------------------------------------------------
 
@@ -628,6 +783,7 @@ fn process_single_file(
     output_base: &Path,
     target_lufs: Option<f32>,
     target_peak_dbfs: f32,
+    automixer: bool,
     ffmpeg: &Path,
 ) -> Result<NormResult> {
     let rel_path = input.strip_prefix(input_base)?;
@@ -639,14 +795,22 @@ fn process_single_file(
 
     let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
 
+    // Build optional automixer prefix — applied before any normalization filter.
+    let automixer_chain: Option<String> = if automixer {
+        Some(automixer_filter_chain())
+    } else {
+        None
+    };
+    let prefix: Option<&str> = automixer_chain.as_deref();
+
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-y", "-hide_banner", "-i"]).arg(input).arg("-vn");
 
     let norm_result = if let Some(lufs) = target_lufs {
         // --- Attempt 1: standard 2-pass ---
-        match get_file_stats(input, ffmpeg, lufs)? {
+        match get_file_stats(input, ffmpeg, lufs, prefix)? {
             Some(stats) => {
-                apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr);
+                apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, prefix);
                 NormResult::Standard
             }
             None => {
@@ -654,44 +818,55 @@ fn process_single_file(
 
                 if duration >= 1.0 {
                     // --- Attempt 2: 2-pass with padding (files ~1-3s) ---
-                    // Pad to max(5s, duration+1s) — ensuring a safe minimum length for EBU R128.
                     let pad_secs = f32::max(5.0, duration + 1.0);
-                    match get_file_stats_padded(input, ffmpeg, lufs, pad_secs)? {
+                    match get_file_stats_padded(input, ffmpeg, lufs, pad_secs, prefix)? {
                         Some(stats) => {
-                            // Pass 2 on ORIGINAL (no padding):
-                            // measured_* from padded analysis are correct because
-                            // silence below -70 LUFS is gated out by EBU R128.
-                            apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr);
+                            apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, prefix);
                             NormResult::Padded
                         }
                         None => {
                             // Even with padding, the signal is inaudible.
+                            if let Some(p) = prefix {
+                                cmd.args(["-af", p]);
+                            }
                             NormResult::Skipped
                         }
                     }
                 } else {
                     // --- Attempt 3: peak normalization (files < 1s) ---
-                    match measure_peak_dbfs(input, ffmpeg) {
+                    match measure_peak_dbfs(input, ffmpeg, prefix) {
                         Ok(peak_dbfs) if peak_dbfs.is_finite() => {
                             let gain_db = target_peak_dbfs - peak_dbfs;
-                            // Limit gain — too much amplification indicates an empty/noisy signal.
                             if gain_db <= 40.0 {
-                                cmd.args([
-                                    "-af",
-                                    &format!("volume={gain:.4}dB", gain = gain_db),
-                                ]);
+                                let vol_filter = format!("volume={gain:.4}dB", gain = gain_db);
+                                let filter = match prefix {
+                                    Some(p) => format!("{},{}", p, vol_filter),
+                                    None => vol_filter,
+                                };
+                                cmd.args(["-af", &filter]);
                                 NormResult::Peak { gain_db }
                             } else {
+                                if let Some(p) = prefix {
+                                    cmd.args(["-af", p]);
+                                }
                                 NormResult::Skipped
                             }
                         }
-                        _ => NormResult::Skipped,
+                        _ => {
+                            if let Some(p) = prefix {
+                                cmd.args(["-af", p]);
+                            }
+                            NormResult::Skipped
+                        }
                     }
                 }
             }
         }
     } else {
         // Normalization disabled by user.
+        if let Some(p) = prefix {
+            cmd.args(["-af", p]);
+        }
         NormResult::Skipped
     };
 
@@ -723,8 +898,9 @@ fn apply_loudnorm_pass2(
     target_lufs: f32,
     stats: &LoudnormStats,
     source_sr: u32,
+    prefix: Option<&str>,
 ) {
-    let filter = format!(
+    let loudnorm = format!(
         "loudnorm=I={lufs}:TP=-1.5:LRA=1.0:\
          measured_I={mi}:measured_LRA={mlra}:measured_TP={mtp}:\
          measured_thresh={mt}:offset={off}:linear=true",
@@ -735,6 +911,10 @@ fn apply_loudnorm_pass2(
         mt = stats.input_thresh,
         off = stats.target_offset,
     );
+    let filter = match prefix {
+        Some(p) => format!("{},{}", p, loudnorm),
+        None => loudnorm,
+    };
     cmd.args(["-af", &filter, "-ar", &source_sr.to_string()]);
 }
 

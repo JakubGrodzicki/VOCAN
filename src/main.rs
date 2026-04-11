@@ -762,7 +762,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Audio Batch Converter Pro",
+        "VOCAN",
         options,
         Box::new(move |_cc| Box::new(AudioBatchApp::new(ffmpeg_path))),
     )

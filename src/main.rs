@@ -7,6 +7,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use walkdir::WalkDir;
 
+// ---------------------------------------------------------------------------
+// Typy danych
+// ---------------------------------------------------------------------------
+
 #[derive(Deserialize, Debug)]
 struct LoudnormStats {
     input_i: String,
@@ -14,6 +18,18 @@ struct LoudnormStats {
     input_lra: String,
     input_thresh: String,
     target_offset: String,
+}
+
+/// Opisuje metodę normalizacji użytą dla pliku — używane do logowania.
+enum NormResult {
+    /// Standardowy 2-pass EBU R128 (pliki >= ~3s).
+    Standard,
+    /// 2-pass EBU R128 z paddingiem ciszą (pliki ~1-3s, zwracające -inf bez paddingu).
+    Padded,
+    /// Normalizacja szczytowa (pliki < 1s, zbyt krótkie dla calkowan ia EBU R128).
+    Peak { gain_db: f32 },
+    /// Konwersja bez normalizacji (skrajny fallback — sygnał cichy lub pusty).
+    Skipped,
 }
 
 enum AppMsg {
@@ -24,11 +40,17 @@ enum AppMsg {
     AnalysisResult(f32),
 }
 
+// ---------------------------------------------------------------------------
+// Stan aplikacji
+// ---------------------------------------------------------------------------
+
 struct AudioBatchApp {
     input_dir: String,
     output_dir: String,
     normalize_volume: bool,
     target_lufs: f32,
+    /// Docelowy peak (dBFS) uzywany dla plikow < 1s (peak normalization).
+    target_peak_dbfs: f32,
     is_processing: bool,
     is_analyzing: bool,
     average_lufs: Option<f32>,
@@ -48,6 +70,7 @@ impl AudioBatchApp {
             output_dir: String::new(),
             normalize_volume: false,
             target_lufs: -14.0,
+            target_peak_dbfs: -3.0,
             is_processing: false,
             is_analyzing: false,
             average_lufs: None,
@@ -65,7 +88,8 @@ impl AudioBatchApp {
             let folder_path = path.to_path_buf();
             self.is_analyzing = true;
             self.average_lufs = None;
-            self.logs.push(format!("Started folder analysis: {}", folder_path.display()));
+            self.logs
+                .push(format!("Started folder analysis: {}", folder_path.display()));
 
             let tx = self.sender.clone();
             let ffmpeg_path = self.ffmpeg_path.clone();
@@ -85,8 +109,6 @@ impl AudioBatchApp {
                     let _ = tx.send(AppMsg::Progress(i + 1, total));
                     ctx.request_repaint();
 
-                    // measure_lufs używa stałego targetu -23 (EBU R128 standard) —
-                    // wartość measured_I jest niezależna od wybranego targetu.
                     match measure_lufs(file, &ffmpeg_path) {
                         Ok(Some(val)) => {
                             sum_lufs += val;
@@ -94,7 +116,7 @@ impl AudioBatchApp {
                         }
                         Ok(None) => {
                             let _ = tx.send(AppMsg::Log(format!(
-                                "Skipped (too short/quiet): {}",
+                                "Skipped in analysis (too short/quiet): {}",
                                 file.display()
                             )));
                         }
@@ -117,7 +139,7 @@ impl AudioBatchApp {
                     )));
                 } else {
                     let _ = tx.send(AppMsg::Error(
-                        "No audio files found for analysis, or all files are too short.".into(),
+                        "No valid audio files found for analysis.".into(),
                     ));
                 }
                 let _ = tx.send(AppMsg::Finished);
@@ -140,6 +162,7 @@ impl AudioBatchApp {
         } else {
             None
         };
+        let target_peak = self.target_peak_dbfs;
 
         let tx = self.sender.clone();
         let ffmpeg_path = self.ffmpeg_path.clone();
@@ -160,18 +183,47 @@ impl AudioBatchApp {
             ctx.request_repaint();
 
             for (i, file) in files.iter().enumerate() {
-                match process_single_file(file, &input_path, &output_path, lufs_option, &ffmpeg_path) {
+                match process_single_file(
+                    file,
+                    &input_path,
+                    &output_path,
+                    lufs_option,
+                    target_peak,
+                    &ffmpeg_path,
+                ) {
                     Err(e) => {
-                        let _ = tx.send(AppMsg::Error(format!("Error {}: {}", file.display(), e)));
-                    }
-                    Ok(skipped) if skipped => {
-                        let _ = tx.send(AppMsg::Log(format!(
-                            "Converted without normalization (too short/quiet): {}",
-                            file.display()
+                        let _ = tx.send(AppMsg::Error(format!(
+                            "Error {}: {}",
+                            file.display(),
+                            e
                         )));
                     }
-                    Ok(_) => {
-                        let _ = tx.send(AppMsg::Log(format!("Processed: {}", file.display())));
+                    Ok(norm_result) => {
+                        let msg = match norm_result {
+                            NormResult::Standard => {
+                                format!("Processed (LUFS 2-pass): {}", file.display())
+                            }
+                            NormResult::Padded => {
+                                format!(
+                                    "Processed (LUFS 2-pass + padding): {}",
+                                    file.display()
+                                )
+                            }
+                            NormResult::Peak { gain_db } => {
+                                format!(
+                                    "Processed (peak norm, gain {:.1} dB): {}",
+                                    gain_db,
+                                    file.display()
+                                )
+                            }
+                            NormResult::Skipped => {
+                                format!(
+                                    "Converted without normalization (silent/empty): {}",
+                                    file.display()
+                                )
+                            }
+                        };
+                        let _ = tx.send(AppMsg::Log(msg));
                     }
                 }
                 let _ = tx.send(AppMsg::Progress(i + 1, total));
@@ -205,6 +257,10 @@ impl AudioBatchApp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// UI
+// ---------------------------------------------------------------------------
+
 impl eframe::App for AudioBatchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_messages();
@@ -224,7 +280,6 @@ impl eframe::App for AudioBatchApp {
                         }
                     }
                 });
-
                 ui.horizontal(|ui| {
                     ui.label("Output: ");
                     ui.text_edit_singleline(&mut self.output_dir);
@@ -242,7 +297,6 @@ impl eframe::App for AudioBatchApp {
                 ui.label("Loudness:");
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.normalize_volume, "Normalize volume");
-
                     if ui
                         .button("Analyze folder loudness...")
                         .on_hover_text("Select a folder to check its average loudness level")
@@ -265,7 +319,15 @@ impl eframe::App for AudioBatchApp {
                 ui.add_enabled_ui(self.normalize_volume, |ui| {
                     ui.add(
                         egui::Slider::new(&mut self.target_lufs, -23.0..=-6.0)
-                            .text("Target LUFS-I"),
+                            .text("Target LUFS-I (files >= 1s)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.target_peak_dbfs, -12.0..=-1.0)
+                            .text("Target peak dBFS (files < 1s)"),
+                    )
+                    .on_hover_text(
+                        "Peak normalization used for very short samples (< 1s).\n\
+                         Recommended: -3 dBFS (safe headroom for 4-bit ADPCM).",
                     );
                 });
             });
@@ -318,7 +380,7 @@ impl eframe::App for AudioBatchApp {
 }
 
 // ---------------------------------------------------------------------------
-// FFmpeg helpers
+// FFmpeg helpers — wykrywanie
 // ---------------------------------------------------------------------------
 
 /// Resolves the ffmpeg executable path.
@@ -326,10 +388,7 @@ impl eframe::App for AudioBatchApp {
 /// Priority:
 ///   1. `ffmpeg` available on PATH (verified by running `ffmpeg -version`)
 ///   2. `ffmpeg.exe` / `ffmpeg` sitting next to the current executable
-///
-/// Returns an error if neither location yields a working binary.
 fn find_ffmpeg() -> Result<PathBuf> {
-    // 1. Try PATH first.
     let path_probe = Command::new("ffmpeg")
         .arg("-version")
         .stdout(Stdio::null())
@@ -340,19 +399,16 @@ fn find_ffmpeg() -> Result<PathBuf> {
         return Ok(PathBuf::from("ffmpeg"));
     }
 
-    // 2. Try the directory that contains our own .exe.
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             let candidate =
                 exe_dir.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
-
             if candidate.is_file() {
                 let local_probe = Command::new(&candidate)
                     .arg("-version")
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
-
                 if local_probe.map(|s| s.success()).unwrap_or(false) {
                     return Ok(candidate);
                 }
@@ -367,12 +423,72 @@ fn find_ffmpeg() -> Result<PathBuf> {
     ))
 }
 
-/// Mierzy zintegrowaną głośność (LUFS-I) pliku.
+// ---------------------------------------------------------------------------
+// FFmpeg helpers — pomiary
+// ---------------------------------------------------------------------------
+
+/// Zwraca sample rate pliku zrodlowego.
 ///
-/// Zwraca `Ok(None)` gdy plik jest za krótki lub za cichy (FFmpeg zwraca "-inf"),
-/// co jest typowe dla krótkich attack/SFX sampli (<3s).
+/// Loudnorm wewnetrznie resampluje do 192 kHz — bez jawnego `-ar` kodek
+/// ADPCM IMA WAV moze dostac nieprawidlowa czestotliwosc probkowania.
+fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-i"])
+        .arg(input)
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let tokens: Vec<&str> = stderr.split_whitespace().collect();
+    for window in tokens.windows(2) {
+        if window[1] == "Hz" {
+            if let Ok(sr) = window[0].trim_end_matches(',').parse::<u32>() {
+                if (8_000..=192_000).contains(&sr) {
+                    return Some(sr);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Zwraca czas trwania pliku w sekundach.
+fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-i"])
+        .arg(input)
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines() {
+        if line.contains("Duration:") {
+            // Format: "  Duration: HH:MM:SS.ms, start: ..."
+            for token in line.split_whitespace() {
+                let t = token.trim_end_matches(',');
+                let parts: Vec<&str> = t.split(':').collect();
+                if parts.len() == 3 {
+                    if let (Ok(h), Ok(m), Ok(s)) = (
+                        parts[0].parse::<f32>(),
+                        parts[1].parse::<f32>(),
+                        parts[2].parse::<f32>(),
+                    ) {
+                        return Some(h * 3600.0 + m * 60.0 + s);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Mierzy zintegrowana glosnosc (LUFS-I) do analizy pogladowej foldera.
+///
+/// Uzywa standardowego EBU R128 bez paddingu — plik < ~3s zwroci `None`.
+/// `measured_I` jest niezalezne od wybranego targetu, wiec uzywamy -23 LUFS (EBU R128).
 fn measure_lufs(input: &Path, ffmpeg: &Path) -> Result<Option<f32>> {
-    // Target LUFS w pass 1 nie wpływa na measured_I — używamy standardu EBU R128.
     let filter = "loudnorm=I=-23:TP=-1.5:LRA=1.0:print_format=json";
     let output = Command::new(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
@@ -387,21 +503,19 @@ fn measure_lufs(input: &Path, ffmpeg: &Path) -> Result<Option<f32>> {
 
     match stats.input_i.parse::<f32>() {
         Ok(val) if val.is_finite() && val >= -99.0 => Ok(Some(val)),
-        _ => Ok(None), // "-inf" lub inny nieprawidłowy wynik
+        _ => Ok(None),
     }
 }
 
-/// Pass 1 normalizacji: pełne dane loudnorm z właściwym target_lufs zadanym przez użytkownika.
+/// Pass 1 normalizacji (standardowy, bez paddingu).
 ///
-/// Zwraca `Ok(None)` gdy plik jest za krótki lub za cichy (measured_I = -inf),
-/// co uniemożliwia prawidłową normalizację 2-passową.
+/// Zwraca `None` gdy `measured_I = -inf` (plik za krotki).
+/// Target musi byc identyczny z pass 2 — `target_offset` jest liczony wzgledem niego.
 fn get_file_stats(
     input: &Path,
     ffmpeg: &Path,
     target_lufs: f32,
 ) -> Result<Option<LoudnormStats>> {
-    // WAŻNE: target w pass 1 musi być identyczny jak w pass 2, bo target_offset
-    // jest obliczany względem tego konkretnego targetu.
     let filter = format!(
         "loudnorm=I={target}:TP=-1.5:LRA=1.0:print_format=json",
         target = target_lufs
@@ -417,55 +531,104 @@ fn get_file_stats(
     let stderr_str = String::from_utf8_lossy(&output.stderr);
     let stats = extract_loudnorm_stats(&stderr_str)?;
 
-    // Odrzuć pliki z nieprawidłowym measured_I (-inf = za krótkie/ciche).
-    // Wbudowanie "-inf" do filter stringa pass 2 powoduje crash FFmpeg.
     match stats.input_i.parse::<f32>() {
         Ok(val) if val.is_finite() && val >= -99.0 => Ok(Some(stats)),
         _ => Ok(None),
     }
 }
 
-/// Odczytuje sample rate pliku źródłowego z stderr FFmpeg.
+/// Pass 1 normalizacji z paddingiem ciszą — dla plikow ~1-3s.
 ///
-/// Potrzebne, bo filtr `loudnorm` wewnętrznie resampluje do 192 kHz
-/// dla true-peak detection — bez jawnego `-ar` kodek ADPCM IMA WAV
-/// może dostać nieprawidłową częstotliwość próbkowania.
-fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
+/// Dopelnia sygnal ciszą do `pad_to_secs` sekund, dzieki czemu algorytm
+/// EBU R128 ma wystarczajaco blokow do analizy. Cisza jest ponizej progu
+/// bramkowania bezwzglednego (-70 LUFS), wiec nie zaburza wyniku `measured_I`.
+///
+/// Zwraca `None` jesli nawet z paddingiem pomiar sie nie powiedzie.
+fn get_file_stats_padded(
+    input: &Path,
+    ffmpeg: &Path,
+    target_lufs: f32,
+    pad_to_secs: f32,
+) -> Result<Option<LoudnormStats>> {
+    // apad dodaje cisze na koncu; atrim przycina do pad_to_secs zeby nie
+    // tworzyc niepotrzebnie dlugich buforow w pamieci.
+    let filter = format!(
+        "apad=pad_dur={pad},atrim=end={pad},\
+         loudnorm=I={target}:TP=-1.5:LRA=1.0:print_format=json",
+        pad = pad_to_secs,
+        target = target_lufs,
+    );
     let output = Command::new(ffmpeg)
-        .args(["-hide_banner", "-i"])
+        .args(["-y", "-hide_banner", "-i"])
         .arg(input)
+        .args(["-vn", "-af", &filter, "-f", "null", "-"])
         .stderr(Stdio::piped())
         .output()
-        .ok()?;
+        .context("FFmpeg error during padded loudnorm analysis (pass 1)")?;
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let stats = extract_loudnorm_stats(&stderr_str)?;
 
-    // FFmpeg wypisuje np. "44100 Hz" lub "48000 Hz" w opisie streamu.
-    // Parsujemy tokeny otaczające "Hz".
-    let tokens: Vec<&str> = stderr.split_whitespace().collect();
-    for window in tokens.windows(2) {
-        if window[1] == "Hz" {
-            if let Ok(sr) = window[0].trim_end_matches(',').parse::<u32>() {
-                if (8000..=192_000).contains(&sr) {
-                    return Some(sr);
+    match stats.input_i.parse::<f32>() {
+        Ok(val) if val.is_finite() && val >= -99.0 => Ok(Some(stats)),
+        _ => Ok(None),
+    }
+}
+
+/// Mierzy poziom szczytowy pliku (dBFS) filtrem `volumedetect`.
+fn measure_peak_dbfs(input: &Path, ffmpeg: &Path) -> Result<f32> {
+    let output = Command::new(ffmpeg)
+        .args(["-y", "-hide_banner", "-i"])
+        .arg(input)
+        .args(["-vn", "-af", "volumedetect", "-f", "null", "-"])
+        .stderr(Stdio::piped())
+        .output()
+        .context("FFmpeg error during peak measurement")?;
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+
+    // Format linii: "[Parsed_volumedetect_0 @ ...] max_volume: -3.5 dB"
+    for line in stderr_str.lines() {
+        if line.contains("max_volume:") {
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            for (i, token) in tokens.iter().enumerate() {
+                if *token == "max_volume:" {
+                    if let Some(val_str) = tokens.get(i + 1) {
+                        if let Ok(val) = val_str.parse::<f32>() {
+                            return Ok(val);
+                        }
+                    }
                 }
             }
         }
     }
-    None
+
+    Err(anyhow!("Could not parse max_volume from FFmpeg output"))
 }
 
-/// Przetwarza jeden plik: (opcjonalna normalizacja 2-pass) + konwersja do ADPCM IMA WAV.
+// ---------------------------------------------------------------------------
+// Przetwarzanie pliku
+// ---------------------------------------------------------------------------
+
+/// Przetwarza jeden plik: hybryda normalizacji + konwersja do ADPCM IMA WAV.
 ///
-/// Zwraca `Ok(true)` jeśli plik był za krótki/cichy i normalizacja została pominięta,
-/// `Ok(false)` jeśli wszystko przebiegło normalnie.
+/// Strategia normalizacji (gdy wlaczona przez uzytkownika):
+///
+///   1. Proba standardowego 2-pass loudnorm (pliki >= ~3s).
+///   2. Jesli measured_I = -inf, sprawdz czas trwania:
+///      a. >= 1s  -> 2-pass loudnorm z paddingiem ciszą do max(5s, czas+1s).
+///                   Pass 2 dziala na ORYGINALE — cisza w analizie jest gated out.
+///      b. < 1s   -> normalizacja szczytowa do `target_peak_dbfs`.
+///                   Gain ograniczony do +40 dB zeby nie wzmacniac szumu/ciszy.
+///   3. Skrajny fallback (sygnal pusty/cichy mimo paddingu): konwersja bez normalizacji.
 fn process_single_file(
     input: &Path,
     input_base: &Path,
     output_base: &Path,
     target_lufs: Option<f32>,
+    target_peak_dbfs: f32,
     ffmpeg: &Path,
-) -> Result<bool> {
+) -> Result<NormResult> {
     let rel_path = input.strip_prefix(input_base)?;
     let output = output_base.join(rel_path).with_extension("wav");
 
@@ -478,35 +641,58 @@ fn process_single_file(
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-y", "-hide_banner", "-i"]).arg(input).arg("-vn");
 
-    let mut skipped_normalization = false;
-
-    if let Some(lufs) = target_lufs {
+    let norm_result = if let Some(lufs) = target_lufs {
+        // --- Proba 1: standardowy 2-pass ---
         match get_file_stats(input, ffmpeg, lufs)? {
             Some(stats) => {
-                // Pass 2: używamy zmierzonych wartości z pass 1.
-                // linear=true — czysty gain, bez dodatkowego ograniczenia dynamiki w pass 2.
-                // LRA=1.0 — bardzo wąska dynamika, minimalizuje błędy kwantyzacji 4-bit.
-                let filter_pass2 = format!(
-                    "loudnorm=I={lufs}:TP=-1.5:LRA=1.0:\
-                     measured_I={mi}:measured_LRA={mlra}:measured_TP={mtp}:\
-                     measured_thresh={mt}:offset={off}:linear=true",
-                    lufs = lufs,
-                    mi = stats.input_i,
-                    mlra = stats.input_lra,
-                    mtp = stats.input_tp,
-                    mt = stats.input_thresh,
-                    off = stats.target_offset,
-                );
-                // -ar przywraca oryginalny sample rate po wewnętrznym resamplu loudnorm.
-                cmd.args(["-af", &filter_pass2, "-ar", &source_sr.to_string()]);
+                apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr);
+                NormResult::Standard
             }
             None => {
-                // Plik za krótki lub za cichy (measured_I = -inf) —
-                // normalizacja niemożliwa, konwertuj bez filtrowania.
-                skipped_normalization = true;
+                let duration = get_duration(input, ffmpeg).unwrap_or(0.0);
+
+                if duration >= 1.0 {
+                    // --- Proba 2: 2-pass z paddingiem (pliki ~1-3s) ---
+                    // Pad do max(5s, duration+1s) — pewna minimalna dlugosc dla EBU R128.
+                    let pad_secs = f32::max(5.0, duration + 1.0);
+                    match get_file_stats_padded(input, ffmpeg, lufs, pad_secs)? {
+                        Some(stats) => {
+                            // Pass 2 na ORYGINALE (bez paddingu):
+                            // measured_* z analizy paddowanej sa prawidlowe,
+                            // bo cisza ponizej -70 LUFS jest gated out przez EBU R128.
+                            apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr);
+                            NormResult::Padded
+                        }
+                        None => {
+                            // Nawet z paddingiem sygnal jest niesłyszalny.
+                            NormResult::Skipped
+                        }
+                    }
+                } else {
+                    // --- Proba 3: peak normalization (pliki < 1s) ---
+                    match measure_peak_dbfs(input, ffmpeg) {
+                        Ok(peak_dbfs) if peak_dbfs.is_finite() => {
+                            let gain_db = target_peak_dbfs - peak_dbfs;
+                            // Ogranicz gain — zbyt duze wzmocnienie oznacza pusty/szumowy sygnal.
+                            if gain_db <= 40.0 {
+                                cmd.args([
+                                    "-af",
+                                    &format!("volume={gain:.4}dB", gain = gain_db),
+                                ]);
+                                NormResult::Peak { gain_db }
+                            } else {
+                                NormResult::Skipped
+                            }
+                        }
+                        _ => NormResult::Skipped,
+                    }
+                }
             }
         }
-    }
+    } else {
+        // Normalizacja wylaczona przez uzytkownika.
+        NormResult::Skipped
+    };
 
     cmd.args(["-c:a", "adpcm_ima_wav"]).arg(&output);
 
@@ -520,7 +706,35 @@ fn process_single_file(
         return Err(anyhow!("FFmpeg Error: {}", err));
     }
 
-    Ok(skipped_normalization)
+    Ok(norm_result)
+}
+
+/// Aplikuje argumenty pass 2 loudnorm do istniejacego Command.
+///
+/// Wydzielone do osobnej funkcji — uzywane zarowno dla sciezki standardowej
+/// jak i paddowanej, bo argumenty FFmpeg sa identyczne.
+///
+/// LRA=1.0  — bardzo waska dynamika, minimalizuje bledy kwantyzacji 4-bit ADPCM.
+/// linear=true — czysty gain liniowy bez dodatkowej kompresji w pass 2.
+/// -ar — przywraca oryginalny sample rate po wewnetrznym resamplu loudnorm (192 kHz).
+fn apply_loudnorm_pass2(
+    cmd: &mut Command,
+    target_lufs: f32,
+    stats: &LoudnormStats,
+    source_sr: u32,
+) {
+    let filter = format!(
+        "loudnorm=I={lufs}:TP=-1.5:LRA=1.0:\
+         measured_I={mi}:measured_LRA={mlra}:measured_TP={mtp}:\
+         measured_thresh={mt}:offset={off}:linear=true",
+        lufs = target_lufs,
+        mi = stats.input_i,
+        mlra = stats.input_lra,
+        mtp = stats.input_tp,
+        mt = stats.input_thresh,
+        off = stats.target_offset,
+    );
+    cmd.args(["-af", &filter, "-ar", &source_sr.to_string()]);
 }
 
 fn extract_loudnorm_stats(stderr: &str) -> Result<LoudnormStats> {
@@ -531,6 +745,10 @@ fn extract_loudnorm_stats(stderr: &str) -> Result<LoudnormStats> {
     Ok(stats)
 }
 
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
 fn main() -> eframe::Result<()> {
     let ffmpeg_path = find_ffmpeg().unwrap_or_else(|e| {
         eprintln!("{}", e);
@@ -538,7 +756,7 @@ fn main() -> eframe::Result<()> {
     });
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([700.0, 650.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([700.0, 700.0]),
         ..Default::default()
     };
 

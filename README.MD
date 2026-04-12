@@ -1,13 +1,13 @@
 # VOCAN
 
-VOCAN is a batch audio processing tool designed for voice-over preparation. It applies a configurable chain of dynamics processing, equalization, noise reduction, and loudness normalization, producing 4-bit IMA ADPCM WAV files suitable for embedded playback systems.
+VOCAN is a batch audio processing tool designed for voice-over preparation. It applies a configurable chain of dynamics processing, equalization, noise reduction, and loudness normalization, producing 4‑bit IMA ADPCM WAV files suitable for embedded playback systems.
 
-The application is written in Rust and provides a graphical interface built with `egui`. All heavy audio processing is delegated to FFmpeg and optional external DSP utilities, while custom spectral and EQ modules are implemented natively.
+The application is written in Rust and provides a graphical interface built with `egui`. All heavy audio processing is delegated to FFmpeg and optional external DSP utilities, while custom spectral and EQ modules are implemented natively. **Files are processed in parallel using Rayon** to fully utilise multi‑core CPUs.
 
 ## Features
 
 - **Loudness normalization**
-  - EBU R128 integrated loudness (LUFS) for files ≥ 3 seconds (two‑pass).
+  - EBU R128 integrated loudness (LUFS) for files ≥ 3 seconds (two‑pass).
   - Silence‑padded analysis for files between 1 and 3 seconds.
   - Peak normalization for files under 1 second, with adjustable target peak level.
 - **Automixer chain** (optional)
@@ -15,13 +15,15 @@ The application is written in Rust and provides a graphical interface built with
   - Spectral gate (custom Rust FFT‑based expander)
   - Noise reduction using `nnnoiseless` (RNNoise‑based)
   - Dereverberation via DeepFilterNet3 (external subprocess)
-  - Voice EQ (static biquad bank: low‑shelf cut, two parametric cuts, high‑shelf boost)
+  - Voice EQ (static biquad bank: low‑shelf cut, two parametric cuts, high‑shelf boost) – always applied at 50% strength when Automixer is active.
   - High‑pass filter and additional parametric EQ (FFmpeg)
   - Compressor with makeup gain (FFmpeg `acompressor`)
 - **Analysis mode**  
   Scan a folder and compute the average LUFS of all audio files. The result can be used as the target normalization level.
+- **Parallel processing**  
+  All files are processed concurrently with a thread pool sized to `CPU cores - 1` (minimum 1). Progress and logs are updated in real time.
 - **Resilient processing**  
-  Preserves original sample rate; stereo is downmixed to mono early in the chain. All intermediate audio is handled as 32‑bit float PCM.
+  Preserves the original sample rate in the final output. When Automixer is enabled, audio is internally converted to 48 kHz mono for the DSP chain and then restored to the original rate.
 
 ## Requirements
 
@@ -44,6 +46,7 @@ Dependencies are listed in `Cargo.toml`. The project uses:
 - `rustfft`, `biquad`, `nnnoiseless` for custom DSP modules
 - `tempfile` for temporary file management
 - `serde`, `walkdir`, `rfd` for configuration and file handling
+- `rayon` for parallel iteration
 
 ## Usage
 
@@ -51,12 +54,13 @@ Dependencies are listed in `Cargo.toml`. The project uses:
 2. Set **Source** and **Output** directories.
 3. (Optional) Use **Analyze folder loudness** to measure the average LUFS of the source material and set the target automatically.
 4. Configure processing:
-   - **Normalize volume** – Enables loudness normalization with the chosen target LUFS (for files ≥1 s) and target peak (for shorter files).
+   - **Normalize volume** – Enables loudness normalization with the chosen target LUFS (for files ≥ 1 s) and target peak (for shorter files).
    - **Automixer** – Enables the full voice‑over processing chain. When active:
      - _Intelligent noise removal (Spectral Gate)_ – Custom FFT gate; mutually exclusive with _nnnoiseless_.
      - _Noise reduction (nnnoiseless)_ – RNNoise‑based denoiser; mutually exclusive with the spectral gate.
      - _Dereverb (DeepFilterNet3)_ – Runs before the gate/EQ. Mix level and optional post‑filter can be adjusted.
      - Voice EQ is always applied at 50% strength when Automixer is enabled.
+     - **Important:** When Automixer is enabled, all audio is downmixed to mono. Without Automixer, the original channel layout is preserved.
 5. Click **START PROCESSING**. Progress and log messages are displayed in the lower pane.
 
 Processing can be stopped gracefully – the current file will finish, and subsequent files will be skipped.
@@ -68,11 +72,12 @@ Processing can be stopped gracefully – the current file will finish, and subse
 1. **De‑esser** – FFmpeg `deesser` filter, parameters fixed for voice.
 2. **DeepFilterNet3** (if enabled) – Joint denoise/dereverb at 48 kHz mono. The `-D` flag ensures sample‑accurate latency compensation.
 3. **Spectral Gate / nnnoiseless** – Either the custom FFT expander or RNNoise runs at 48 kHz mono.
-4. **Voice EQ** – Four‑band biquad (low shelf -3 dB @ 120 Hz, cut -1.5 dB @ 400 Hz, boost +2 dB @ 2.5 kHz, high shelf +1.5 dB @ 10 kHz). Strength parameter scales all gains.
+4. **Voice EQ** – Four‑band biquad (low shelf -3 dB @ 120 Hz, cut -1.5 dB @ 400 Hz, boost +2 dB @ 2.5 kHz, high shelf +1.5 dB @ 10 kHz). Strength parameter scales all gains (fixed at 0.5 in this chain).
 5. **Post‑EQ & Dynamics** (FFmpeg)
    - 2‑pole + 1‑pole high‑pass at 70 Hz
    - Five parametric EQ bands
-   - Compressor (threshold -12 dBFS, ratio 4:1, attack 5 ms, release 80 ms, makeup 4 dB)
+   - Compressor (threshold -12 dBFS, ratio 4:1, attack 5 ms, release 80 ms, makeup 4 dB)  
+     _Note: In the current code the compressor threshold is specified as a linear value (`0.251`), which corresponds to -12 dBFS._
 6. **Normalization** – EBU R128 two‑pass with optional padding for short files, or peak normalization.
 7. **Encoding** – IMA ADPCM WAV, preserving the original sample rate.
 
@@ -102,6 +107,10 @@ Processing can be stopped gracefully – the current file will finish, and subse
 | < 1 s         | Peak normalization to `target_peak_dbfs` (default -3 dBFS) |
 
 If a file is completely silent or contains only negligible signal, it is converted without normalization and logged as _Skipped_.
+
+### Parallel Execution
+
+The analysis and processing stages use `rayon::par_iter()` to distribute files across all available CPU cores (minus one, to keep the UI responsive). A global thread pool is initialised on startup.
 
 ## Logging and Error Handling
 

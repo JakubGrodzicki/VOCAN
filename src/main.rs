@@ -853,19 +853,25 @@ fn process_with_rust_dsp(
         .spawn()
         .context("FFmpeg spawn failed (de-esser pass)")?;
 
+    // Czytaj stderr w osobnym wątku, żeby nie zablokować ffmpega
+    // przy dużym wyjściu diagnostycznym.
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let stderr_handle = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr_pipe.read_to_string(&mut s);
+        s
+    });
+
     let mut raw = Vec::with_capacity(1 << 20);
     child
         .stdout
         .as_mut()
-        .unwrap()
+        .context("FFmpeg stdout not piped")?
         .read_to_end(&mut raw)?;
     let status = child.wait().context("FFmpeg de-esser wait failed")?;
+    let stderr_text = stderr_handle.join().unwrap_or_default();
     if !status.success() {
-        let mut err = String::new();
-        if let Some(mut s) = child.stderr.take() {
-            let _ = s.read_to_string(&mut err);
-        }
-        return Err(anyhow!("FFmpeg de-esser pass failed: {}", err));
+        return Err(anyhow!("FFmpeg de-esser pass failed: {}", stderr_text));
     }
 
     let samples: Vec<f32> = raw
@@ -884,7 +890,18 @@ fn process_with_rust_dsp(
             attenuation_limit: 30.0,
             post_filter: dfn3_pf,
         };
-        let dfn_path = ffmpeg.parent().unwrap().join("deep-filter.exe");
+        // Szukaj deep-filter.exe najpierw obok ffmpeg, a jeśli ffmpeg jest z PATH
+    // (brak sensownego parenta), to obok naszego exe.
+    let dfn_path = ffmpeg
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join("deep-filter.exe"))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("deep-filter.exe")))
+        })
+        .ok_or_else(|| anyhow!("cannot locate deep-filter.exe"))?;
         processed = audio_effects::apply_dereverb_dfn3(&processed, &params, &dfn_path, ffmpeg)?;
     }
 
@@ -908,19 +925,21 @@ fn process_with_rust_dsp(
 
     // 5. Save processed samples to second temporary file
     let temp_out = NamedTempFile::new()?;
-    let temp_out_path = temp_out.path().to_str().unwrap();
     {
-        let mut file = std::fs::File::create(temp_out_path)?;
+        // BufWriter — jedna alokacja zamiast write_all per próbkę (potencjalnie miliony).
+        let mut file = std::io::BufWriter::new(std::fs::File::create(temp_out.path())?);
+        // Bezpieczne reinterpretowanie Vec<f32> jako bajtów little-endian:
         for sample in &processed {
             file.write_all(&sample.to_le_bytes())?;
         }
+        file.flush()?;
     }
 
     // 6. Second FFmpeg call: raw → filters (HPF, EQ, compressor) → normalization → encoding
     let mut cmd = ffmpeg_cmd(ffmpeg);
     cmd.args(["-y", "-hide_banner", "-f", "f32le", "-ar", "48000", "-ac", "1"])
         .arg("-i")
-        .arg(temp_out_path)
+        .arg(temp_out.path())   // przekaż &Path, nie &str
         .arg("-vn");
 
     let post_filters = post_deesser_filters();

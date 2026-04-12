@@ -184,12 +184,21 @@ pub fn apply_voice_eq_inplace(
     let ch = channels as usize;
     let frames = buf.len() / ch;
 
+    // Zbuduj współczynniki raz, z propagacją błędu zamiast unwrap.
+    let coeffs: [Coefficients<f32>; 4] = {
+        let mut arr: [Option<Coefficients<f32>>; 4] = [None, None, None, None];
+        for (i, (t, f, q)) in bands.iter().enumerate() {
+            arr[i] = Some(
+                Coefficients::<f32>::from_params(*t, fs, f.hz(), *q)
+                    .map_err(|e| anyhow::anyhow!("biquad coeffs failed for band {}: {:?}", i, e))?,
+            );
+        }
+        [arr[0].unwrap(), arr[1].unwrap(), arr[2].unwrap(), arr[3].unwrap()]
+    };
+
     for c in 0..ch {
-        let mut filters: [DirectForm2Transposed<f32>; 4] = std::array::from_fn(|i| {
-            let (t, f, q) = bands[i];
-            let coeffs = Coefficients::<f32>::from_params(t, fs, f.hz(), q).unwrap();
-            DirectForm2Transposed::<f32>::new(coeffs)
-        });
+        let mut filters: [DirectForm2Transposed<f32>; 4] =
+            std::array::from_fn(|i| DirectForm2Transposed::<f32>::new(coeffs[i]));
         for i in 0..frames {
             let idx = i * ch + c;
             let mut x = buf[idx];
@@ -227,28 +236,31 @@ pub fn apply_nnnoise(samples_48k_mono: &[f32], params: &NnnoiseParams) -> Result
     let frame_size = DenoiseState::FRAME_SIZE;
     let mix = params.mix.clamp(0.0, 1.0);
 
-    let scaled: Vec<f32> = samples_48k_mono
-        .iter()
-        .map(|&x| (x * 32768.0).clamp(-32768.0, 32767.0))
-        .collect();
+    // Skalowanie do zakresu i16 w miejscu — unikamy osobnej kopii całego sygnału.
+    let mut scaled: Vec<f32> = Vec::with_capacity(samples_48k_mono.len());
+    for &x in samples_48k_mono {
+        scaled.push((x * 32768.0).clamp(-32768.0, 32767.0));
+    }
 
     let total_frames = (scaled.len() + frame_size - 1) / frame_size;
-    let mut wet = Vec::with_capacity(total_frames * frame_size);
+    let mut wet: Vec<f32> = Vec::with_capacity(total_frames * frame_size);
     let mut frame_buf = vec![0f32; frame_size];
+    // Reużywany bufor wejściowy — bez alokacji per ramka.
+    let mut input_buf = vec![0f32; frame_size];
 
     for chunk in scaled.chunks(frame_size) {
-        let input: Vec<f32> = if chunk.len() == frame_size {
-            chunk.to_vec()
-        } else {
-            let mut v = chunk.to_vec();
-            v.resize(frame_size, 0.0);
-            v
-        };
-        state.process_frame(&mut frame_buf, &input);
+        input_buf[..chunk.len()].copy_from_slice(chunk);
+        if chunk.len() < frame_size {
+            input_buf[chunk.len()..].fill(0.0);
+        }
+        state.process_frame(&mut frame_buf, &input_buf);
         wet.extend_from_slice(&frame_buf);
     }
 
-    let wet: Vec<f32> = wet.into_iter().map(|x| x / 32768.0).collect();
+    // Skalowanie wet z powrotem do ±1.0 in-place (bez drugiego Vec).
+    for v in wet.iter_mut() {
+        *v /= 32768.0;
+    }
 
     let shift = frame_size;
     let dry_len = samples_48k_mono.len();
@@ -320,9 +332,14 @@ pub fn apply_dereverb_dfn3(
         }
     }
 
-    // 2. Input WAV (because deep-filter does not read f32le)
-    let temp_wav_in = NamedTempFile::new()?;
-    let wav_in_path = temp_wav_in.path().with_extension("wav");
+    // 2. Input WAV (because deep-filter does not read f32le).
+    // Tworzymy od razu z rozszerzeniem .wav — NamedTempFile zarządza
+    // plikiem RAII-owo, więc przy panice/błędzie zostanie posprzątany.
+    let temp_wav_in = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .context("cannot create temp wav input")?;
+    let wav_in_path = temp_wav_in.path().to_path_buf();
 
     let st = silent_command(ffmpeg)
         .args(["-y", "-hide_banner", "-f", "f32le", "-ar", "48000", "-ac", "1", "-i"])
@@ -397,11 +414,6 @@ pub fn apply_dereverb_dfn3(
     for i in n..samples_48k_mono.len() {
         out_samples.push(samples_48k_mono[i]);
     }
-
-    // Cleanup: wav_in_path is not managed by NamedTempFile (we changed the
-    // extension), so we remove it manually. out_dir and everything inside 
-    // will be cleaned up automatically on drop.
-    let _ = std::fs::remove_file(&wav_in_path);
 
     Ok(out_samples)
 }

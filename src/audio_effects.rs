@@ -10,6 +10,16 @@
 //!   nnnoiseless = "0.5"
 //!   tempfile    = "3"
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+fn silent_command(bin: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    cmd
+}
+
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -275,7 +285,7 @@ pub fn apply_dereverb_dfn3(
     let temp_wav_in = NamedTempFile::new()?;
     let wav_in_path = temp_wav_in.path().with_extension("wav");
 
-    let st = Command::new(ffmpeg)
+    let st = silent_command(ffmpeg)
         .args(["-y", "-hide_banner", "-f", "f32le", "-ar", "48000", "-ac", "1", "-i"])
         .arg(temp_raw_in.path())
         .arg(&wav_in_path)
@@ -291,7 +301,7 @@ pub fn apply_dereverb_dfn3(
     // instead of guessing the naming scheme (which differs between CLI builds).
     let out_dir = tempfile::tempdir().context("cannot create temp dir for deep-filter")?;
 
-    let mut cmd = Command::new(dfn_binary);
+    let mut cmd = silent_command(dfn_binary);
     cmd.arg("-D")
         .args(["-a", &format!("{:.1}", params.attenuation_limit.clamp(0.0, 100.0))])
         .arg("-o")
@@ -318,7 +328,7 @@ pub fn apply_dereverb_dfn3(
 
     // 5. WAV -> f32le
     let temp_raw_out = NamedTempFile::new()?;
-    let st = Command::new(ffmpeg)
+    let st = silent_command(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(&wav_out_path)
         .args(["-f", "f32le", "-ar", "48000", "-ac", "1"])

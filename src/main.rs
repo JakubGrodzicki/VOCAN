@@ -1,4 +1,14 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+fn ffmpeg_cmd(ffmpeg: &Path) -> Command {
+    let mut cmd = Command::new(ffmpeg);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    cmd
+}
 
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
@@ -599,7 +609,7 @@ fn find_ffmpeg() -> Result<PathBuf> {
 
 /// Returns the sample rate of the source file.
 fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
-    let output = Command::new(ffmpeg)
+    let output = ffmpeg_cmd(ffmpeg)
         .args(["-hide_banner", "-i"])
         .arg(input)
         .stderr(Stdio::piped())
@@ -622,7 +632,7 @@ fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
 
 /// Returns the duration of the file in seconds.
 fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
-    let output = Command::new(ffmpeg)
+    let output = ffmpeg_cmd(ffmpeg)
         .args(["-hide_banner", "-i"])
         .arg(input)
         .stderr(Stdio::piped())
@@ -653,7 +663,7 @@ fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
 /// Measures the integrated loudness (LUFS-I) for folder overview analysis.
 fn measure_lufs(input: &Path, ffmpeg: &Path) -> Result<Option<f32>> {
     let filter = "loudnorm=I=-23:TP=-1.5:LRA=1.0:print_format=json";
-    let output = Command::new(ffmpeg)
+    let output = ffmpeg_cmd(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
         .args(["-vn", "-af", filter, "-f", "null", "-"])
@@ -685,7 +695,7 @@ fn get_file_stats(
         Some(p) => format!("{},{}", p, loudnorm),
         None => loudnorm,
     };
-    let output = Command::new(ffmpeg)
+    let output = ffmpeg_cmd(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
         .args(["-vn", "-af", &filter, "-f", "null", "-"])
@@ -723,7 +733,7 @@ fn get_file_stats_padded(
         Some(p) => format!("{},{}", p, pad_chain),
         None => pad_chain,
     };
-    let output = Command::new(ffmpeg)
+    let output = ffmpeg_cmd(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
         .args(["-vn", "-af", &filter, "-f", "null", "-"])
@@ -746,7 +756,7 @@ fn measure_peak_dbfs(input: &Path, ffmpeg: &Path, prefix: Option<&str>) -> Resul
         Some(p) => format!("{},volumedetect", p),
         None => "volumedetect".to_string(),
     };
-    let output = Command::new(ffmpeg)
+    let output = ffmpeg_cmd(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
         .args(["-vn", "-af", &filter, "-f", "null", "-"])
@@ -824,7 +834,7 @@ fn process_with_rust_dsp(
     let temp_in = NamedTempFile::new()?;
     let temp_in_path = temp_in.path().to_str().unwrap();
 
-    let status = Command::new(ffmpeg)
+    let status = ffmpeg_cmd(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
         .args(["-vn", "-af", &deesser_only_filter()])
@@ -888,7 +898,7 @@ fn process_with_rust_dsp(
     }
 
     // 6. Second FFmpeg call: raw → filters (HPF, EQ, compressor) → normalization → encoding
-    let mut cmd = Command::new(ffmpeg);
+    let mut cmd = ffmpeg_cmd(ffmpeg);
     cmd.args(["-y", "-hide_banner", "-f", "f32le", "-ar", "48000", "-ac", "1"])
         .arg("-i")
         .arg(temp_out_path)
@@ -1033,11 +1043,11 @@ fn process_single_file(
     }
 
     // Old pipeline (without automixer)
-    let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
-    let mut cmd = Command::new(ffmpeg);
+    let mut cmd = ffmpeg_cmd(ffmpeg);
     cmd.args(["-y", "-hide_banner", "-i"]).arg(input).arg("-vn");
 
     let norm_result = if let Some(lufs) = target_lufs {
+    let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
         match get_file_stats(input, ffmpeg, lufs, None)? {
             Some(stats) => {
                 apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, None);

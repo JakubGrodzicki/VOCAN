@@ -11,3 +11,9 @@ rfd = "0.14.0"
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.115"
 walkdir = "2.5.0"
+
+# new dependencies for DSP and temporary files
+rustfft = "6.2"
+biquad = "0.4"
+nnnoiseless = "0.5"
+tempfile = "3.10"

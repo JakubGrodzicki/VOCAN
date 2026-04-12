@@ -1,13 +1,18 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
+
 use anyhow::{anyhow, Context, Result};
 use eframe::egui;
 use serde::Deserialize;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc::{self, Receiver, Sender}};
 use std::thread;
+use tempfile::NamedTempFile;
 use walkdir::WalkDir;
+
+mod audio_effects;
 
 // ---------------------------------------------------------------------------
 // Data Types
@@ -56,6 +61,14 @@ struct AudioBatchApp {
     target_peak_dbfs: f32,
     /// Applies a fixed processing chain (EQ → De-esser → Compressor) before normalization.
     automixer: bool,
+    /// Module 1: custom spectral gate (FFT).
+    automixer_spectral_gate: bool,
+    /// Module 3: nnnoiseless used as pseudo-dereverb.
+    automixer_nn_dereverb: bool,
+    /// Module 4: DeepFilterNet3 — proper dereverb (+ optional denoise).
+    automixer_dfn3_dereverb: bool,
+    automixer_dfn3_mix: f32,
+    automixer_dfn3_postfilter: bool,
     is_processing: bool,
     is_analyzing: bool,
     average_lufs: Option<f32>,
@@ -79,6 +92,11 @@ impl AudioBatchApp {
             target_lufs: -14.0,
             target_peak_dbfs: -3.0,
             automixer: false,
+            automixer_spectral_gate: false,
+            automixer_nn_dereverb: false,
+            automixer_dfn3_dereverb: false,
+            automixer_dfn3_mix: 0.8,
+            automixer_dfn3_postfilter: false,
             is_processing: false,
             is_analyzing: false,
             average_lufs: None,
@@ -183,6 +201,11 @@ impl AudioBatchApp {
         };
         let target_peak = self.target_peak_dbfs;
         let automixer = self.automixer;
+        let automixer_sg = self.automixer_spectral_gate;
+        let automixer_nn = self.automixer_nn_dereverb;
+        let automixer_dfn3 = self.automixer_dfn3_dereverb;
+        let automixer_dfn3_mix = self.automixer_dfn3_mix;
+        let automixer_dfn3_pf = self.automixer_dfn3_postfilter;
 
         let tx = self.sender.clone();
         let ffmpeg_path = self.ffmpeg_path.clone();
@@ -218,6 +241,11 @@ impl AudioBatchApp {
                     lufs_option,
                     target_peak,
                     automixer,
+                    automixer_sg,
+                    automixer_nn,
+                    automixer_dfn3,
+                    automixer_dfn3_mix,
+                    automixer_dfn3_pf,
                     &ffmpeg_path,
                 ) {
                     Err(e) => {
@@ -371,11 +399,71 @@ impl eframe::App for AudioBatchApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.automixer, "Automixer");
                     ui.label(
-                        egui::RichText::new("(EQ -> De-esser -> Compressor, applied before normalization)")
+                        egui::RichText::new("(De-esser -> EQ -> Compressor, applied before normalization)")
                             .weak()
                             .italics(),
                     );
                 });
+
+                // Additional options (active only when automixer is enabled)
+                ui.add_enabled_ui(self.automixer && !self.is_processing, |ui| {
+                    ui.indent("automixer_opts", |ui| {
+                        // SG and NN are mutually exclusive (both live in the "noise" slot).
+                        // DFN3 is independent — it's proper dereverb, runs before the others.
+                        let sg_disabled = self.automixer_nn_dereverb;
+                        let nn_disabled = self.automixer_spectral_gate;
+
+                        ui.add_enabled_ui(!sg_disabled, |ui| {
+                            if ui
+                                .checkbox(
+                                    &mut self.automixer_spectral_gate,
+                                    "Intelligent noise removal (Spectral Gate)",
+                                )
+                                .changed()
+                                && self.automixer_spectral_gate
+                            {
+                                self.automixer_nn_dereverb = false;
+                            }
+                        });
+
+                        ui.add_enabled_ui(!nn_disabled, |ui| {
+                            if ui
+                                .checkbox(
+                                    &mut self.automixer_nn_dereverb,
+                                    "Noise reduction (nnnoiseless)",
+                                )
+                                .changed()
+                                && self.automixer_nn_dereverb
+                            {
+                                self.automixer_spectral_gate = false;
+                            }
+                        });
+
+                        ui.separator();
+                        ui.checkbox(
+                            &mut self.automixer_dfn3_dereverb,
+                            "Dereverb (DeepFilterNet3)",
+                        );
+                        ui.add_enabled_ui(self.automixer_dfn3_dereverb, |ui| {
+                            ui.add(
+                                egui::Slider::new(&mut self.automixer_dfn3_mix, 0.0..=1.0)
+                                    .text("Dereverb mix")
+                                    .fixed_decimals(2),
+                            );
+                            ui.checkbox(
+                                &mut self.automixer_dfn3_postfilter,
+                                "Post-filter (aggressive)",
+                            );
+                        });
+
+                        ui.label(
+                            egui::RichText::new("Voice EQ works automatically (50% strength)")
+                                .small()
+                                .italics(),
+                        );
+                    });
+                });
+
                 if self.automixer {
                     ui.add_space(4.0);
                     let warning = "⚠  Attention! There is no way to create a universal mixing \
@@ -454,7 +542,6 @@ impl eframe::App for AudioBatchApp {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` for file extensions that ffmpeg can decode as audio.
-/// Used to skip sidecar files (.reapeaks, .txt, .png, etc.) that WalkDir picks up.
 fn is_audio_file(path: &Path) -> bool {
     matches!(
         path.extension()
@@ -467,7 +554,7 @@ fn is_audio_file(path: &Path) -> bool {
         )
     )
 }
-///
+
 /// Priority:
 ///   1. `ffmpeg` available on PATH (verified by running `ffmpeg -version`)
 ///   2. `ffmpeg.exe` / `ffmpeg` sitting next to the current executable
@@ -511,9 +598,6 @@ fn find_ffmpeg() -> Result<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// Returns the sample rate of the source file.
-///
-/// Loudnorm internally resamples to 192 kHz — without an explicit `-ar`, the
-/// ADPCM IMA WAV codec might receive an incorrect sampling frequency.
 fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
     let output = Command::new(ffmpeg)
         .args(["-hide_banner", "-i"])
@@ -548,7 +632,6 @@ fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     for line in stderr.lines() {
         if line.contains("Duration:") {
-            // Format: "  Duration: HH:MM:SS.ms, start: ..."
             for token in line.split_whitespace() {
                 let t = token.trim_end_matches(',');
                 let parts: Vec<&str> = t.split(':').collect();
@@ -568,9 +651,6 @@ fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
 }
 
 /// Measures the integrated loudness (LUFS-I) for folder overview analysis.
-///
-/// Uses standard EBU R128 without padding — files < ~3s will return `None`.
-/// `measured_I` is independent of the selected target, so we use -23 LUFS (EBU R128).
 fn measure_lufs(input: &Path, ffmpeg: &Path) -> Result<Option<f32>> {
     let filter = "loudnorm=I=-23:TP=-1.5:LRA=1.0:print_format=json";
     let output = Command::new(ffmpeg)
@@ -591,9 +671,6 @@ fn measure_lufs(input: &Path, ffmpeg: &Path) -> Result<Option<f32>> {
 }
 
 /// Normalization Pass 1 (standard, no padding).
-///
-/// Returns `None` when `measured_I = -inf` (file too short).
-/// The target must be identical to Pass 2 — `target_offset` is calculated relative to it.
 fn get_file_stats(
     input: &Path,
     ffmpeg: &Path,
@@ -626,12 +703,6 @@ fn get_file_stats(
 }
 
 /// Normalization Pass 1 with silence padding — for files ~1-3s.
-///
-/// Pads the signal with silence to `pad_to_secs` seconds, ensuring the
-/// EBU R128 algorithm has enough blocks for analysis. Silence is below the
-/// absolute gating threshold (-70 LUFS), so it does not distort the `measured_I` result.
-///
-/// Returns `None` if the measurement fails even with padding.
 fn get_file_stats_padded(
     input: &Path,
     ffmpeg: &Path,
@@ -639,8 +710,6 @@ fn get_file_stats_padded(
     pad_to_secs: f32,
     prefix: Option<&str>,
 ) -> Result<Option<LoudnormStats>> {
-    // apad adds silence at the end; atrim trims to pad_to_secs to avoid
-    // creating unnecessarily large memory buffers.
     let loudnorm = format!(
         "loudnorm=I={target}:TP=-1.5:LRA=1.0:print_format=json",
         target = target_lufs
@@ -687,7 +756,6 @@ fn measure_peak_dbfs(input: &Path, ffmpeg: &Path, prefix: Option<&str>) -> Resul
 
     let stderr_str = String::from_utf8_lossy(&output.stderr);
 
-    // Line format: "[Parsed_volumedetect_0 @ ...] max_volume: -3.5 dB"
     for line in stderr_str.lines() {
         if line.contains("max_volume:") {
             let tokens: Vec<&str> = line.split_whitespace().collect();
@@ -707,76 +775,225 @@ fn measure_peak_dbfs(input: &Path, ffmpeg: &Path, prefix: Option<&str>) -> Resul
 }
 
 // ---------------------------------------------------------------------------
-// Automixer chain
+// Automixer chain (original, used when new DSP modules are disabled)
 // ---------------------------------------------------------------------------
 
-/// Builds a fixed processing filter chain intended as a "closest-to-universal"
-/// mixing pre-processor for voice-over material.
-///
-/// Chain order: EQ → De-esser → Compressor
-///
-/// EQ bands:
-///   - HPF  70 Hz, Q 1.0, 18 dB/oct (3-pole) — remove rumble and proximity buildup
-///   - Bell  90 Hz, Q 2.478, −2.0 dB          — tighten low-mid mud
-///   - Bell 175 Hz, Q 1.0,   −2.22 dB         — reduce boxy buildup
-///   - Bell 360 Hz, Q 1.0,   −1.23 dB         — reduce nasal honk
-///   - Bell 1350 Hz, Q 1.4,  +1.4 dB          — add presence / intelligibility
-///   - Bell 4246 Hz, Q 2.0,  −1.36 dB         — tame harshness
-///   - High shelf 8000 Hz, Q 1.0, +1.0 dB     — gentle air boost
-///
-/// De-esser: balanced intensity, targeting the 6–8 kHz sibilance band.
-/// Compressor: heavy (−12 dB threshold, 4:1 ratio) with 4 dB makeup gain.
-fn automixer_filter_chain() -> String {
-    // 18 dB/oct HPF at 70 Hz:
-    // ffmpeg's `highpass` supports only 1 or 2 poles natively.
-    // We cascade a 2-pole (12 dB/oct, Q=1.0) and a 1-pole (6 dB/oct) to get 18 dB/oct
-    // while preserving the Q=1.0 character on the resonant section.
-    let hpf = "highpass=f=70:poles=2:width_type=q:width=1.0,highpass=f=70:poles=1";
+/// Returns **only** the de-esser filter (used in the new pipeline).
+fn deesser_only_filter() -> String {
+    "deesser=i=0.4:m=0.5:f=0.5:s=o".to_string()
+}
 
-    // Bell / peaking filters via `equalizer` (width_type=q → Q factor).
+/// Returns filters after the de-esser: HPF, EQ, compressor (no de-esser).
+fn post_deesser_filters() -> String {
+    let hpf = "highpass=f=70:poles=2:width_type=q:width=1.0,highpass=f=70:poles=1";
     let eq_90   = "equalizer=f=90:width_type=q:width=2.478:g=-2.0";
     let eq_175  = "equalizer=f=175:width_type=q:width=1.0:g=-2.22";
     let eq_360  = "equalizer=f=360:width_type=q:width=1.0:g=-1.23";
     let eq_1350 = "equalizer=f=1350:width_type=q:width=1.4:g=1.4";
     let eq_4246 = "equalizer=f=4246:width_type=q:width=2.0:g=-1.36";
-
-    // High shelf at 8 kHz.
     let shelf_8k = "highshelf=f=8000:width_type=q:width=1.0:g=1.0";
-
-    // De-esser — balanced: intensity 0.4, max de-essing 0.5, center ~0.5 (≈ 7 kHz).
-    // s=o → output the de-essed signal (not the raw side chain).
-    let deesser = "deesser=i=0.4:m=0.5:f=0.5:s=o";
-
-    // Compressor — heavy but musical.
-    //   threshold: −12 dBFS → linear amplitude ≈ 0.251  (10^(−12/20))
-    //   ratio: 4:1
-    //   attack: 5 ms  — fast enough to catch transients without choking them
-    //   release: 80 ms — natural decay for speech
-    //   makeup: 4 dB  — compensate for gain reduction
     let comp = "acompressor=threshold=0.251:ratio=4:attack=5:release=80:makeup=4";
 
-    // hpf already contains a comma-separated pair, so join everything manually.
     format!(
-        "{},{},{},{},{},{},{},{},{}",
-        hpf, eq_90, eq_175, eq_360, eq_1350, eq_4246, shelf_8k, deesser, comp
+        "{},{},{},{},{},{},{},{}",
+        hpf, eq_90, eq_175, eq_360, eq_1350, eq_4246, shelf_8k, comp
     )
 }
 
 // ---------------------------------------------------------------------------
-// File Processing
+// New pipeline with Rust DSP (when automixer + new modules are active)
 // ---------------------------------------------------------------------------
 
-/// Processes a single file: hybrid normalization + conversion to ADPCM IMA WAV.
-///
-/// Normalization strategy (when enabled by user):
-///
-///   1. Attempt standard 2-pass loudnorm (files >= ~3s).
-///   2. If measured_I = -inf, check duration:
-///      a. >= 1s  -> 2-pass loudnorm with silence padding to max(5s, duration+1s).
-///                   Pass 2 operates on the ORIGINAL — padded silence is gated out.
-///      b. < 1s   -> Peak normalization to `target_peak_dbfs`.
-///                   Gain capped at +40 dB to avoid amplifying noise/silence.
-///   3. Extreme fallback (silent/empty signal despite padding): convert without normalization.
+/// Processes the file using Rust DSP (SG/NN + Voice EQ) between the de-esser and the rest of the chain.
+fn process_with_rust_dsp(
+    input: &Path,
+    output: &Path,
+    target_lufs: Option<f32>,
+    target_peak_dbfs: f32,
+    use_sg: bool,
+    use_nn: bool,
+    use_dfn3: bool,
+    dfn3_mix: f32,
+    dfn3_pf: bool,
+    ffmpeg: &Path,
+) -> Result<NormResult> {
+    // 1. Get original sample rate (to restore later)
+    let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
+
+    // 2. First FFmpeg call: de-esser → raw f32le mono 48kHz to temporary file
+    let temp_in = NamedTempFile::new()?;
+    let temp_in_path = temp_in.path().to_str().unwrap();
+
+    let status = Command::new(ffmpeg)
+        .args(["-y", "-hide_banner", "-i"])
+        .arg(input)
+        .args(["-vn", "-af", &deesser_only_filter()])
+        .args(["-ac", "1", "-ar", "48000", "-f", "f32le"])
+        .arg(temp_in_path)
+        .stderr(Stdio::piped())
+        .output()
+        .context("FFmpeg error during de-esser pass")?;
+
+    if !status.status.success() {
+        let err = String::from_utf8_lossy(&status.stderr);
+        return Err(anyhow!("FFmpeg de-esser pass failed: {}", err));
+    }
+
+    // 3. Load samples
+    let mut file = std::fs::File::open(temp_in_path)?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)?;
+    let samples: Vec<f32> = raw
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    // 4. Rust DSP
+    let mut processed = samples;
+
+    // Dereverb FIRST — reverb tails would otherwise confuse the gate
+    // and smear bands that the EQ would later emphasize.
+    if use_dfn3 {
+        let params = audio_effects::DereverbParams {
+            mix: dfn3_mix,
+            attenuation_limit: 30.0,
+            post_filter: dfn3_pf,
+        };
+        // `ffmpeg` is already in this scope; we need path to deep-filter.
+        let dfn_path = ffmpeg.parent().unwrap().join("deep-filter.exe");
+        processed = audio_effects::apply_dereverb_dfn3(&processed, &params, &dfn_path, ffmpeg)?;
+    }
+
+    if use_sg {
+        processed = audio_effects::apply_spectral_gate(
+            &processed,
+            48000,
+            1,
+            &audio_effects::SpectralGateParams::default(),
+        )?;
+    } else if use_nn {
+        processed = audio_effects::apply_nnnoise(&processed, &audio_effects::NnnoiseParams::default())?;
+    }
+    // Voice EQ always at 50% strength
+    processed = audio_effects::apply_voice_eq(&processed, 48000, 1, 0.5)?;
+
+    // 5. Save processed samples to second temporary file
+    let temp_out = NamedTempFile::new()?;
+    let temp_out_path = temp_out.path().to_str().unwrap();
+    {
+        let mut file = std::fs::File::create(temp_out_path)?;
+        for sample in &processed {
+            file.write_all(&sample.to_le_bytes())?;
+        }
+    }
+
+    // 6. Second FFmpeg call: raw → filters (HPF, EQ, compressor) → normalization → encoding
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-y", "-hide_banner", "-f", "f32le", "-ar", "48000", "-ac", "1"])
+        .arg("-i")
+        .arg(temp_out_path)
+        .arg("-vn");
+
+    let post_filters = post_deesser_filters();
+
+    // Normalization and encoding – adapted from existing logic
+    let norm_result = if let Some(lufs) = target_lufs {
+        // Perform loudnorm analysis on processed signal (with post_filters prefix)
+        match get_file_stats_with_filter(input, ffmpeg, lufs, &post_filters)? {
+            Some(stats) => {
+                apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, Some(&post_filters));
+                NormResult::Standard
+            }
+            None => {
+                let duration = get_duration(input, ffmpeg).unwrap_or(0.0);
+                if duration >= 1.0 {
+                    let pad_secs = f32::max(5.0, duration + 1.0);
+                    match get_file_stats_padded_with_filter(
+                        input, ffmpeg, lufs, pad_secs, &post_filters,
+                    )? {
+                        Some(stats) => {
+                            apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, Some(&post_filters));
+                            NormResult::Padded
+                        }
+                        None => {
+                            cmd.args(["-af", &post_filters]);
+                            NormResult::Skipped
+                        }
+                    }
+                } else {
+                    match measure_peak_dbfs_with_filter(input, ffmpeg, &post_filters) {
+                        Ok(peak_dbfs) if peak_dbfs.is_finite() => {
+                            let gain_db = target_peak_dbfs - peak_dbfs;
+                            if gain_db <= 40.0 {
+                                let vol_filter = format!("volume={:.4}dB", gain_db);
+                                let filter = format!("{},{}", post_filters, vol_filter);
+                                cmd.args(["-af", &filter]);
+                                NormResult::Peak { gain_db }
+                            } else {
+                                cmd.args(["-af", &post_filters]);
+                                NormResult::Skipped
+                            }
+                        }
+                        _ => {
+                            cmd.args(["-af", &post_filters]);
+                            NormResult::Skipped
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        cmd.args(["-af", &post_filters]);
+        NormResult::Skipped
+    };
+
+    cmd.args(["-c:a", "adpcm_ima_wav"]).arg(output);
+
+    let final_output = cmd
+        .stderr(Stdio::piped())
+        .output()
+        .context("Failed to run FFmpeg (Conversion)")?;
+
+    if !final_output.status.success() {
+        let err = String::from_utf8_lossy(&final_output.stderr);
+        return Err(anyhow!("FFmpeg Error: {}", err));
+    }
+
+    Ok(norm_result)
+}
+
+/// Helper function for loudnorm analysis on processed signal with given filter.
+fn get_file_stats_with_filter(
+    input: &Path,
+    ffmpeg: &Path,
+    target_lufs: f32,
+    filter_prefix: &str,
+) -> Result<Option<LoudnormStats>> {
+    get_file_stats(input, ffmpeg, target_lufs, Some(filter_prefix))
+}
+
+fn get_file_stats_padded_with_filter(
+    input: &Path,
+    ffmpeg: &Path,
+    target_lufs: f32,
+    pad_to_secs: f32,
+    filter_prefix: &str,
+) -> Result<Option<LoudnormStats>> {
+    get_file_stats_padded(input, ffmpeg, target_lufs, pad_to_secs, Some(filter_prefix))
+}
+
+fn measure_peak_dbfs_with_filter(
+    input: &Path,
+    ffmpeg: &Path,
+    filter_prefix: &str,
+) -> Result<f32> {
+    measure_peak_dbfs(input, ffmpeg, Some(filter_prefix))
+}
+
+// ---------------------------------------------------------------------------
+// Main file processing function
+// ---------------------------------------------------------------------------
+
 fn process_single_file(
     input: &Path,
     input_base: &Path,
@@ -784,6 +1001,11 @@ fn process_single_file(
     target_lufs: Option<f32>,
     target_peak_dbfs: f32,
     automixer: bool,
+    automixer_sg: bool,
+    automixer_nn: bool,
+    automixer_dfn3: bool,
+    automixer_dfn3_mix: f32,
+    automixer_dfn3_pf: bool,
     ffmpeg: &Path,
 ) -> Result<NormResult> {
     let rel_path = input.strip_prefix(input_base)?;
@@ -793,80 +1015,63 @@ fn process_single_file(
         std::fs::create_dir_all(parent)?;
     }
 
+    // If automixer is enabled, use the new pipeline with Rust DSP.
+    // Otherwise, use old logic (no additional modules).
+    if automixer {
+        return process_with_rust_dsp(
+            input,
+            &output,
+            target_lufs,
+            target_peak_dbfs,
+            automixer_sg,
+            automixer_nn,
+            automixer_dfn3,
+            automixer_dfn3_mix,
+            automixer_dfn3_pf,
+            ffmpeg,
+        );
+    }
+
+    // Old pipeline (without automixer)
     let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
-
-    // Build optional automixer prefix — applied before any normalization filter.
-    let automixer_chain: Option<String> = if automixer {
-        Some(automixer_filter_chain())
-    } else {
-        None
-    };
-    let prefix: Option<&str> = automixer_chain.as_deref();
-
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-y", "-hide_banner", "-i"]).arg(input).arg("-vn");
 
     let norm_result = if let Some(lufs) = target_lufs {
-        // --- Attempt 1: standard 2-pass ---
-        match get_file_stats(input, ffmpeg, lufs, prefix)? {
+        match get_file_stats(input, ffmpeg, lufs, None)? {
             Some(stats) => {
-                apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, prefix);
+                apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, None);
                 NormResult::Standard
             }
             None => {
                 let duration = get_duration(input, ffmpeg).unwrap_or(0.0);
-
                 if duration >= 1.0 {
-                    // --- Attempt 2: 2-pass with padding (files ~1-3s) ---
                     let pad_secs = f32::max(5.0, duration + 1.0);
-                    match get_file_stats_padded(input, ffmpeg, lufs, pad_secs, prefix)? {
+                    match get_file_stats_padded(input, ffmpeg, lufs, pad_secs, None)? {
                         Some(stats) => {
-                            apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, prefix);
+                            apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, None);
                             NormResult::Padded
                         }
-                        None => {
-                            // Even with padding, the signal is inaudible.
-                            if let Some(p) = prefix {
-                                cmd.args(["-af", p]);
-                            }
-                            NormResult::Skipped
-                        }
+                        None => NormResult::Skipped,
                     }
                 } else {
-                    // --- Attempt 3: peak normalization (files < 1s) ---
-                    match measure_peak_dbfs(input, ffmpeg, prefix) {
+                    match measure_peak_dbfs(input, ffmpeg, None) {
                         Ok(peak_dbfs) if peak_dbfs.is_finite() => {
                             let gain_db = target_peak_dbfs - peak_dbfs;
                             if gain_db <= 40.0 {
-                                let vol_filter = format!("volume={gain:.4}dB", gain = gain_db);
-                                let filter = match prefix {
-                                    Some(p) => format!("{},{}", p, vol_filter),
-                                    None => vol_filter,
-                                };
-                                cmd.args(["-af", &filter]);
+                                let vol_filter = format!("volume={:.4}dB", gain_db);
+                                cmd.args(["-af", &vol_filter]);
                                 NormResult::Peak { gain_db }
                             } else {
-                                if let Some(p) = prefix {
-                                    cmd.args(["-af", p]);
-                                }
                                 NormResult::Skipped
                             }
                         }
-                        _ => {
-                            if let Some(p) = prefix {
-                                cmd.args(["-af", p]);
-                            }
-                            NormResult::Skipped
-                        }
+                        _ => NormResult::Skipped,
                     }
                 }
             }
         }
     } else {
-        // Normalization disabled by user.
-        if let Some(p) = prefix {
-            cmd.args(["-af", p]);
-        }
         NormResult::Skipped
     };
 
@@ -885,14 +1090,6 @@ fn process_single_file(
     Ok(norm_result)
 }
 
-/// Applies Pass 2 loudnorm arguments to an existing Command.
-///
-/// Extracted to a separate function — used for both standard and padded paths,
-/// as the FFmpeg arguments are identical.
-///
-/// LRA=1.0 — very narrow dynamic range, minimizes 4-bit ADPCM quantization errors.
-/// linear=true — clean linear gain without extra compression in Pass 2.
-/// -ar — restores original sample rate after internal loudnorm resampling (192 kHz).
 fn apply_loudnorm_pass2(
     cmd: &mut Command,
     target_lufs: f32,
@@ -941,7 +1138,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+ eframe::run_native(
         "VOCAN",
         options,
         Box::new(move |_cc| Box::new(AudioBatchApp::new(ffmpeg_path))),

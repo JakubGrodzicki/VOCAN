@@ -21,7 +21,7 @@ fn silent_command(bin: &Path) -> Command {
 }
 
 use anyhow::Result;
-use std::sync::Arc;
+//use std::sync::Arc;
 
 // ===========================================================================
 // MODULE 1: Spectral Gate
@@ -74,14 +74,14 @@ pub fn apply_spectral_gate(
     let mut buf: Vec<Complex<f32>> = vec![Complex { re: 0.0, im: 0.0 }; fft_size];
 
     for c in 0..ch {
-        let ch_in: Vec<f32> = (0..frames_total).map(|i| samples[i * ch + c]).collect();
+        //let ch_in: Vec<f32> = (0..frames_total).map(|i| samples[i * ch + c]).collect();
         let mut ch_out = vec![0f32; frames_total];
         let mut bin_env = vec![0f32; fft_size / 2 + 1];
 
         let mut pos = 0usize;
-        while pos + fft_size <= ch_in.len() {
+        while pos + fft_size <= frames_total {
             for n in 0..fft_size {
-                buf[n].re = ch_in[pos + n] * window[n];
+                buf[n].re = samples[(pos + n) * ch + c] * window[n];
                 buf[n].im = 0.0;
             }
             fft.process(&mut buf);
@@ -125,6 +125,7 @@ pub fn apply_spectral_gate(
 // MODULE 2: Voice EQ (static biquad bank)
 // ===========================================================================
 
+#[allow(dead_code)]
 pub fn apply_voice_eq(samples: &[f32], sample_rate: u32, channels: u16, strength: f32) -> Result<Vec<f32>> {
     use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Q_BUTTERWORTH_F32, Type};
 
@@ -161,6 +162,44 @@ pub fn apply_voice_eq(samples: &[f32], sample_rate: u32, channels: u16, strength
         }
     }
     Ok(out)
+}
+
+pub fn apply_voice_eq_inplace(
+    buf: &mut [f32],
+    sample_rate: u32,
+    channels: u16,
+    strength: f32,
+) -> Result<()> {
+    use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Q_BUTTERWORTH_F32, Type};
+
+    let fs = (sample_rate as f32).hz();
+    let s = strength.clamp(0.0, 1.0);
+    let bands: [(Type<f32>, f32, f32); 4] = [
+        (Type::LowShelf(-3.0 * s), 120.0, Q_BUTTERWORTH_F32),
+        (Type::PeakingEQ(-1.5 * s), 400.0, 1.0),
+        (Type::PeakingEQ(2.0 * s), 2500.0, 1.2),
+        (Type::HighShelf(1.5 * s), 10000.0, Q_BUTTERWORTH_F32),
+    ];
+
+    let ch = channels as usize;
+    let frames = buf.len() / ch;
+
+    for c in 0..ch {
+        let mut filters: [DirectForm2Transposed<f32>; 4] = std::array::from_fn(|i| {
+            let (t, f, q) = bands[i];
+            let coeffs = Coefficients::<f32>::from_params(t, fs, f.hz(), q).unwrap();
+            DirectForm2Transposed::<f32>::new(coeffs)
+        });
+        for i in 0..frames {
+            let idx = i * ch + c;
+            let mut x = buf[idx];
+            for f in filters.iter_mut() {
+                x = <DirectForm2Transposed<f32> as Biquad<f32>>::run(f, x);
+            }
+            buf[idx] = x;
+        }
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -367,4 +406,4 @@ pub fn apply_dereverb_dfn3(
     Ok(out_samples)
 }
 
-pub type SharedParams = Arc<SpectralGateParams>;
+//pub type SharedParams = Arc<SpectralGateParams>;

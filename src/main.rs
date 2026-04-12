@@ -1,8 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 fn ffmpeg_cmd(ffmpeg: &Path) -> Command {
     let mut cmd = Command::new(ffmpeg);
     #[cfg(windows)]
@@ -21,6 +19,8 @@ use std::sync::{Arc, mpsc::{self, Receiver, Sender}};
 use std::thread;
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
+use std::sync::atomic::AtomicUsize;
+use rayon::prelude::*;
 
 mod audio_effects;
 
@@ -141,24 +141,20 @@ impl AudioBatchApp {
                     .collect();
 
                 let total = files.len();
-                let mut sum_lufs = 0.0f32;
-                let mut count = 0usize;
+                let done = Arc::new(AtomicUsize::new(0));
+                let sum = Arc::new(std::sync::Mutex::new((0.0f32, 0usize))); // (sum, count)
 
-                for (i, file) in files.iter().enumerate() {
+                files.par_iter().for_each(|file| {
                     if cancel.load(Ordering::Relaxed) {
-                        let _ = tx.send(AppMsg::Log("Analysis stopped by user.".into()));
-                        let _ = tx.send(AppMsg::Stopped);
-                        ctx.request_repaint();
                         return;
                     }
-
-                    let _ = tx.send(AppMsg::Progress(i + 1, total));
-                    ctx.request_repaint();
+                    let tx = tx.clone();
 
                     match measure_lufs(file, &ffmpeg_path) {
                         Ok(Some(val)) => {
-                            sum_lufs += val;
-                            count += 1;
+                            let mut guard = sum.lock().unwrap();
+                            guard.0 += val;
+                            guard.1 += 1;
                         }
                         Ok(None) => {
                             let _ = tx.send(AppMsg::Log(format!(
@@ -174,14 +170,26 @@ impl AudioBatchApp {
                             )));
                         }
                     }
+
+                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let _ = tx.send(AppMsg::Progress(n, total));
+                    ctx.request_repaint();
+                });
+
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(AppMsg::Log("Analysis stopped by user.".into()));
+                    let _ = tx.send(AppMsg::Stopped);
+                    ctx.request_repaint();
+                    return;
                 }
 
-                if count > 0 {
-                    let avg = sum_lufs / count as f32;
+                let (s, c) = *sum.lock().unwrap();
+                if c > 0 {
+                    let avg = s / c as f32;
                     let _ = tx.send(AppMsg::AnalysisResult(avg));
                     let _ = tx.send(AppMsg::Log(format!(
                         "Analysis finished. Average LUFS: {:.2} (from {} files)",
-                        avg, count
+                        avg, c
                     )));
                 } else {
                     let _ = tx.send(AppMsg::Error(
@@ -236,13 +244,13 @@ impl AudioBatchApp {
             let _ = tx.send(AppMsg::Progress(0, total));
             ctx.request_repaint();
 
-            for (i, file) in files.iter().enumerate() {
+            let done = Arc::new(AtomicUsize::new(0));
+
+            files.par_iter().for_each(|file| {
                 if cancel.load(Ordering::Relaxed) {
-                    let _ = tx.send(AppMsg::Log("Processing stopped by user.".into()));
-                    let _ = tx.send(AppMsg::Stopped);
-                    ctx.request_repaint();
                     return;
                 }
+                let tx = tx.clone();
 
                 match process_single_file(
                     file,
@@ -271,10 +279,7 @@ impl AudioBatchApp {
                                 format!("Processed (LUFS 2-pass): {}", file.display())
                             }
                             NormResult::Padded => {
-                                format!(
-                                    "Processed (LUFS 2-pass + padding): {}",
-                                    file.display()
-                                )
+                                format!("Processed (LUFS 2-pass + padding): {}", file.display())
                             }
                             NormResult::Peak { gain_db } => {
                                 format!(
@@ -293,12 +298,19 @@ impl AudioBatchApp {
                         let _ = tx.send(AppMsg::Log(msg));
                     }
                 }
-                let _ = tx.send(AppMsg::Progress(i + 1, total));
-                ctx.request_repaint();
-            }
 
-            let _ = tx.send(AppMsg::Log("Processing finished.".into()));
-            let _ = tx.send(AppMsg::Finished);
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                let _ = tx.send(AppMsg::Progress(n, total));
+                ctx.request_repaint();
+            });
+
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(AppMsg::Log("Processing stopped by user.".into()));
+                let _ = tx.send(AppMsg::Stopped);
+            } else {
+                let _ = tx.send(AppMsg::Log("Processing finished.".into()));
+                let _ = tx.send(AppMsg::Finished);
+            }
             ctx.request_repaint();
         });
     }
@@ -830,29 +842,32 @@ fn process_with_rust_dsp(
     // 1. Get original sample rate (to restore later)
     let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
 
-    // 2. First FFmpeg call: de-esser → raw f32le mono 48kHz to temporary file
-    let temp_in = NamedTempFile::new()?;
-    let temp_in_path = temp_in.path().to_str().unwrap();
-
-    let status = ffmpeg_cmd(ffmpeg)
+    // 2+3. FFmpeg de-esser → stdout (f32le) → memory (no temp file)
+    let mut child = ffmpeg_cmd(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
         .args(["-vn", "-af", &deesser_only_filter()])
-        .args(["-ac", "1", "-ar", "48000", "-f", "f32le"])
-        .arg(temp_in_path)
+        .args(["-ac", "1", "-ar", "48000", "-f", "f32le", "pipe:1"])
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
-        .context("FFmpeg error during de-esser pass")?;
+        .spawn()
+        .context("FFmpeg spawn failed (de-esser pass)")?;
 
-    if !status.status.success() {
-        let err = String::from_utf8_lossy(&status.stderr);
+    let mut raw = Vec::with_capacity(1 << 20);
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_to_end(&mut raw)?;
+    let status = child.wait().context("FFmpeg de-esser wait failed")?;
+    if !status.success() {
+        let mut err = String::new();
+        if let Some(mut s) = child.stderr.take() {
+            let _ = s.read_to_string(&mut err);
+        }
         return Err(anyhow!("FFmpeg de-esser pass failed: {}", err));
     }
 
-    // 3. Load samples
-    let mut file = std::fs::File::open(temp_in_path)?;
-    let mut raw = Vec::new();
-    file.read_to_end(&mut raw)?;
     let samples: Vec<f32> = raw
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -869,11 +884,11 @@ fn process_with_rust_dsp(
             attenuation_limit: 30.0,
             post_filter: dfn3_pf,
         };
-        // `ffmpeg` is already in this scope; we need path to deep-filter.
         let dfn_path = ffmpeg.parent().unwrap().join("deep-filter.exe");
         processed = audio_effects::apply_dereverb_dfn3(&processed, &params, &dfn_path, ffmpeg)?;
     }
 
+    // Denoise: spectral gate OR nnnoise (mutually exclusive)
     if use_sg {
         processed = audio_effects::apply_spectral_gate(
             &processed,
@@ -882,10 +897,14 @@ fn process_with_rust_dsp(
             &audio_effects::SpectralGateParams::default(),
         )?;
     } else if use_nn {
-        processed = audio_effects::apply_nnnoise(&processed, &audio_effects::NnnoiseParams::default())?;
+        processed = audio_effects::apply_nnnoise(
+            &processed,
+            &audio_effects::NnnoiseParams::default(),
+        )?;
     }
-    // Voice EQ always at 50% strength
-    processed = audio_effects::apply_voice_eq(&processed, 48000, 1, 0.5)?;
+
+    // Voice EQ always at 50% strength — LAST in the chain (in-place)
+    audio_effects::apply_voice_eq_inplace(&mut processed, 48000, 1, 0.5)?;
 
     // 5. Save processed samples to second temporary file
     let temp_out = NamedTempFile::new()?;
@@ -908,7 +927,6 @@ fn process_with_rust_dsp(
 
     // Normalization and encoding – adapted from existing logic
     let norm_result = if let Some(lufs) = target_lufs {
-        // Perform loudnorm analysis on processed signal (with post_filters prefix)
         match get_file_stats_with_filter(input, ffmpeg, lufs, &post_filters)? {
             Some(stats) => {
                 apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, Some(&post_filters));
@@ -1147,6 +1165,12 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default().with_inner_size([700.0, 700.0]),
         ..Default::default()
     };
+
+    let threads = num_cpus::get().saturating_sub(1).max(1);
+    rayon::ThreadPoolBuilder::new()
+    .num_threads(threads)
+    .build_global()
+    .ok(); // ignore if already initialized
 
  eframe::run_native(
         "VOCAN",

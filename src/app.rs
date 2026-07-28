@@ -8,7 +8,7 @@ use walkdir::WalkDir;
 
 use crate::ffmpeg::{is_audio_file, measure_lufs};
 use crate::processing::process_single_file;
-use crate::types::{AppMsg, NormResult};
+use crate::types::{AppMsg, NormResult, OutputFormat, ProcessingOptions, ReductionProfile};
 
 // ---------------------------------------------------------------------------
 // Application State
@@ -31,6 +31,16 @@ pub struct AudioBatchApp {
     automixer_dfn3_dereverb: bool,
     automixer_dfn3_mix: f32,
     automixer_dfn3_postfilter: bool,
+    /// Module 5: smart downward expander (noise-floor-based, bounded).
+    automixer_expander: bool,
+    /// 0–100, UI-facing "Safety Margin". Higher = more conservative.
+    automixer_expander_safety_pct: f32,
+    /// Preset reduction depth (Safe/Recommended/Hard/Max).
+    automixer_expander_reduction_profile: ReductionProfile,
+    /// Output format selector (ADPCM, PCM, FLAC, MP3, OGG).
+    output_format: OutputFormat,
+    /// Bitrate for lossy formats (MP3, OGG).
+    bitrate_kbps: u32,
     is_processing: bool,
     is_analyzing: bool,
     average_lufs: Option<f32>,
@@ -59,6 +69,11 @@ impl AudioBatchApp {
             automixer_dfn3_dereverb: false,
             automixer_dfn3_mix: 0.8,
             automixer_dfn3_postfilter: false,
+            automixer_expander: false,
+            automixer_expander_safety_pct: 50.0,
+            automixer_expander_reduction_profile: ReductionProfile::Recommended,
+            output_format: OutputFormat::default(),
+            bitrate_kbps: 128,
             is_processing: false,
             is_analyzing: false,
             average_lufs: None,
@@ -102,23 +117,37 @@ impl AudioBatchApp {
                     }
                     let tx = tx.clone();
 
-                    match measure_lufs(file, &ffmpeg_path) {
-                        Ok(Some(val)) => {
-                            let mut guard = sum.lock().unwrap();
+                    // Catch panics so a single failure doesn't poison the Mutex
+                    // or leave the UI stuck.
+                    let result = std::panic::catch_unwind(|| {
+                        measure_lufs(file, &ffmpeg_path)
+                    });
+
+                    match result {
+                        Ok(Ok(Some(val))) => {
+                            // Use unwrap_or_else to handle potential mutex poisoning
+                            // from a panicked thread gracefully.
+                            let mut guard = sum.lock().unwrap_or_else(|e| e.into_inner());
                             guard.0 += val;
                             guard.1 += 1;
                         }
-                        Ok(None) => {
+                        Ok(Ok(None)) => {
                             let _ = tx.send(AppMsg::Log(format!(
                                 "Skipped in analysis (too short/quiet): {}",
                                 file.display()
                             )));
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             let _ = tx.send(AppMsg::Log(format!(
                                 "Analysis error for {}: {}",
                                 file.display(),
                                 e
+                            )));
+                        }
+                        Err(_) => {
+                            let _ = tx.send(AppMsg::Error(format!(
+                                "Panic while analyzing: {}",
+                                file.display()
                             )));
                         }
                     }
@@ -135,7 +164,10 @@ impl AudioBatchApp {
                     return;
                 }
 
-                let (s, c) = *sum.lock().unwrap();
+                let (s, c) = {
+                    let guard = sum.lock().unwrap_or_else(|e| e.into_inner());
+                    *guard
+                };
                 if c > 0 {
                     let avg = s / c as f32;
                     let _ = tx.send(AppMsg::AnalysisResult(avg));
@@ -164,18 +196,25 @@ impl AudioBatchApp {
         let input_path = PathBuf::from(&self.input_dir);
         let output_path = PathBuf::from(&self.output_dir);
 
-        let lufs_option = if self.normalize_volume {
-            Some(self.target_lufs)
-        } else {
-            None
+        let opts = ProcessingOptions {
+            target_lufs: if self.normalize_volume {
+                Some(self.target_lufs)
+            } else {
+                None
+            },
+            target_peak_dbfs: self.target_peak_dbfs,
+            automixer: self.automixer,
+            automixer_spectral_gate: self.automixer_spectral_gate,
+            automixer_nn_dereverb: self.automixer_nn_dereverb,
+            automixer_dfn3_dereverb: self.automixer_dfn3_dereverb,
+            automixer_dfn3_mix: self.automixer_dfn3_mix,
+            automixer_dfn3_postfilter: self.automixer_dfn3_postfilter,
+            automixer_expander: self.automixer_expander,
+            automixer_expander_safety_pct: self.automixer_expander_safety_pct,
+            automixer_expander_reduction_profile: self.automixer_expander_reduction_profile,
+            output_format: self.output_format,
+            bitrate_kbps: self.bitrate_kbps,
         };
-        let target_peak = self.target_peak_dbfs;
-        let automixer = self.automixer;
-        let automixer_sg = self.automixer_spectral_gate;
-        let automixer_nn = self.automixer_nn_dereverb;
-        let automixer_dfn3 = self.automixer_dfn3_dereverb;
-        let automixer_dfn3_mix = self.automixer_dfn3_mix;
-        let automixer_dfn3_pf = self.automixer_dfn3_postfilter;
 
         let tx = self.sender.clone();
         let ffmpeg_path = self.ffmpeg_path.clone();
@@ -204,28 +243,27 @@ impl AudioBatchApp {
                 }
                 let tx = tx.clone();
 
-                match process_single_file(
-                    file,
-                    &input_path,
-                    &output_path,
-                    lufs_option,
-                    target_peak,
-                    automixer,
-                    automixer_sg,
-                    automixer_nn,
-                    automixer_dfn3,
-                    automixer_dfn3_mix,
-                    automixer_dfn3_pf,
-                    &ffmpeg_path,
-                ) {
-                    Err(e) => {
+                // Catch panics so a single file failure doesn't kill the worker
+                // thread and leave the UI stuck in "processing" forever.
+                let result = std::panic::catch_unwind(|| {
+                    process_single_file(
+                        file,
+                        &input_path,
+                        &output_path,
+                        &opts,
+                        &ffmpeg_path,
+                    )
+                });
+
+                match result {
+                    Ok(Err(e)) => {
                         let _ = tx.send(AppMsg::Error(format!(
                             "Error {}: {}",
                             file.display(),
                             e
                         )));
                     }
-                    Ok(norm_result) => {
+                    Ok(Ok(norm_result)) => {
                         let msg = match norm_result {
                             NormResult::Standard => {
                                 format!("Processed (LUFS 2-pass): {}", file.display())
@@ -248,6 +286,12 @@ impl AudioBatchApp {
                             }
                         };
                         let _ = tx.send(AppMsg::Log(msg));
+                    }
+                    Err(_) => {
+                        let _ = tx.send(AppMsg::Error(format!(
+                            "Panic while processing: {}",
+                            file.display()
+                        )));
                     }
                 }
 
@@ -370,6 +414,33 @@ impl eframe::App for AudioBatchApp {
             ui.add_space(10.0);
 
             ui.group(|ui| {
+                ui.label("Output Format:");
+                egui::ComboBox::from_label("Format")
+                    .selected_text(self.output_format.label())
+                    .show_ui(ui, |ui| {
+                        for &fmt in OutputFormat::all() {
+                            ui.selectable_value(&mut self.output_format, fmt, fmt.label());
+                        }
+                    });
+                if self.output_format.needs_bitrate() {
+                    ui.add(
+                        egui::Slider::new(&mut self.bitrate_kbps, 64..=320)
+                            .text("Bitrate (kbps)")
+                            .suffix(" kbps"),
+                    );
+                }
+                if self.output_format == OutputFormat::AdpcmWav {
+                    ui.label(
+                        egui::RichText::new("Suggested for video game voice-over")
+                            .small()
+                            .italics(),
+                    );
+                }
+            });
+
+            ui.add_space(10.0);
+
+            ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.automixer, "Automixer");
                     ui.label(
@@ -428,6 +499,63 @@ impl eframe::App for AudioBatchApp {
                                 &mut self.automixer_dfn3_postfilter,
                                 "Post-filter (aggressive)",
                             );
+                        });
+
+                        ui.separator();
+                        // Module 5: Downward Expander
+                        ui.horizontal(|ui| {
+                            ui.checkbox(
+                                &mut self.automixer_expander,
+                                "Downward Expander (noise floor)",
+                            );
+                            ui.label(
+                                egui::RichText::new("Compute heavy!")
+                                    .small()
+                                    .weak()
+                                    .italics(),
+                            );
+                        });
+                        ui.add_enabled_ui(self.automixer_expander, |ui| {
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.automixer_expander_safety_pct,
+                                    0.0..=100.0,
+                                )
+                                .text("Safety Margin")
+                                .suffix("%")
+                                .fixed_decimals(0),
+                            )
+                            .on_hover_text(
+                                "Higher = safer, touches less material.\n\
+                                 50% is a good starting point.\n\
+                                 The threshold sits below the detected noise floor\n\
+                                 by a margin derived from this setting.",
+                            );
+
+                            egui::ComboBox::from_label("Reduction profile")
+                                .selected_text(
+                                    self.automixer_expander_reduction_profile.label(),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for &profile in ReductionProfile::all() {
+                                        ui.selectable_value(
+                                            &mut self.automixer_expander_reduction_profile,
+                                            profile,
+                                            profile.label(),
+                                        );
+                                    }
+                                });
+
+                            if self.automixer_expander_reduction_profile
+                                == ReductionProfile::Max
+                            {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 200, 80),
+                                    "\u{26a0} MAX (-32 dB) is aggressive \u{2014} can sound \
+                                     like a hard gate on RMS-detected material below an \
+                                     already-conservative threshold.",
+                                );
+                            }
                         });
 
                         ui.label(

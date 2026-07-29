@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::Read;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use crate::audio_effects;
 use crate::ffmpeg::{
@@ -34,6 +34,58 @@ fn post_deesser_filters() -> String {
         "{},{},{},{},{},{},{},{}",
         hpf, eq_90, eq_175, eq_360, eq_1350, eq_4246, shelf_8k, comp
     )
+}
+
+// ---------------------------------------------------------------------------
+// Loudness normalization fallback helper
+// ---------------------------------------------------------------------------
+
+/// Attempts padded loudnorm measurement first, falls back to peak normalization.
+#[allow(clippy::too_many_arguments)]
+fn normalize_padded_or_peak(
+    input: &Path,
+    ffmpeg: &Path,
+    cmd: &mut Command,
+    target_lufs: f32,
+    source_sr: u32,
+    duration: f32,
+    prefix: Option<&str>,
+    opts: &ProcessingOptions,
+) -> Result<NormResult> {
+    let pad_secs = f32::max(5.0, duration + 1.0);
+    match get_file_stats_padded(input, ffmpeg, target_lufs, pad_secs, prefix)? {
+        Some(stats) => {
+            apply_loudnorm_pass2(cmd, target_lufs, &stats, source_sr, prefix);
+            Ok(NormResult::Padded)
+        }
+        None => {
+            match measure_peak_dbfs(input, ffmpeg, prefix) {
+                Ok(peak_dbfs) if peak_dbfs.is_finite() => {
+                    let gain_db = opts.target_peak_dbfs - peak_dbfs;
+                    if gain_db <= 40.0 {
+                        let vol_filter = format!("volume={:.4}dB", gain_db);
+                        let filter = match prefix {
+                            Some(p) => format!("{},{}", p, vol_filter),
+                            None => vol_filter,
+                        };
+                        cmd.args(["-af", &filter]);
+                        Ok(NormResult::Peak { gain_db })
+                    } else {
+                        if let Some(p) = prefix {
+                            cmd.args(["-af", p]);
+                        }
+                        Ok(NormResult::Skipped)
+                    }
+                }
+                _ => {
+                    if let Some(p) = prefix {
+                        cmd.args(["-af", p]);
+                    }
+                    Ok(NormResult::Skipped)
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,48 +259,23 @@ fn process_with_rust_dsp(
 
     // Normalization and encoding — stats measured on the PROCESSED temp WAV.
     let norm_result = if let Some(lufs) = opts.target_lufs {
-        match get_file_stats(&temp_wav_path, ffmpeg, lufs, Some(&post_filters))? {
-            Some(stats) => {
-                apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, Some(&post_filters));
-                NormResult::Standard
-            }
-            None => {
-                let duration = get_duration(&temp_wav_path, ffmpeg).unwrap_or(0.0);
-                if duration >= 1.0 {
-                    let pad_secs = f32::max(5.0, duration + 1.0);
-                    match get_file_stats_padded(
-                        &temp_wav_path, ffmpeg, lufs, pad_secs, Some(&post_filters),
-                    )? {
-                        Some(stats) => {
-                            apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, Some(&post_filters));
-                            NormResult::Padded
-                        }
-                        None => {
-                            cmd.args(["-af", &post_filters]);
-                            NormResult::Skipped
-                        }
-                    }
-                } else {
-                    match measure_peak_dbfs(&temp_wav_path, ffmpeg, Some(&post_filters)) {
-                        Ok(peak_dbfs) if peak_dbfs.is_finite() => {
-                            let gain_db = opts.target_peak_dbfs - peak_dbfs;
-                            if gain_db <= 40.0 {
-                                let vol_filter = format!("volume={:.4}dB", gain_db);
-                                let filter = format!("{},{}", post_filters, vol_filter);
-                                cmd.args(["-af", &filter]);
-                                NormResult::Peak { gain_db }
-                            } else {
-                                cmd.args(["-af", &post_filters]);
-                                NormResult::Skipped
-                            }
-                        }
-                        _ => {
-                            cmd.args(["-af", &post_filters]);
-                            NormResult::Skipped
-                        }
-                    }
+        let duration = get_duration(&temp_wav_path, ffmpeg).unwrap_or(0.0);
+        if duration >= 3.0 {
+            match get_file_stats(&temp_wav_path, ffmpeg, lufs, Some(&post_filters))? {
+                Some(stats) => {
+                    apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, Some(&post_filters));
+                    NormResult::Standard
                 }
+                None => normalize_padded_or_peak(
+                    &temp_wav_path, ffmpeg, &mut cmd, lufs, source_sr,
+                    duration, Some(&post_filters), opts,
+                )?,
             }
+        } else {
+            normalize_padded_or_peak(
+                &temp_wav_path, ffmpeg, &mut cmd, lufs, source_sr,
+                duration, Some(&post_filters), opts,
+            )?
         }
     } else {
         cmd.args(["-af", &post_filters]);
@@ -301,38 +328,23 @@ pub fn process_single_file(
 
     let norm_result = if let Some(lufs) = opts.target_lufs {
         let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
-        match get_file_stats(input, ffmpeg, lufs, None)? {
-            Some(stats) => {
-                apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, None);
-                NormResult::Standard
-            }
-            None => {
-                let duration = get_duration(input, ffmpeg).unwrap_or(0.0);
-                if duration >= 1.0 {
-                    let pad_secs = f32::max(5.0, duration + 1.0);
-                    match get_file_stats_padded(input, ffmpeg, lufs, pad_secs, None)? {
-                        Some(stats) => {
-                            apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, None);
-                            NormResult::Padded
-                        }
-                        None => NormResult::Skipped,
-                    }
-                } else {
-                    match measure_peak_dbfs(input, ffmpeg, None) {
-                        Ok(peak_dbfs) if peak_dbfs.is_finite() => {
-                            let gain_db = opts.target_peak_dbfs - peak_dbfs;
-                            if gain_db <= 40.0 {
-                                let vol_filter = format!("volume={:.4}dB", gain_db);
-                                cmd.args(["-af", &vol_filter]);
-                                NormResult::Peak { gain_db }
-                            } else {
-                                NormResult::Skipped
-                            }
-                        }
-                        _ => NormResult::Skipped,
-                    }
+        let duration = get_duration(input, ffmpeg).unwrap_or(0.0);
+        if duration >= 3.0 {
+            match get_file_stats(input, ffmpeg, lufs, None)? {
+                Some(stats) => {
+                    apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, None);
+                    NormResult::Standard
                 }
+                None => normalize_padded_or_peak(
+                    input, ffmpeg, &mut cmd, lufs, source_sr,
+                    duration, None, opts,
+                )?,
             }
+        } else {
+            normalize_padded_or_peak(
+                input, ffmpeg, &mut cmd, lufs, source_sr,
+                duration, None, opts,
+            )?
         }
     } else {
         NormResult::Skipped

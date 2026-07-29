@@ -122,13 +122,15 @@ When the Automixer is disabled, files go straight to FFmpeg for optional loudnes
 
 ### Loudness Analysis Fallback
 
-| File Duration | Method                                                     |
-| ------------- | ---------------------------------------------------------- |
-| ≥ 3 s         | Standard two-pass EBU R128                                 |
-| 1 s … 3 s     | Two-pass with silence padding to at least 5 s              |
-| < 1 s         | Peak normalization to `target_peak_dbfs` (default −3 dBFS) |
+| File Duration | Method                                                                        |
+| ------------- | ----------------------------------------------------------------------------- |
+| ≥ 3 s         | Standard two-pass EBU R128                                                    |
+| < 3 s         | Two-pass EBU R128 with silence padding to at least 5 s                        |
+| (last resort) | Peak normalization to `target_peak_dbfs` (default −3 dBFS, gain capped at 40 dB) |
 
-If a file is completely silent or contains only negligible signal, it is converted without normalization and logged as _Skipped_.
+Files shorter than 3 seconds always use the padded pass so that FFmpeg's `loudnorm` filter has enough integration time for a reliable EBU R128 integrated loudness measurement.
+Silence is excluded by the −70 LUFS absolute gate, so the measurement reflects only the actual audio content.
+Pass 2 normalizes the original unpadded file.
 
 ## Logging and Error Handling
 

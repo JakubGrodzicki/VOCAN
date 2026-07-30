@@ -119,7 +119,7 @@ fn process_single_file_with_missing_ffmpeg_returns_err_not_panic() {
         automixer_expander: false,
         automixer_expander_safety_pct: 50.0,
         automixer_expander_reduction_profile: ReductionProfile::Recommended,
-        output_format: OutputFormat::Pcm32fWav,
+        output_format: OutputFormat::Pcm24Wav,
         bitrate_kbps: 128,
     };
 
@@ -159,7 +159,7 @@ fn norm_result_matches_decision_table_at_boundary_durations() {
         automixer_expander: false,
         automixer_expander_safety_pct: 50.0,
         automixer_expander_reduction_profile: ReductionProfile::Recommended,
-        output_format: OutputFormat::Pcm32fWav,
+        output_format: OutputFormat::Pcm24Wav,
         bitrate_kbps: 128,
     };
 

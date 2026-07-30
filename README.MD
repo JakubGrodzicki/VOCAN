@@ -48,7 +48,7 @@ VOCAN can write these formats:
 
 - 4-bit IMA ADPCM WAV. This is the default format. Use this format for game voice-over.
 - 16-bit PCM WAV.
-- 32-bit float WAV. This format is lossless.
+- 24-bit PCM WAV. This is the standard bit depth for professional audio work.
 - FLAC. This format uses lossless compression.
 - MP3. You can set the bitrate, from 64 to 320 kbps.
 - OGG Vorbis. You can set the bitrate, from 64 to 320 kbps.

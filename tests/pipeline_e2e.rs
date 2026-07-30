@@ -30,7 +30,7 @@ fn base_opts() -> ProcessingOptions {
         automixer_expander: false,
         automixer_expander_safety_pct: 50.0,
         automixer_expander_reduction_profile: ReductionProfile::Recommended,
-        output_format: OutputFormat::Pcm32fWav,
+        output_format: OutputFormat::Pcm24Wav,
         bitrate_kbps: 128,
     }
 }
@@ -97,7 +97,7 @@ fn output_lufs_within_tolerance_of_target() {
 
     let mut opts = base_opts();
     opts.target_lufs = Some(-16.0);
-    opts.output_format = OutputFormat::Pcm32fWav; // lossless -> tight tolerance is fair
+    opts.output_format = OutputFormat::Pcm24Wav; // lossless -> tight tolerance is fair
 
     process_single_file(
         &input_path,
@@ -135,7 +135,7 @@ fn automixer_pipeline_produces_finite_non_clipping_output() {
     opts.automixer = true;
     opts.automixer_spectral_gate = true;
     opts.automixer_expander = true;
-    opts.output_format = OutputFormat::Pcm32fWav; // easy to read back with hound
+    opts.output_format = OutputFormat::Pcm24Wav; // easy to read back with hound
 
     process_single_file(
         &input_path,
@@ -196,7 +196,7 @@ fn automixer_toggle_combinations_do_not_error() {
         opts.automixer_spectral_gate = sg;
         opts.automixer_nn_dereverb = nn;
         opts.automixer_expander = exp;
-        opts.output_format = OutputFormat::Pcm32fWav;
+        opts.output_format = OutputFormat::Pcm24Wav;
 
         process_single_file(
             &input_path,

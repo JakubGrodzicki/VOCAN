@@ -3,6 +3,10 @@ name = "VOCAN"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "vocan"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow = "1.0.81"
 eframe = "0.27.2"

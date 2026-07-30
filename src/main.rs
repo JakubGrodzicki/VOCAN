@@ -1,13 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-mod app;
-mod audio_effects;
-mod ffmpeg;
-mod processing;
-mod types;
-
 use eframe::egui;
 use std::path::PathBuf;
+use vocan::{app, ffmpeg};
 
 fn configure_fonts_and_style(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -25,7 +20,7 @@ fn configure_fonts_and_style(ctx: &egui::Context) {
     }
 
     // Load Segoe UI Semibold for headings.
-    if let Ok(data) = std::fs::read("C:/Windows/Fonts/seguisb.ttf") {
+    let heading_font_loaded = if let Ok(data) = std::fs::read("C:/Windows/Fonts/seguisb.ttf") {
         fonts
             .font_data
             .insert("segoe_ui_sb".to_owned(), egui::FontData::from_owned(data));
@@ -34,16 +29,23 @@ fn configure_fonts_and_style(ctx: &egui::Context) {
             .entry(egui::FontFamily::Name("heading".into()))
             .or_default()
             .insert(0, "segoe_ui_sb".to_owned());
-    }
+        true
+    } else {
+        false
+    };
 
     ctx.set_fonts(fonts);
 
     // Slightly larger text sizes for comfortable reading on high-DPI displays.
     let mut style = (*ctx.style()).clone();
-    let heading_family = if style.text_styles.is_empty() {
-        egui::FontFamily::Proportional
-    } else {
+    // Only use the "heading" font family if we actually registered a font
+    // under that name above -- referencing an unregistered FontFamily::Name
+    // panics on first render. This is the case on any non-Windows platform,
+    // where the Segoe UI Semibold file simply doesn't exist.
+    let heading_family = if heading_font_loaded {
         egui::FontFamily::Name("heading".into())
+    } else {
+        egui::FontFamily::Proportional
     };
 
     style.text_styles = [

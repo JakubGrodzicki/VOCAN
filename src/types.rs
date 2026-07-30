@@ -44,16 +44,11 @@ impl ReductionProfile {
 
     /// All variants in dropdown order.
     pub fn all() -> &'static [ReductionProfile] {
-        &[
-            Self::Safe,
-            Self::Recommended,
-            Self::Hard,
-            Self::Max,
-        ]
+        &[Self::Safe, Self::Recommended, Self::Hard, Self::Max]
     }
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct LoudnormStats {
     pub input_i: String,
     pub input_tp: String,
@@ -63,14 +58,18 @@ pub struct LoudnormStats {
 }
 
 /// Describes the normalization method used for a file -- used for logging.
+#[derive(Debug, PartialEq)]
 pub enum NormResult {
-    /// Standard 2-pass EBU R128 (files >= ~3s).
+    /// Standard 2-pass EBU R128 (files >= 3s).
     Standard,
-    /// 2-pass EBU R128 with silence padding (files ~1-3s, returning -inf without padding).
+    /// 2-pass EBU R128 with silence padding (files < 3s, or files >= 3s whose
+    /// standard pass returned -inf/invalid).
     Padded,
-    /// Peak normalization (files < 1s, too short for EBU R128 integration).
+    /// Peak normalization fallback, used only when EBU R128 measurement
+    /// (standard or padded) failed to produce a valid loudness value.
     Peak { gain_db: f32 },
-    /// Conversion without normalization (extreme fallback -- silent or empty signal).
+    /// Conversion without normalization (extreme fallback -- silent or empty signal,
+    /// or peak gain would exceed the 40dB safety cap).
     Skipped,
 }
 
@@ -191,4 +190,68 @@ pub struct ProcessingOptions {
     pub output_format: OutputFormat,
     /// Bitrate in kbps for lossy formats (MP3, OGG). Ignored for lossless.
     pub bitrate_kbps: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduction_profile_db_matches_documented_values() {
+        assert_eq!(ReductionProfile::Safe.db(), -8.0);
+        assert_eq!(ReductionProfile::Recommended.db(), -12.0);
+        assert_eq!(ReductionProfile::Hard.db(), -18.0);
+        assert_eq!(ReductionProfile::Max.db(), -32.0);
+    }
+
+    #[test]
+    fn reduction_profile_all_lists_every_variant_once() {
+        let all = ReductionProfile::all();
+        assert_eq!(all.len(), 4);
+        assert_eq!(
+            all,
+            &[
+                ReductionProfile::Safe,
+                ReductionProfile::Recommended,
+                ReductionProfile::Hard,
+                ReductionProfile::Max,
+            ]
+        );
+    }
+
+    #[test]
+    fn reduction_profile_default_is_recommended() {
+        assert_eq!(ReductionProfile::default(), ReductionProfile::Recommended);
+    }
+
+    #[test]
+    fn output_format_extension_codec_and_bitrate_flag_are_consistent() {
+        let cases: &[(OutputFormat, &str, &str, bool)] = &[
+            (OutputFormat::AdpcmWav, "wav", "adpcm_ima_wav", false),
+            (OutputFormat::Pcm16Wav, "wav", "pcm_s16le", false),
+            (OutputFormat::Pcm32fWav, "wav", "pcm_f32le", false),
+            (OutputFormat::Flac, "flac", "flac", false),
+            (OutputFormat::Mp3, "mp3", "libmp3lame", true),
+            (OutputFormat::Ogg, "ogg", "libvorbis", true),
+        ];
+        for (format, extension, codec, needs_bitrate) in cases {
+            assert_eq!(format.extension(), *extension, "{format:?} extension");
+            assert_eq!(format.ffmpeg_codec(), *codec, "{format:?} codec");
+            assert_eq!(
+                format.needs_bitrate(),
+                *needs_bitrate,
+                "{format:?} needs_bitrate"
+            );
+        }
+    }
+
+    #[test]
+    fn output_format_all_lists_every_variant_once() {
+        assert_eq!(OutputFormat::all().len(), 6);
+    }
+
+    #[test]
+    fn output_format_default_is_adpcm_wav() {
+        assert_eq!(OutputFormat::default(), OutputFormat::AdpcmWav);
+    }
 }

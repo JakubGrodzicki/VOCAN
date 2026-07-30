@@ -1,14 +1,14 @@
 use anyhow::{anyhow, Context, Result};
 use std::io::Read;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 use crate::audio_effects;
 use crate::ffmpeg::{
     apply_loudnorm_pass2, ffmpeg_cmd, get_duration, get_file_stats, get_file_stats_padded,
     get_sample_rate, measure_peak_dbfs,
 };
-use crate::types::{NormResult, OutputFormat, ProcessingOptions};
+use crate::types::{LoudnormStats, NormResult, OutputFormat, ProcessingOptions};
 
 // ---------------------------------------------------------------------------
 // Automixer filter chains
@@ -34,6 +34,155 @@ fn post_deesser_filters() -> String {
         "{},{},{},{},{},{},{},{}",
         hpf, eq_90, eq_175, eq_360, eq_1350, eq_4246, shelf_8k, comp
     )
+}
+
+// ---------------------------------------------------------------------------
+// Loudness normalization decision logic
+// ---------------------------------------------------------------------------
+
+/// Which loudness-normalization strategy to use, carrying whatever measured
+/// data is needed to actually apply it.
+///
+/// Kept separate from [`NormResult`] (the logging-facing summary) because this
+/// type also carries the measured [`LoudnormStats`]/gain needed by
+/// [`apply_norm_decision`] to build the FFmpeg filter args.
+#[derive(Debug, PartialEq)]
+pub(crate) enum NormDecision {
+    /// Standard 2-pass EBU R128 stats (duration >= 3.0s, first pass succeeded).
+    Standard(LoudnormStats),
+    /// 2-pass EBU R128 stats measured on a silence-padded copy of the input.
+    Padded(LoudnormStats),
+    /// Peak-normalization fallback with the computed gain.
+    Peak { gain_db: f32 },
+    /// No normalization applied.
+    Skipped,
+}
+
+/// Pure decision: given already-measured (or not-yet-attempted) data, decide
+/// which normalization strategy applies. No I/O, no ffmpeg invocation.
+///
+/// `standard_stats` is only consulted when `duration >= 3.0` -- below that
+/// threshold the standard (unpadded) pass is never attempted by the caller,
+/// mirroring the real measurement flow (see [`measure_and_decide_normalization`]).
+fn decide_normalization(
+    duration: f32,
+    standard_stats: Option<&LoudnormStats>,
+    padded_stats: Option<&LoudnormStats>,
+    peak_dbfs: Option<f32>,
+    target_peak_dbfs: f32,
+) -> NormDecision {
+    if duration >= 3.0 {
+        if let Some(stats) = standard_stats {
+            return NormDecision::Standard(stats.clone());
+        }
+    }
+    if let Some(stats) = padded_stats {
+        return NormDecision::Padded(stats.clone());
+    }
+    match peak_dbfs {
+        Some(peak) if peak.is_finite() => {
+            let gain_db = target_peak_dbfs - peak;
+            if gain_db <= 40.0 {
+                NormDecision::Peak { gain_db }
+            } else {
+                NormDecision::Skipped
+            }
+        }
+        _ => NormDecision::Skipped,
+    }
+}
+
+/// Measures whatever is needed (standard -> padded -> peak, stopping as soon
+/// as one succeeds) and returns the resulting [`NormDecision`]. This is the
+/// only place that shells out to ffmpeg for normalization measurement;
+/// `decide_normalization` itself stays pure and independently testable.
+fn measure_and_decide_normalization(
+    input: &Path,
+    ffmpeg: &Path,
+    target_lufs: f32,
+    duration: f32,
+    prefix: Option<&str>,
+    target_peak_dbfs: f32,
+) -> Result<NormDecision> {
+    let standard_stats = if duration >= 3.0 {
+        get_file_stats(input, ffmpeg, target_lufs, prefix)?
+    } else {
+        None
+    };
+    if matches!(
+        decide_normalization(
+            duration,
+            standard_stats.as_ref(),
+            None,
+            None,
+            target_peak_dbfs
+        ),
+        NormDecision::Standard(_)
+    ) {
+        return Ok(NormDecision::Standard(standard_stats.unwrap()));
+    }
+
+    let pad_secs = f32::max(5.0, duration + 1.0);
+    let padded_stats = get_file_stats_padded(input, ffmpeg, target_lufs, pad_secs, prefix)?;
+    if matches!(
+        decide_normalization(
+            duration,
+            standard_stats.as_ref(),
+            padded_stats.as_ref(),
+            None,
+            target_peak_dbfs
+        ),
+        NormDecision::Padded(_)
+    ) {
+        return Ok(NormDecision::Padded(padded_stats.unwrap()));
+    }
+
+    let peak_dbfs = measure_peak_dbfs(input, ffmpeg, prefix)
+        .ok()
+        .filter(|p| p.is_finite());
+    Ok(decide_normalization(
+        duration,
+        standard_stats.as_ref(),
+        padded_stats.as_ref(),
+        peak_dbfs,
+        target_peak_dbfs,
+    ))
+}
+
+/// Applies a [`NormDecision`] to the FFmpeg command (pass-2 filter args) and
+/// returns the corresponding [`NormResult`] for logging.
+fn apply_norm_decision(
+    cmd: &mut Command,
+    decision: &NormDecision,
+    target_lufs: f32,
+    source_sr: u32,
+    prefix: Option<&str>,
+) -> NormResult {
+    match decision {
+        NormDecision::Standard(stats) => {
+            apply_loudnorm_pass2(cmd, target_lufs, stats, source_sr, prefix);
+            NormResult::Standard
+        }
+        NormDecision::Padded(stats) => {
+            apply_loudnorm_pass2(cmd, target_lufs, stats, source_sr, prefix);
+            NormResult::Padded
+        }
+        NormDecision::Peak { gain_db } => {
+            let vol_filter = format!("volume={:.4}dB", gain_db);
+            let filter = match prefix {
+                Some(p) => format!("{},{}", p, vol_filter),
+                None => vol_filter,
+            };
+            cmd.args(["-af", &filter]);
+            NormResult::Peak { gain_db: *gain_db }
+        }
+        NormDecision::Skipped => {
+            if let Some(p) = prefix {
+                cmd.args(["-af", p]);
+            }
+            NormResult::Skipped
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +277,11 @@ fn process_with_rust_dsp(
             post_filter: opts.automixer_dfn3_postfilter,
         };
         // Look for deep-filter binary next to ffmpeg, or next to our exe.
-        let dfn_name = if cfg!(windows) { "deep-filter.exe" } else { "deep-filter" };
+        let dfn_name = if cfg!(windows) {
+            "deep-filter.exe"
+        } else {
+            "deep-filter"
+        };
         let dfn_path = ffmpeg
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -153,7 +306,8 @@ fn process_with_rust_dsp(
                 reduction_profile: opts.automixer_expander_reduction_profile,
                 ..Default::default()
             };
-            processed = audio_effects::apply_expander(&processed, 48000, 1, &params, noise_floor_db);
+            processed =
+                audio_effects::apply_expander(&processed, 48000, 1, &params, noise_floor_db);
         }
     }
 
@@ -166,10 +320,8 @@ fn process_with_rust_dsp(
             &audio_effects::SpectralGateParams::default(),
         )?;
     } else if opts.automixer_nn_dereverb {
-        processed = audio_effects::apply_nnnoise(
-            &processed,
-            &audio_effects::NnnoiseParams::default(),
-        )?;
+        processed =
+            audio_effects::apply_nnnoise(&processed, &audio_effects::NnnoiseParams::default())?;
     }
 
     // Voice EQ always at 50% strength — LAST in the chain (in-place)
@@ -191,8 +343,8 @@ fn process_with_rust_dsp(
             sample_format: hound::SampleFormat::Float,
             channels: 1,
         };
-        let mut writer = hound::WavWriter::create(&temp_wav_path, spec)
-            .context("cannot write temp wav")?;
+        let mut writer =
+            hound::WavWriter::create(&temp_wav_path, spec).context("cannot write temp wav")?;
         for &s in &processed {
             writer.write_sample(s)?;
         }
@@ -201,55 +353,24 @@ fn process_with_rust_dsp(
 
     // 6. Second FFmpeg call: temp WAV → filters (HPF, EQ, compressor) → normalization → encoding
     let mut cmd = ffmpeg_cmd(ffmpeg);
-    cmd.args(["-y", "-hide_banner", "-i"]).arg(&temp_wav_path).arg("-vn");
+    cmd.args(["-y", "-hide_banner", "-i"])
+        .arg(&temp_wav_path)
+        .arg("-vn");
 
     let post_filters = post_deesser_filters();
 
     // Normalization and encoding — stats measured on the PROCESSED temp WAV.
     let norm_result = if let Some(lufs) = opts.target_lufs {
-        match get_file_stats(&temp_wav_path, ffmpeg, lufs, Some(&post_filters))? {
-            Some(stats) => {
-                apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, Some(&post_filters));
-                NormResult::Standard
-            }
-            None => {
-                let duration = get_duration(&temp_wav_path, ffmpeg).unwrap_or(0.0);
-                if duration >= 1.0 {
-                    let pad_secs = f32::max(5.0, duration + 1.0);
-                    match get_file_stats_padded(
-                        &temp_wav_path, ffmpeg, lufs, pad_secs, Some(&post_filters),
-                    )? {
-                        Some(stats) => {
-                            apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, Some(&post_filters));
-                            NormResult::Padded
-                        }
-                        None => {
-                            cmd.args(["-af", &post_filters]);
-                            NormResult::Skipped
-                        }
-                    }
-                } else {
-                    match measure_peak_dbfs(&temp_wav_path, ffmpeg, Some(&post_filters)) {
-                        Ok(peak_dbfs) if peak_dbfs.is_finite() => {
-                            let gain_db = opts.target_peak_dbfs - peak_dbfs;
-                            if gain_db <= 40.0 {
-                                let vol_filter = format!("volume={:.4}dB", gain_db);
-                                let filter = format!("{},{}", post_filters, vol_filter);
-                                cmd.args(["-af", &filter]);
-                                NormResult::Peak { gain_db }
-                            } else {
-                                cmd.args(["-af", &post_filters]);
-                                NormResult::Skipped
-                            }
-                        }
-                        _ => {
-                            cmd.args(["-af", &post_filters]);
-                            NormResult::Skipped
-                        }
-                    }
-                }
-            }
-        }
+        let duration = get_duration(&temp_wav_path, ffmpeg).unwrap_or(0.0);
+        let decision = measure_and_decide_normalization(
+            &temp_wav_path,
+            ffmpeg,
+            lufs,
+            duration,
+            Some(&post_filters),
+            opts.target_peak_dbfs,
+        )?;
+        apply_norm_decision(&mut cmd, &decision, lufs, source_sr, Some(&post_filters))
     } else {
         cmd.args(["-af", &post_filters]);
         NormResult::Skipped
@@ -283,7 +404,9 @@ pub fn process_single_file(
     ffmpeg: &Path,
 ) -> Result<NormResult> {
     let rel_path = input.strip_prefix(input_base)?;
-    let output = output_base.join(rel_path).with_extension(opts.output_format.extension());
+    let output = output_base
+        .join(rel_path)
+        .with_extension(opts.output_format.extension());
 
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -301,39 +424,16 @@ pub fn process_single_file(
 
     let norm_result = if let Some(lufs) = opts.target_lufs {
         let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
-        match get_file_stats(input, ffmpeg, lufs, None)? {
-            Some(stats) => {
-                apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, None);
-                NormResult::Standard
-            }
-            None => {
-                let duration = get_duration(input, ffmpeg).unwrap_or(0.0);
-                if duration >= 1.0 {
-                    let pad_secs = f32::max(5.0, duration + 1.0);
-                    match get_file_stats_padded(input, ffmpeg, lufs, pad_secs, None)? {
-                        Some(stats) => {
-                            apply_loudnorm_pass2(&mut cmd, lufs, &stats, source_sr, None);
-                            NormResult::Padded
-                        }
-                        None => NormResult::Skipped,
-                    }
-                } else {
-                    match measure_peak_dbfs(input, ffmpeg, None) {
-                        Ok(peak_dbfs) if peak_dbfs.is_finite() => {
-                            let gain_db = opts.target_peak_dbfs - peak_dbfs;
-                            if gain_db <= 40.0 {
-                                let vol_filter = format!("volume={:.4}dB", gain_db);
-                                cmd.args(["-af", &vol_filter]);
-                                NormResult::Peak { gain_db }
-                            } else {
-                                NormResult::Skipped
-                            }
-                        }
-                        _ => NormResult::Skipped,
-                    }
-                }
-            }
-        }
+        let duration = get_duration(input, ffmpeg).unwrap_or(0.0);
+        let decision = measure_and_decide_normalization(
+            input,
+            ffmpeg,
+            lufs,
+            duration,
+            None,
+            opts.target_peak_dbfs,
+        )?;
+        apply_norm_decision(&mut cmd, &decision, lufs, source_sr, None)
     } else {
         NormResult::Skipped
     };
@@ -352,4 +452,158 @@ pub fn process_single_file(
     }
 
     Ok(norm_result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats() -> LoudnormStats {
+        LoudnormStats {
+            input_i: "-23.5".to_string(),
+            input_tp: "-6.0".to_string(),
+            input_lra: "5.0".to_string(),
+            input_thresh: "-33.5".to_string(),
+            target_offset: "0.5".to_string(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_normalization: boundary-duration table.
+    //
+    // This pins down the exact behavior introduced by the "Changed padding
+    // logic" refactor (commit 8122883): the 1.0s threshold no longer exists
+    // (short files always try padded loudnorm first, never jump straight to
+    // peak normalization), and the 3.0s threshold gates whether the standard
+    // (unpadded) pass is even attempted.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn short_file_with_valid_padded_stats_uses_padded_at_0_9s() {
+        let decision = decide_normalization(0.9, None, Some(&stats()), None, -3.0);
+        assert_eq!(decision, NormDecision::Padded(stats()));
+    }
+
+    #[test]
+    fn short_file_with_valid_padded_stats_uses_padded_at_1_0s() {
+        // Proves the old 1.0s threshold has no effect anymore: at exactly
+        // 1.0s (which used to be the padding/peak boundary) the result is
+        // still Padded, purely because padded_stats succeeded.
+        let decision = decide_normalization(1.0, None, Some(&stats()), None, -3.0);
+        assert_eq!(decision, NormDecision::Padded(stats()));
+    }
+
+    #[test]
+    fn short_file_with_valid_padded_stats_uses_padded_at_2_9s() {
+        let decision = decide_normalization(2.9, None, Some(&stats()), None, -3.0);
+        assert_eq!(decision, NormDecision::Padded(stats()));
+    }
+
+    #[test]
+    fn file_at_3_0s_with_valid_standard_stats_uses_standard() {
+        // Boundary is inclusive: duration >= 3.0 attempts standard.
+        let decision = decide_normalization(3.0, Some(&stats()), None, None, -3.0);
+        assert_eq!(decision, NormDecision::Standard(stats()));
+    }
+
+    #[test]
+    fn file_at_3_1s_with_valid_standard_stats_uses_standard() {
+        let decision = decide_normalization(3.1, Some(&stats()), None, None, -3.0);
+        assert_eq!(decision, NormDecision::Standard(stats()));
+    }
+
+    #[test]
+    fn file_at_3_1s_falls_back_to_padded_when_standard_measurement_failed() {
+        let decision = decide_normalization(3.1, None, Some(&stats()), None, -3.0);
+        assert_eq!(decision, NormDecision::Padded(stats()));
+    }
+
+    #[test]
+    fn falls_back_to_peak_when_both_standard_and_padded_fail() {
+        let decision = decide_normalization(5.0, None, None, Some(-6.0), -3.0);
+        assert_eq!(decision, NormDecision::Peak { gain_db: 3.0 });
+    }
+
+    #[test]
+    fn peak_gain_exceeding_40db_cap_is_skipped() {
+        // target=-3.0, peak=-50.0 => gain_db = 47.0 > 40.0 cap.
+        let decision = decide_normalization(5.0, None, None, Some(-50.0), -3.0);
+        assert_eq!(decision, NormDecision::Skipped);
+    }
+
+    #[test]
+    fn missing_peak_measurement_is_skipped() {
+        let decision = decide_normalization(5.0, None, None, None, -3.0);
+        assert_eq!(decision, NormDecision::Skipped);
+    }
+
+    #[test]
+    fn extremely_short_file_still_prefers_padded_over_peak_when_padded_succeeds() {
+        // The exact case that changed in the refactor: pre-refactor code
+        // never attempted padded loudnorm below 1.0s. Post-refactor, padded
+        // is tried unconditionally for any duration < 3.0s.
+        let decision = decide_normalization(0.1, None, Some(&stats()), Some(-1.0), -3.0);
+        assert_eq!(decision, NormDecision::Padded(stats()));
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_norm_decision: Peak/Skipped build the expected -af filter args
+    // (Standard/Padded delegate filter-building to apply_loudnorm_pass2,
+    // covered separately in ffmpeg.rs).
+    // -----------------------------------------------------------------------
+
+    fn args_of(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn apply_peak_decision_adds_volume_filter_with_prefix() {
+        let mut cmd = Command::new("ffmpeg");
+        let result = apply_norm_decision(
+            &mut cmd,
+            &NormDecision::Peak { gain_db: 2.5 },
+            -16.0,
+            44100,
+            Some("highpass=f=70"),
+        );
+        assert_eq!(result, NormResult::Peak { gain_db: 2.5 });
+        let args = args_of(&cmd);
+        assert_eq!(args, vec!["-af", "highpass=f=70,volume=2.5000dB"]);
+    }
+
+    #[test]
+    fn apply_peak_decision_adds_volume_filter_without_prefix() {
+        let mut cmd = Command::new("ffmpeg");
+        apply_norm_decision(
+            &mut cmd,
+            &NormDecision::Peak { gain_db: -1.0 },
+            -16.0,
+            44100,
+            None,
+        );
+        assert_eq!(args_of(&cmd), vec!["-af", "volume=-1.0000dB"]);
+    }
+
+    #[test]
+    fn apply_skipped_decision_keeps_prefix_filters_only() {
+        let mut cmd = Command::new("ffmpeg");
+        let result = apply_norm_decision(
+            &mut cmd,
+            &NormDecision::Skipped,
+            -16.0,
+            44100,
+            Some("highpass=f=70"),
+        );
+        assert_eq!(result, NormResult::Skipped);
+        assert_eq!(args_of(&cmd), vec!["-af", "highpass=f=70"]);
+    }
+
+    #[test]
+    fn apply_skipped_decision_without_prefix_adds_no_args() {
+        let mut cmd = Command::new("ffmpeg");
+        apply_norm_decision(&mut cmd, &NormDecision::Skipped, -16.0, 44100, None);
+        assert!(args_of(&cmd).is_empty());
+    }
 }

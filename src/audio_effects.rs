@@ -1,7 +1,7 @@
 //! Additional DSP modules for Automixer.
 //!
 //! All functions operate on interleaved f32 PCM, mono or stereo,
-//! at the sample_rate provided as an argument. They return Vec<f32> 
+//! at the sample_rate provided as an argument. They return Vec<f32>
 //! in the same format.
 //!
 //! Dependencies in Cargo.toml:
@@ -22,6 +22,7 @@ use crate::types::ReductionProfile;
 
 /// Creates a Command with CREATE_NO_WINDOW on Windows (for non-FFmpeg binaries).
 fn silent_command(bin: &Path) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(bin);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000);
@@ -41,7 +42,12 @@ pub struct SpectralGateParams {
 
 impl Default for SpectralGateParams {
     fn default() -> Self {
-        Self { threshold_db: -45.0, ratio: 2.0, attack_s: 0.002, release_s: 0.080 }
+        Self {
+            threshold_db: -45.0,
+            ratio: 2.0,
+            attack_s: 0.002,
+            release_s: 0.080,
+        }
     }
 }
 
@@ -105,7 +111,10 @@ pub fn apply_spectral_gate(
                 buf[k].re *= gain;
                 buf[k].im *= gain;
                 if k > 0 && k < fft_size / 2 {
-                    buf[fft_size - k] = Complex { re: buf[k].re, im: -buf[k].im };
+                    buf[fft_size - k] = Complex {
+                        re: buf[k].re,
+                        im: -buf[k].im,
+                    };
                 }
             }
 
@@ -130,8 +139,13 @@ pub fn apply_spectral_gate(
 // ===========================================================================
 
 #[allow(dead_code)]
-pub fn apply_voice_eq(samples: &[f32], sample_rate: u32, channels: u16, strength: f32) -> Result<Vec<f32>> {
-    use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Q_BUTTERWORTH_F32, Type};
+pub fn apply_voice_eq(
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    strength: f32,
+) -> Result<Vec<f32>> {
+    use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Type, Q_BUTTERWORTH_F32};
 
     let fs = (sample_rate as f32).hz();
     let s = strength.clamp(0.0, 1.0);
@@ -174,7 +188,7 @@ pub fn apply_voice_eq_inplace(
     channels: u16,
     strength: f32,
 ) -> Result<()> {
-    use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Q_BUTTERWORTH_F32, Type};
+    use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Type, Q_BUTTERWORTH_F32};
 
     let fs = (sample_rate as f32).hz();
     let s = strength.clamp(0.0, 1.0);
@@ -197,7 +211,12 @@ pub fn apply_voice_eq_inplace(
                     .map_err(|e| anyhow::anyhow!("biquad coeffs failed for band {}: {:?}", i, e))?,
             );
         }
-        [arr[0].unwrap(), arr[1].unwrap(), arr[2].unwrap(), arr[3].unwrap()]
+        [
+            arr[0].unwrap(),
+            arr[1].unwrap(),
+            arr[2].unwrap(),
+            arr[3].unwrap(),
+        ]
     };
 
     for c in 0..ch {
@@ -272,7 +291,11 @@ pub fn apply_nnnoise(samples_48k_mono: &[f32], params: &NnnoiseParams) -> Result
 
     for i in 0..dry_len {
         let dry = samples_48k_mono[i];
-        let wet_sample = if i + shift < wet.len() { wet[i + shift] } else { 0.0 };
+        let wet_sample = if i + shift < wet.len() {
+            wet[i + shift]
+        } else {
+            0.0
+        };
         out.push(dry * (1.0 - mix) + wet_sample * mix);
     }
 
@@ -306,7 +329,11 @@ pub struct DereverbParams {
 
 impl Default for DereverbParams {
     fn default() -> Self {
-        Self { mix: 0.8, attenuation_limit: 30.0, post_filter: false }
+        Self {
+            mix: 0.8,
+            attenuation_limit: 30.0,
+            post_filter: false,
+        }
     }
 }
 
@@ -335,9 +362,7 @@ fn read_wav_f32(path: &Path) -> Result<Vec<f32>> {
 
     // Convert any sample format to f32.
     let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => {
-            reader.samples::<f32>().filter_map(|s| s.ok()).collect()
-        }
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
         hound::SampleFormat::Int => {
             let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
             reader
@@ -390,7 +415,10 @@ pub fn apply_dereverb_dfn3(
 
     let mut cmd = silent_command(dfn_binary);
     cmd.arg("-D")
-        .args(["-a", &format!("{:.1}", params.attenuation_limit.clamp(0.0, 100.0))])
+        .args([
+            "-a",
+            &format!("{:.1}", params.attenuation_limit.clamp(0.0, 100.0)),
+        ])
         .arg("-o")
         .arg(out_dir.path())
         .arg(&wav_in_path);
@@ -398,9 +426,7 @@ pub fn apply_dereverb_dfn3(
         cmd.arg("--pf");
     }
 
-    let out = cmd
-        .output()
-        .context("deep-filter invocation failed")?;
+    let out = cmd.output().context("deep-filter invocation failed")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("deep-filter returned non-zero: {}", stderr);
@@ -610,7 +636,14 @@ pub fn apply_expander(
         let mut rms_sum_sq = 0.0f32; // running sum of squares for RMS
         let mut rms_buf = vec![0.0f32; rms_win]; // circular buffer
         let mut rms_buf_idx = 0usize;
-        let mut env_db = f32::MIN; // envelope in dB (start very low)
+        // Envelope in dB. Bootstrapped from the first frame's det_db (below)
+        // rather than started at f32::MIN: with the one-pole attack/release
+        // smoothing below, climbing from f32::MIN to a normal dB range takes
+        // ~40000 samples (~800ms at 48kHz) regardless of actual signal
+        // level, producing a spurious "attack from silence" at the start of
+        // every processed file.
+        let mut env_db = 0.0f32;
+        let mut env_initialized = false;
         let mut gain_lin = 1.0f32; // current smoothed gain
         let mut hold_counter = 0usize;
 
@@ -632,12 +665,17 @@ pub fn apply_expander(
             };
 
             // --- Level envelope (attack/release on dB) ---
-            let coef = if det_db > env_db {
-                attack_coef
+            if !env_initialized {
+                env_db = det_db;
+                env_initialized = true;
             } else {
-                release_coef
-            };
-            env_db = det_db + coef * (env_db - det_db);
+                let coef = if det_db > env_db {
+                    attack_coef
+                } else {
+                    release_coef
+                };
+                env_db = det_db + coef * (env_db - det_db);
+            }
 
             // --- Gain computer (soft knee, bounded) ---
             //
@@ -678,8 +716,13 @@ pub fn apply_expander(
                 hold_counter = 0;
             }
 
-            // If in hold period, prevent gain from decreasing.
-            let effective_target = if hold_counter > 0 && hold_counter <= hold_samples {
+            // If in hold period, prevent gain from decreasing. Strictly less
+            // than `hold_samples`: once the counter reaches `hold_samples`
+            // (hold has fully elapsed), target_gain must apply normally again.
+            // (A `<=` here would freeze the gain permanently on any signal
+            // that stays quiet longer than hold_ms, since the counter above
+            // is clamped at `hold_samples` and never grows past it.)
+            let effective_target = if hold_counter > 0 && hold_counter < hold_samples {
                 gain_lin.max(target_gain)
             } else {
                 target_gain
@@ -699,4 +742,269 @@ pub fn apply_expander(
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Synthetic signal helpers (no external `rand` dependency).
+    // -----------------------------------------------------------------------
+
+    fn sine_wave(freq_hz: f32, sample_rate: u32, secs: f32, amplitude: f32) -> Vec<f32> {
+        let n = (sample_rate as f32 * secs) as usize;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                amplitude * (2.0 * std::f32::consts::PI * freq_hz * t).sin()
+            })
+            .collect()
+    }
+
+    /// Deterministic xorshift32 white noise generator, values in `[-amplitude, amplitude]`.
+    fn xorshift_noise(len: usize, amplitude: f32, seed: u32) -> Vec<f32> {
+        let mut state = seed.max(1);
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let normalized = (state as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                normalized * amplitude
+            })
+            .collect()
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    // -----------------------------------------------------------------------
+    // safety_pct_to_margin_db -- formula documented in README:
+    // margin_db = 2.0 + (pct/100) * (8.0 - 2.0)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn safety_pct_to_margin_db_matches_formula_at_endpoints_and_midpoint() {
+        assert!((safety_pct_to_margin_db(0.0) - 2.0).abs() < 1e-6);
+        assert!((safety_pct_to_margin_db(50.0) - 5.0).abs() < 1e-6);
+        assert!((safety_pct_to_margin_db(100.0) - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn safety_pct_to_margin_db_clamps_out_of_range_input() {
+        assert!((safety_pct_to_margin_db(-10.0) - 2.0).abs() < 1e-6);
+        assert!((safety_pct_to_margin_db(150.0) - 8.0).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // estimate_noise_floor_db
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn estimate_noise_floor_db_on_empty_returns_none() {
+        assert_eq!(estimate_noise_floor_db(&[], 48000), None);
+    }
+
+    #[test]
+    fn estimate_noise_floor_db_on_zero_sample_rate_returns_none() {
+        let samples = xorshift_noise(48000, 0.1, 1);
+        assert_eq!(estimate_noise_floor_db(&samples, 0), None);
+    }
+
+    #[test]
+    fn estimate_noise_floor_db_too_short_returns_none() {
+        // win_len at 48kHz is round(48000*0.025) = 1200 samples; 500 < that.
+        let samples = xorshift_noise(500, 0.1, 1);
+        assert_eq!(estimate_noise_floor_db(&samples, 48000), None);
+    }
+
+    #[test]
+    fn estimate_noise_floor_db_on_pure_silence_returns_none() {
+        let samples = vec![0.0f32; 96000]; // 2s at 48kHz, well above the length floor
+        assert_eq!(estimate_noise_floor_db(&samples, 48000), None);
+    }
+
+    #[test]
+    fn estimate_noise_floor_db_scales_exactly_with_amplitude() {
+        // Same underlying noise, two amplitudes -- windowing/percentile selection
+        // is purely multiplicative, so the estimated floor must shift by exactly
+        // 20*log10(ratio), regardless of window-shape implementation details.
+        let base = xorshift_noise(96000, 1.0, 42);
+        let loud: Vec<f32> = base.iter().map(|s| s * 0.5).collect();
+        let quiet: Vec<f32> = base.iter().map(|s| s * 0.05).collect();
+
+        let floor_loud = estimate_noise_floor_db(&loud, 48000).expect("loud floor");
+        let floor_quiet = estimate_noise_floor_db(&quiet, 48000).expect("quiet floor");
+
+        let expected_diff_db = 20.0 * (0.5f32 / 0.05f32).log10(); // 20 dB
+        assert!(
+            (floor_loud - floor_quiet - expected_diff_db).abs() < 0.1,
+            "floor_loud={floor_loud}, floor_quiet={floor_quiet}, expected diff={expected_diff_db}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_expander
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_expander_on_empty_signal_returns_empty() {
+        let params = ExpanderParams::default();
+        assert!(apply_expander(&[], 48000, 1, &params, -40.0).is_empty());
+    }
+
+    #[test]
+    fn apply_expander_zero_channels_returns_input_unchanged() {
+        let samples = sine_wave(440.0, 48000, 0.1, 0.5);
+        let params = ExpanderParams::default();
+        let out = apply_expander(&samples, 48000, 0, &params, -40.0);
+        assert_eq!(out, samples);
+    }
+
+    #[test]
+    fn apply_expander_never_produces_nan_or_inf() {
+        let mut samples = xorshift_noise(48000, 0.3, 7);
+        samples.extend(vec![0.0f32; 4800]); // silence segment
+        samples.extend(sine_wave(880.0, 48000, 0.5, 0.8));
+        let params = ExpanderParams::default();
+        let out = apply_expander(&samples, 48000, 1, &params, -40.0);
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn apply_expander_loud_signal_stays_near_unity_gain_after_attack() {
+        // A sine well above the noise floor for its whole duration; after the
+        // ~10ms default attack settles, gain should be close to 1.0.
+        let sr = 48000u32;
+        let samples = sine_wave(440.0, sr, 1.0, 0.5);
+        let params = ExpanderParams::default();
+        let out = apply_expander(&samples, sr, 1, &params, -40.0);
+
+        // Skip the first 50ms (attack warm-up) and compare the tail.
+        let warmup = (sr as f32 * 0.05) as usize;
+        let in_tail_rms = rms(&samples[warmup..]);
+        let out_tail_rms = rms(&out[warmup..]);
+        let ratio = out_tail_rms / in_tail_rms;
+        assert!(
+            (0.9..=1.1).contains(&ratio),
+            "expected near-unity gain, got ratio={ratio}"
+        );
+    }
+
+    #[test]
+    fn apply_expander_deeply_quiet_signal_settles_near_reduction_profile_cap() {
+        // A very quiet, sustained tone far below (noise_floor - margin), held
+        // long enough (2s >> attack/release/hold time constants) for the
+        // envelope to fully settle to the profile's capped attenuation.
+        let sr = 48000u32;
+        let samples = sine_wave(440.0, sr, 2.0, 0.001); // very low level
+        let params = ExpanderParams {
+            reduction_profile: ReductionProfile::Recommended, // -12.0 dB cap
+            ..Default::default()
+        };
+        // noise_floor_db well above the signal level so it's deep in the gate region.
+        let out = apply_expander(&samples, sr, 1, &params, -20.0);
+
+        let tail_start = samples.len() - 4800; // last 100ms
+        let in_tail_rms = rms(&samples[tail_start..]);
+        let out_tail_rms = rms(&out[tail_start..]);
+        let measured_gain_db = 20.0 * (out_tail_rms / in_tail_rms).log10();
+
+        assert!(
+            (measured_gain_db - (-12.0)).abs() < 1.0,
+            "expected settled gain near -12.0 dB, got {measured_gain_db}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_spectral_gate
+    //
+    // The gate compares FFT-bin magnitudes (unnormalized) against a
+    // dB-derived linear threshold, so its absolute numeric behavior depends
+    // on FFT-size/window normalization details. Rather than assert exact
+    // gain values (which would require running the real FFT to verify),
+    // these tests stick to invariants that hold regardless of that scale:
+    // output length, finiteness, and monotonicity in input level.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_spectral_gate_output_length_matches_input() {
+        let samples = xorshift_noise(5000, 0.2, 3);
+        let out = apply_spectral_gate(&samples, 48000, 1, &SpectralGateParams::default()).unwrap();
+        assert_eq!(out.len(), samples.len());
+    }
+
+    #[test]
+    fn apply_spectral_gate_shorter_than_fft_window_returns_zeros_same_length() {
+        let samples = xorshift_noise(100, 0.2, 3); // shorter than fft_size (2048)
+        let out = apply_spectral_gate(&samples, 48000, 1, &SpectralGateParams::default()).unwrap();
+        assert_eq!(out.len(), samples.len());
+        assert!(out.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn apply_spectral_gate_never_produces_nan_or_inf() {
+        let samples = xorshift_noise(96000, 0.3, 5);
+        let out = apply_spectral_gate(&samples, 48000, 1, &SpectralGateParams::default()).unwrap();
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn apply_spectral_gate_is_monotonic_in_input_level() {
+        // The gate's gain is a non-decreasing function of the per-bin envelope,
+        // which itself scales with input amplitude -- so a louder copy of the
+        // same waveform must never produce a quieter output.
+        let quiet = xorshift_noise(96000, 0.05, 5);
+        let loud: Vec<f32> = quiet.iter().map(|s| s * 10.0).collect();
+
+        let out_quiet =
+            apply_spectral_gate(&quiet, 48000, 1, &SpectralGateParams::default()).unwrap();
+        let out_loud =
+            apply_spectral_gate(&loud, 48000, 1, &SpectralGateParams::default()).unwrap();
+
+        assert!(rms(&out_loud) >= rms(&out_quiet));
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_voice_eq_inplace
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_voice_eq_inplace_zero_strength_is_near_identity() {
+        // At strength=0.0 all bands are configured for 0dB gain, which for
+        // shelving/peaking biquads is a true allpass (unity magnitude
+        // response) -- RMS should be preserved after the initial transient.
+        let original = sine_wave(300.0, 48000, 1.0, 0.4);
+        let mut buf = original.clone();
+        apply_voice_eq_inplace(&mut buf, 48000, 1, 0.0).unwrap();
+        assert!(buf.iter().all(|s| s.is_finite()));
+
+        let settle = 500; // skip filter startup transient
+        let ratio = rms(&buf[settle..]) / rms(&original[settle..]);
+        assert!((0.9..=1.1).contains(&ratio), "ratio={ratio}");
+    }
+
+    #[test]
+    fn apply_voice_eq_inplace_full_strength_stays_finite() {
+        let mut buf = xorshift_noise(48000, 0.3, 11);
+        apply_voice_eq_inplace(&mut buf, 48000, 1, 1.0).unwrap();
+        assert!(buf.iter().all(|s| s.is_finite()));
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_nnnoise
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_nnnoise_preserves_length_and_is_finite() {
+        let samples = sine_wave(300.0, 48000, 1.0, 0.3);
+        let out = apply_nnnoise(&samples, &NnnoiseParams::default()).unwrap();
+        assert_eq!(out.len(), samples.len());
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
 }

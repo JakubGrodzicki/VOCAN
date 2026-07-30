@@ -1,9 +1,12 @@
 use eframe::egui;
+use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc::{self, Receiver, Sender}};
+use std::sync::{
+    mpsc::{self, Receiver, Sender},
+    Arc,
+};
 use std::thread;
-use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::ffmpeg::{is_audio_file, measure_lufs};
@@ -19,7 +22,8 @@ pub struct AudioBatchApp {
     output_dir: String,
     normalize_volume: bool,
     target_lufs: f32,
-    /// Target peak (dBFS) used for files < 1s (peak normalization).
+    /// Target peak (dBFS) used as a peak-normalization fallback when EBU R128
+    /// loudness measurement (standard or padded) fails.
     target_peak_dbfs: f32,
     /// Applies a fixed processing chain (EQ → De-esser → Compressor) before normalization.
     automixer: bool,
@@ -93,8 +97,10 @@ impl AudioBatchApp {
             self.is_analyzing = true;
             self.average_lufs = None;
             self.cancel_flag.store(false, Ordering::Relaxed);
-            self.logs
-                .push(format!("Started folder analysis: {}", folder_path.display()));
+            self.logs.push(format!(
+                "Started folder analysis: {}",
+                folder_path.display()
+            ));
 
             let tx = self.sender.clone();
             let ffmpeg_path = self.ffmpeg_path.clone();
@@ -119,9 +125,7 @@ impl AudioBatchApp {
 
                     // Catch panics so a single failure doesn't poison the Mutex
                     // or leave the UI stuck.
-                    let result = std::panic::catch_unwind(|| {
-                        measure_lufs(file, &ffmpeg_path)
-                    });
+                    let result = std::panic::catch_unwind(|| measure_lufs(file, &ffmpeg_path));
 
                     match result {
                         Ok(Ok(Some(val))) => {
@@ -246,22 +250,12 @@ impl AudioBatchApp {
                 // Catch panics so a single file failure doesn't kill the worker
                 // thread and leave the UI stuck in "processing" forever.
                 let result = std::panic::catch_unwind(|| {
-                    process_single_file(
-                        file,
-                        &input_path,
-                        &output_path,
-                        &opts,
-                        &ffmpeg_path,
-                    )
+                    process_single_file(file, &input_path, &output_path, &opts, &ffmpeg_path)
                 });
 
                 match result {
                     Ok(Err(e)) => {
-                        let _ = tx.send(AppMsg::Error(format!(
-                            "Error {}: {}",
-                            file.display(),
-                            e
-                        )));
+                        let _ = tx.send(AppMsg::Error(format!("Error {}: {}", file.display(), e)));
                     }
                     Ok(Ok(norm_result)) => {
                         let msg = match norm_result {
@@ -398,14 +392,16 @@ impl eframe::App for AudioBatchApp {
                 ui.add_enabled_ui(self.normalize_volume, |ui| {
                     ui.add(
                         egui::Slider::new(&mut self.target_lufs, -23.0..=-6.0)
-                            .text("Target LUFS-I (files >= 1s)"),
+                            .text("Target LUFS-I (EBU R128, padded below 3s)"),
                     );
                     ui.add(
                         egui::Slider::new(&mut self.target_peak_dbfs, -12.0..=-1.0)
-                            .text("Target peak dBFS (files < 1s)"),
+                            .text("Target peak dBFS (fallback)"),
                     )
                     .on_hover_text(
-                        "Peak normalization used for very short samples (< 1s).\n\
+                        "Peak normalization fallback, used only when EBU R128 loudness \
+                         measurement (standard or padded) fails -- typically for silent \
+                         or near-silent samples.\n\
                          Recommended: -3 dBFS (safe headroom for 4-bit ADPCM).",
                     );
                 });
@@ -444,9 +440,11 @@ impl eframe::App for AudioBatchApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.automixer, "Automixer");
                     ui.label(
-                        egui::RichText::new("(De-esser -> EQ -> Compressor, applied before normalization)")
-                            .weak()
-                            .italics(),
+                        egui::RichText::new(
+                            "(De-esser -> EQ -> Compressor, applied before normalization)",
+                        )
+                        .weak()
+                        .italics(),
                     );
                 });
 
@@ -533,9 +531,7 @@ impl eframe::App for AudioBatchApp {
                             );
 
                             egui::ComboBox::from_label("Reduction profile")
-                                .selected_text(
-                                    self.automixer_expander_reduction_profile.label(),
-                                )
+                                .selected_text(self.automixer_expander_reduction_profile.label())
                                 .show_ui(ui, |ui| {
                                     for &profile in ReductionProfile::all() {
                                         ui.selectable_value(
@@ -546,9 +542,7 @@ impl eframe::App for AudioBatchApp {
                                     }
                                 });
 
-                            if self.automixer_expander_reduction_profile
-                                == ReductionProfile::Max
-                            {
+                            if self.automixer_expander_reduction_profile == ReductionProfile::Max {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(255, 200, 80),
                                     "\u{26a0} MAX (-32 dB) is aggressive \u{2014} can sound \
@@ -568,7 +562,8 @@ impl eframe::App for AudioBatchApp {
 
                 if self.automixer {
                     ui.add_space(4.0);
-                    let warning = "\u{26a0}  Attention! There is no way to create a universal mixing \
+                    let warning =
+                        "\u{26a0}  Attention! There is no way to create a universal mixing \
                         tool. This is the closest I can think of to a universal mixing chain \
                         without doing proper mixing, but the results may drastically vary based \
                         on the provided material. Use with caution!";
@@ -590,7 +585,11 @@ impl eframe::App for AudioBatchApp {
 
             if self.is_processing || self.is_analyzing {
                 ui.add_space(10.0);
-                let label = if self.is_analyzing { "Analyzing" } else { "Processing" };
+                let label = if self.is_analyzing {
+                    "Analyzing"
+                } else {
+                    "Processing"
+                };
                 let progress = if self.total_files > 0 {
                     self.current_progress as f32 / self.total_files as f32
                 } else {
@@ -607,13 +606,15 @@ impl eframe::App for AudioBatchApp {
                     );
                     if ui
                         .add(egui::Button::new(
-                            egui::RichText::new("\u{23f9} Stop").color(egui::Color32::from_rgb(255, 90, 90)),
+                            egui::RichText::new("\u{23f9} Stop")
+                                .color(egui::Color32::from_rgb(255, 90, 90)),
                         ))
                         .on_hover_text("Stop after the current file finishes")
                         .clicked()
                     {
                         self.cancel_flag.store(true, Ordering::Relaxed);
-                        self.logs.push("Stop requested \u{2014} waiting for current file...".into());
+                        self.logs
+                            .push("Stop requested \u{2014} waiting for current file...".into());
                     }
                 });
             }
@@ -636,5 +637,111 @@ impl eframe::App for AudioBatchApp {
                     }
                 });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests construct `AudioBatchApp` directly and drive
+    // `handle_messages()` via its own mpsc channel -- no `eframe::run_native`,
+    // no window, no rendering. As a `#[cfg(test)] mod` nested inside `app`,
+    // this can see all of `AudioBatchApp`'s private fields without any
+    // visibility changes to the struct itself.
+
+    fn test_app() -> AudioBatchApp {
+        AudioBatchApp::new(PathBuf::from("ffmpeg"))
+    }
+
+    #[test]
+    fn handle_messages_appends_log_line() {
+        let mut app = test_app();
+        app.sender.send(AppMsg::Log("hello".to_string())).unwrap();
+        app.handle_messages();
+        assert_eq!(app.logs, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn handle_messages_prefixes_error_with_error_tag() {
+        let mut app = test_app();
+        app.sender.send(AppMsg::Error("boom".to_string())).unwrap();
+        app.handle_messages();
+        assert_eq!(app.logs, vec!["[ERROR] boom".to_string()]);
+    }
+
+    #[test]
+    fn handle_messages_updates_progress_counters() {
+        let mut app = test_app();
+        app.sender.send(AppMsg::Progress(3, 10)).unwrap();
+        app.handle_messages();
+        assert_eq!(app.current_progress, 3);
+        assert_eq!(app.total_files, 10);
+    }
+
+    #[test]
+    fn handle_messages_finished_clears_processing_and_analyzing_flags() {
+        let mut app = test_app();
+        app.is_processing = true;
+        app.is_analyzing = true;
+        app.sender.send(AppMsg::Finished).unwrap();
+        app.handle_messages();
+        assert!(!app.is_processing);
+        assert!(!app.is_analyzing);
+    }
+
+    #[test]
+    fn handle_messages_stopped_clears_processing_and_analyzing_flags() {
+        let mut app = test_app();
+        app.is_processing = true;
+        app.is_analyzing = true;
+        app.sender.send(AppMsg::Stopped).unwrap();
+        app.handle_messages();
+        assert!(!app.is_processing);
+        assert!(!app.is_analyzing);
+    }
+
+    #[test]
+    fn handle_messages_analysis_result_sets_average_lufs() {
+        let mut app = test_app();
+        app.sender.send(AppMsg::AnalysisResult(-16.3)).unwrap();
+        app.handle_messages();
+        assert_eq!(app.average_lufs, Some(-16.3));
+    }
+
+    #[test]
+    fn handle_messages_drains_multiple_queued_messages_in_order() {
+        let mut app = test_app();
+        app.sender.send(AppMsg::Log("a".to_string())).unwrap();
+        app.sender.send(AppMsg::Progress(1, 2)).unwrap();
+        app.sender.send(AppMsg::Log("b".to_string())).unwrap();
+        app.handle_messages();
+        assert_eq!(app.logs, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(app.current_progress, 1);
+        assert_eq!(app.total_files, 2);
+    }
+
+    #[test]
+    fn handle_messages_on_empty_channel_is_a_no_op() {
+        let mut app = test_app();
+        app.handle_messages();
+        assert!(app.logs.is_empty());
+        assert_eq!(app.current_progress, 0);
+        assert_eq!(app.total_files, 0);
+    }
+
+    #[test]
+    fn new_app_has_sane_defaults() {
+        let app = test_app();
+        assert!(!app.normalize_volume);
+        assert!(!app.automixer);
+        assert!(!app.is_processing);
+        assert!(!app.is_analyzing);
+        assert_eq!(app.average_lufs, None);
+        assert_eq!(app.output_format, OutputFormat::AdpcmWav);
+        assert_eq!(
+            app.automixer_expander_reduction_profile,
+            ReductionProfile::Recommended
+        );
     }
 }

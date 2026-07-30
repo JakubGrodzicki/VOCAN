@@ -100,8 +100,8 @@ pub enum OutputFormat {
     AdpcmWav,
     /// 16-bit PCM WAV -- universal compatibility.
     Pcm16Wav,
-    /// 32-bit float WAV -- lossless, ideal for re-normalization.
-    Pcm32fWav,
+    /// 24-bit PCM WAV -- industry-standard bit depth for professional audio.
+    Pcm24Wav,
     /// FLAC -- lossless compression.
     Flac,
     /// MP3 -- lossy, widely compatible.
@@ -116,7 +116,7 @@ impl OutputFormat {
         match self {
             Self::AdpcmWav => "adpcm_ima_wav",
             Self::Pcm16Wav => "pcm_s16le",
-            Self::Pcm32fWav => "pcm_f32le",
+            Self::Pcm24Wav => "pcm_s24le",
             Self::Flac => "flac",
             Self::Mp3 => "libmp3lame",
             Self::Ogg => "libvorbis",
@@ -126,7 +126,7 @@ impl OutputFormat {
     /// Returns the file extension (without leading dot) for this format.
     pub fn extension(&self) -> &'static str {
         match self {
-            Self::AdpcmWav | Self::Pcm16Wav | Self::Pcm32fWav => "wav",
+            Self::AdpcmWav | Self::Pcm16Wav | Self::Pcm24Wav => "wav",
             Self::Flac => "flac",
             Self::Mp3 => "mp3",
             Self::Ogg => "ogg",
@@ -143,7 +143,7 @@ impl OutputFormat {
         match self {
             Self::AdpcmWav => "4-bit ADPCM WAV (suggested for game VO)",
             Self::Pcm16Wav => "16-bit PCM WAV",
-            Self::Pcm32fWav => "32-bit float WAV (lossless)",
+            Self::Pcm24Wav => "24-bit PCM WAV (industry standard)",
             Self::Flac => "FLAC (lossless)",
             Self::Mp3 => "MP3",
             Self::Ogg => "OGG Vorbis",
@@ -155,7 +155,7 @@ impl OutputFormat {
         &[
             Self::AdpcmWav,
             Self::Pcm16Wav,
-            Self::Pcm32fWav,
+            Self::Pcm24Wav,
             Self::Flac,
             Self::Mp3,
             Self::Ogg,
@@ -229,7 +229,7 @@ mod tests {
         let cases: &[(OutputFormat, &str, &str, bool)] = &[
             (OutputFormat::AdpcmWav, "wav", "adpcm_ima_wav", false),
             (OutputFormat::Pcm16Wav, "wav", "pcm_s16le", false),
-            (OutputFormat::Pcm32fWav, "wav", "pcm_f32le", false),
+            (OutputFormat::Pcm24Wav, "wav", "pcm_s24le", false),
             (OutputFormat::Flac, "flac", "flac", false),
             (OutputFormat::Mp3, "mp3", "libmp3lame", true),
             (OutputFormat::Ogg, "ogg", "libvorbis", true),

@@ -8,6 +8,9 @@
 *.rs.bk
 Cargo.lock.bak
 
+# --- Ready-to-run output folder created by installMacLinux.sh / installWindows.ps1
+/VOCAN-App/
+
 # --- Editors / IDEs -----------------------------------------------------------
 .vscode/
 .idea/

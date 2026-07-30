@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use crate::types::LoudnormStats;
 
 pub fn ffmpeg_cmd(ffmpeg: &Path) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(ffmpeg);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
@@ -22,8 +23,21 @@ pub fn is_audio_file(path: &Path) -> bool {
             .map(|e| e.to_ascii_lowercase())
             .as_deref(),
         Some(
-            "wav" | "wave" | "mp3" | "flac" | "aiff" | "aif" | "ogg" | "opus"
-                | "m4a" | "aac" | "wma" | "mp2" | "ac3" | "dts" | "mka"
+            "wav"
+                | "wave"
+                | "mp3"
+                | "flac"
+                | "aiff"
+                | "aif"
+                | "ogg"
+                | "opus"
+                | "m4a"
+                | "aac"
+                | "wma"
+                | "mp2"
+                | "ac3"
+                | "dts"
+                | "mka"
         )
     )
 }
@@ -44,8 +58,11 @@ pub fn find_ffmpeg() -> Result<PathBuf> {
 
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            let candidate =
-                exe_dir.join(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+            let candidate = exe_dir.join(if cfg!(windows) {
+                "ffmpeg.exe"
+            } else {
+                "ffmpeg"
+            });
             if candidate.is_file() {
                 let local_probe = Command::new(&candidate)
                     .arg("-version")
@@ -78,7 +95,9 @@ pub fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let tokens: Vec<&str> = stderr.split_whitespace().collect();
     for window in tokens.windows(2) {
-        if window[1] == "Hz" {
+        // Real ffmpeg output is "<rate> Hz, <channels> ..." -- "Hz" carries
+        // a trailing comma, so it must be trimmed just like the number is.
+        if window[1].trim_end_matches(',') == "Hz" {
             if let Ok(sr) = window[0].trim_end_matches(',').parse::<u32>() {
                 if (8_000..=192_000).contains(&sr) {
                     return Some(sr);
@@ -274,4 +293,59 @@ pub fn extract_loudnorm_stats(stderr: &str) -> Result<LoudnormStats> {
     let json_str = &stderr[start_idx..=end_idx];
     let stats: LoudnormStats = serde_json::from_str(json_str)?;
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Representative capture of real `ffmpeg -af loudnorm=...:print_format=json`
+    // stderr output (banner lines trimmed, JSON block kept verbatim in shape).
+    const SAMPLE_STDERR: &str = r#"
+Input #0, wav, from 'input.wav':
+  Duration: 00:00:05.00, bitrate: 1411 kb/s
+Stream #0:0: Audio: pcm_s16le, 44100 Hz, mono, s16, 705 kb/s
+[Parsed_loudnorm_0 @ 0x7f8b3b008dc0]
+{
+	"input_i" : "-23.50",
+	"input_tp" : "-6.00",
+	"input_lra" : "5.00",
+	"input_thresh" : "-33.50",
+	"output_i" : "-23.00",
+	"output_tp" : "-2.00",
+	"output_lra" : "5.00",
+	"output_thresh" : "-33.00",
+	"normalization_type" : "dynamic",
+	"target_offset" : "0.50"
+}
+size=N/A time=00:00:05.00 bitrate=N/A speed=  42x
+"#;
+
+    #[test]
+    fn extract_loudnorm_stats_parses_trailing_json() {
+        let stats = extract_loudnorm_stats(SAMPLE_STDERR).unwrap();
+        assert_eq!(stats.input_i, "-23.50");
+        assert_eq!(stats.input_tp, "-6.00");
+        assert_eq!(stats.input_lra, "5.00");
+        assert_eq!(stats.input_thresh, "-33.50");
+        assert_eq!(stats.target_offset, "0.50");
+    }
+
+    #[test]
+    fn extract_loudnorm_stats_missing_json_errors() {
+        let stderr = "Input #0, wav, from 'input.wav':\nno json here at all\n";
+        assert!(extract_loudnorm_stats(stderr).is_err());
+    }
+
+    #[test]
+    fn extract_loudnorm_stats_malformed_json_errors() {
+        let stderr = "[Parsed_loudnorm_0]\n{ this is not valid json }\n";
+        assert!(extract_loudnorm_stats(stderr).is_err());
+    }
+
+    #[test]
+    fn extract_loudnorm_stats_only_opening_brace_errors() {
+        let stderr = "[Parsed_loudnorm_0]\n{ \"input_i\": \"-23.50\" \n";
+        assert!(extract_loudnorm_stats(stderr).is_err());
+    }
 }

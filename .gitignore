@@ -1,0 +1,52 @@
+# Everything below is generated, machine-local, or editor/OS noise.
+# The repo should only ever track what's needed to build VOCAN (source,
+# Cargo.toml/Cargo.lock, tests), the setup scripts, and project docs/CI.
+
+# --- Rust / Cargo build output (debug and release both live under here) -----
+/target/
+**/target/
+*.rs.bk
+Cargo.lock.bak
+
+# --- Editors / IDEs -----------------------------------------------------------
+.vscode/
+.idea/
+*.iml
+.vs/
+*.code-workspace
+*.sublime-project
+*.sublime-workspace
+
+# --- OS junk -------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# --- Editor swap/backup files --------------------------------------------------
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+*.orig
+
+# --- Local secrets/config (never commit these) ---------------------------------
+.env
+.env.*
+*.pem
+*.key
+
+# --- Logs ------------------------------------------------------------------
+*.log
+
+# --- Downloaded/extracted setup-script artifacts, if ever run from repo root --
+/deep-filter
+/deep-filter.exe
+/ffmpeg
+/ffmpeg.exe

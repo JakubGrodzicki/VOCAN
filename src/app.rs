@@ -338,240 +338,13 @@ impl eframe::App for AudioBatchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_messages();
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Voice-Over Compression and Normalization (ADPCM 4-bit)");
-
+        // Pinned to the bottom of the window so START PROCESSING and the log
+        // pane are always visible, regardless of how tall the settings
+        // section above (in the CentralPanel) grows. Must be registered
+        // before CentralPanel, since CentralPanel always claims whatever
+        // space is left after Top/Bottom/Side panels for the frame.
+        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.add_space(10.0);
-            ui.group(|ui| {
-                ui.label("Path Settings:");
-                ui.horizontal(|ui| {
-                    ui.label("Source: ");
-                    ui.text_edit_singleline(&mut self.input_dir);
-                    if ui.button("Browse...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.input_dir = path.display().to_string();
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Output: ");
-                    ui.text_edit_singleline(&mut self.output_dir);
-                    if ui.button("Browse...").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.output_dir = path.display().to_string();
-                        }
-                    }
-                });
-            });
-
-            ui.add_space(10.0);
-
-            ui.group(|ui| {
-                ui.label("Loudness:");
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.normalize_volume, "Normalize volume");
-                    if ui
-                        .button("Analyze folder loudness...")
-                        .on_hover_text("Select a folder to check its average loudness level")
-                        .clicked()
-                    {
-                        self.start_analysis(ctx.clone());
-                    }
-                });
-
-                if let Some(avg) = self.average_lufs {
-                    ui.colored_label(
-                        egui::Color32::KHAKI,
-                        format!("Average level of your files: {:.2} LUFS", avg),
-                    );
-                    if ui.button("Set as target").clicked() {
-                        self.target_lufs = avg.round();
-                    }
-                }
-
-                ui.add_enabled_ui(self.normalize_volume, |ui| {
-                    ui.add(
-                        egui::Slider::new(&mut self.target_lufs, -23.0..=-6.0)
-                            .text("Target LUFS-I (EBU R128, padded below 3s)"),
-                    );
-                    ui.add(
-                        egui::Slider::new(&mut self.target_peak_dbfs, -12.0..=-1.0)
-                            .text("Target peak dBFS (fallback)"),
-                    )
-                    .on_hover_text(
-                        "Peak normalization fallback, used only when EBU R128 loudness \
-                         measurement (standard or padded) fails -- typically for silent \
-                         or near-silent samples.\n\
-                         Recommended: -3 dBFS (safe headroom for 4-bit ADPCM).",
-                    );
-                });
-            });
-
-            ui.add_space(10.0);
-
-            ui.group(|ui| {
-                ui.label("Output Format:");
-                egui::ComboBox::from_label("Format")
-                    .selected_text(self.output_format.label())
-                    .show_ui(ui, |ui| {
-                        for &fmt in OutputFormat::all() {
-                            ui.selectable_value(&mut self.output_format, fmt, fmt.label());
-                        }
-                    });
-                if self.output_format.needs_bitrate() {
-                    ui.add(
-                        egui::Slider::new(&mut self.bitrate_kbps, 64..=320)
-                            .text("Bitrate (kbps)")
-                            .suffix(" kbps"),
-                    );
-                }
-                if self.output_format == OutputFormat::AdpcmWav {
-                    ui.label(
-                        egui::RichText::new("Suggested for video game voice-over")
-                            .small()
-                            .italics(),
-                    );
-                }
-            });
-
-            ui.add_space(10.0);
-
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.automixer, "Automixer");
-                    ui.label(
-                        egui::RichText::new(
-                            "(De-esser -> EQ -> Compressor, applied before normalization)",
-                        )
-                        .weak()
-                        .italics(),
-                    );
-                });
-
-                // Additional options (active only when automixer is enabled)
-                ui.add_enabled_ui(self.automixer && !self.is_processing, |ui| {
-                    ui.indent("automixer_opts", |ui| {
-                        // SG and NN are mutually exclusive (both live in the "noise" slot).
-                        // DFN3 is independent — it's proper dereverb, runs before the others.
-                        let sg_disabled = self.automixer_nn_dereverb;
-                        let nn_disabled = self.automixer_spectral_gate;
-
-                        ui.add_enabled_ui(!sg_disabled, |ui| {
-                            if ui
-                                .checkbox(
-                                    &mut self.automixer_spectral_gate,
-                                    "Intelligent noise removal (Spectral Gate)",
-                                )
-                                .changed()
-                                && self.automixer_spectral_gate
-                            {
-                                self.automixer_nn_dereverb = false;
-                            }
-                        });
-
-                        ui.add_enabled_ui(!nn_disabled, |ui| {
-                            if ui
-                                .checkbox(
-                                    &mut self.automixer_nn_dereverb,
-                                    "Noise reduction (nnnoiseless)",
-                                )
-                                .changed()
-                                && self.automixer_nn_dereverb
-                            {
-                                self.automixer_spectral_gate = false;
-                            }
-                        });
-
-                        ui.separator();
-                        ui.checkbox(
-                            &mut self.automixer_dfn3_dereverb,
-                            "Dereverb (DeepFilterNet3)",
-                        );
-                        ui.add_enabled_ui(self.automixer_dfn3_dereverb, |ui| {
-                            ui.add(
-                                egui::Slider::new(&mut self.automixer_dfn3_mix, 0.0..=1.0)
-                                    .text("Dereverb mix")
-                                    .fixed_decimals(2),
-                            );
-                            ui.checkbox(
-                                &mut self.automixer_dfn3_postfilter,
-                                "Post-filter (aggressive)",
-                            );
-                        });
-
-                        ui.separator();
-                        // Module 5: Downward Expander
-                        ui.horizontal(|ui| {
-                            ui.checkbox(
-                                &mut self.automixer_expander,
-                                "Downward Expander (noise floor)",
-                            );
-                            ui.label(
-                                egui::RichText::new("Compute heavy!")
-                                    .small()
-                                    .weak()
-                                    .italics(),
-                            );
-                        });
-                        ui.add_enabled_ui(self.automixer_expander, |ui| {
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.automixer_expander_safety_pct,
-                                    0.0..=100.0,
-                                )
-                                .text("Safety Margin")
-                                .suffix("%")
-                                .fixed_decimals(0),
-                            )
-                            .on_hover_text(
-                                "Higher = safer, touches less material.\n\
-                                 50% is a good starting point.\n\
-                                 The threshold sits below the detected noise floor\n\
-                                 by a margin derived from this setting.",
-                            );
-
-                            egui::ComboBox::from_label("Reduction profile")
-                                .selected_text(self.automixer_expander_reduction_profile.label())
-                                .show_ui(ui, |ui| {
-                                    for &profile in ReductionProfile::all() {
-                                        ui.selectable_value(
-                                            &mut self.automixer_expander_reduction_profile,
-                                            profile,
-                                            profile.label(),
-                                        );
-                                    }
-                                });
-
-                            if self.automixer_expander_reduction_profile == ReductionProfile::Max {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(255, 200, 80),
-                                    "\u{26a0} MAX (-32 dB) is aggressive \u{2014} can sound \
-                                     like a hard gate on RMS-detected material below an \
-                                     already-conservative threshold.",
-                                );
-                            }
-                        });
-
-                        ui.label(
-                            egui::RichText::new("Voice EQ works automatically (50% strength)")
-                                .small()
-                                .italics(),
-                        );
-                    });
-                });
-
-                if self.automixer {
-                    ui.add_space(4.0);
-                    let warning =
-                        "\u{26a0}  Attention! There is no way to create a universal mixing \
-                        tool. This is the closest I can think of to a universal mixing chain \
-                        without doing proper mixing, but the results may drastically vary based \
-                        on the provided material. Use with caution!";
-                    ui.colored_label(egui::Color32::from_rgb(255, 200, 80), warning);
-                }
-            });
-
-            ui.add_space(15.0);
 
             let can_start = !self.is_processing
                 && !self.is_analyzing
@@ -623,9 +396,15 @@ impl eframe::App for AudioBatchApp {
             ui.separator();
             ui.label("Logs:");
 
+            // Capped height: an unbounded ScrollArea inside a self-sizing
+            // TopBottomPanel is circular (the panel wants to fit the
+            // ScrollArea, the ScrollArea wants to fill the panel) and
+            // reproduces the original clipping bug one level down.
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .stick_to_bottom(true)
+                .max_height(180.0)
+                .id_source("log_scroll")
                 .show(ui, |ui| {
                     for log in &self.logs {
                         let color = if log.starts_with("[ERROR]") {
@@ -636,6 +415,258 @@ impl eframe::App for AudioBatchApp {
                         ui.colored_label(color, log);
                     }
                 });
+
+            ui.add_space(5.0);
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Settings are read-only (visible but not editable) while a
+            // batch job is running, instead of only the Automixer options.
+            ui.add_enabled_ui(!self.is_processing, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .id_source("settings_scroll")
+                    .show(ui, |ui| {
+                        ui.heading("Voice-Over Compression and Normalization (ADPCM 4-bit)");
+
+                        ui.add_space(10.0);
+                        ui.group(|ui| {
+                            ui.label("Path Settings:");
+                            ui.horizontal(|ui| {
+                                ui.label("Source: ");
+                                ui.text_edit_singleline(&mut self.input_dir);
+                                if ui.button("Browse...").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        self.input_dir = path.display().to_string();
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Output: ");
+                                ui.text_edit_singleline(&mut self.output_dir);
+                                if ui.button("Browse...").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        self.output_dir = path.display().to_string();
+                                    }
+                                }
+                            });
+                        });
+
+                        ui.add_space(10.0);
+
+                        ui.group(|ui| {
+                            ui.label("Loudness:");
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.normalize_volume, "Normalize volume");
+                                if ui
+                                    .button("Analyze folder loudness...")
+                                    .on_hover_text(
+                                        "Select a folder to check its average loudness level",
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_analysis(ctx.clone());
+                                }
+                            });
+
+                            if let Some(avg) = self.average_lufs {
+                                ui.colored_label(
+                                    egui::Color32::KHAKI,
+                                    format!("Average level of your files: {:.2} LUFS", avg),
+                                );
+                                if ui.button("Set as target").clicked() {
+                                    self.target_lufs = avg.round();
+                                }
+                            }
+
+                            ui.add_enabled_ui(self.normalize_volume, |ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut self.target_lufs, -23.0..=-6.0)
+                                        .text("Target LUFS-I (EBU R128, padded below 3s)"),
+                                );
+                                ui.add(
+                                    egui::Slider::new(&mut self.target_peak_dbfs, -12.0..=-1.0)
+                                        .text("Target peak dBFS (fallback)"),
+                                )
+                                .on_hover_text(
+                                    "Peak normalization fallback, used only when EBU R128 loudness \
+                                     measurement (standard or padded) fails -- typically for silent \
+                                     or near-silent samples.\n\
+                                     Recommended: -3 dBFS (safe headroom for 4-bit ADPCM).",
+                                );
+                            });
+                        });
+
+                        ui.add_space(10.0);
+
+                        ui.group(|ui| {
+                            ui.label("Output Format:");
+                            egui::ComboBox::from_label("Format")
+                                .selected_text(self.output_format.label())
+                                .show_ui(ui, |ui| {
+                                    for &fmt in OutputFormat::all() {
+                                        ui.selectable_value(&mut self.output_format, fmt, fmt.label());
+                                    }
+                                });
+                            if self.output_format.needs_bitrate() {
+                                ui.add(
+                                    egui::Slider::new(&mut self.bitrate_kbps, 64..=320)
+                                        .text("Bitrate (kbps)")
+                                        .suffix(" kbps"),
+                                );
+                            }
+                            if self.output_format == OutputFormat::AdpcmWav {
+                                ui.label(
+                                    egui::RichText::new("Suggested for video game voice-over")
+                                        .small()
+                                        .italics(),
+                                );
+                            }
+                        });
+
+                        ui.add_space(10.0);
+
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut self.automixer, "Automixer");
+                                ui.label(
+                                    egui::RichText::new(
+                                        "(De-esser -> EQ -> Compressor, applied before normalization)",
+                                    )
+                                    .weak()
+                                    .italics(),
+                                );
+                            });
+
+                            // Sub-options fully collapse when automixer is off (not just
+                            // grayed out), so the settings area stays compact by default.
+                            if self.automixer {
+                                ui.indent("automixer_opts", |ui| {
+                                    // SG and NN are mutually exclusive (both live in the "noise" slot).
+                                    // DFN3 is independent — it's proper dereverb, runs before the others.
+                                    let sg_disabled = self.automixer_nn_dereverb;
+                                    let nn_disabled = self.automixer_spectral_gate;
+
+                                    ui.add_enabled_ui(!sg_disabled, |ui| {
+                                        if ui
+                                            .checkbox(
+                                                &mut self.automixer_spectral_gate,
+                                                "Intelligent noise removal (Spectral Gate)",
+                                            )
+                                            .changed()
+                                            && self.automixer_spectral_gate
+                                        {
+                                            self.automixer_nn_dereverb = false;
+                                        }
+                                    });
+
+                                    ui.add_enabled_ui(!nn_disabled, |ui| {
+                                        if ui
+                                            .checkbox(
+                                                &mut self.automixer_nn_dereverb,
+                                                "Noise reduction (nnnoiseless)",
+                                            )
+                                            .changed()
+                                            && self.automixer_nn_dereverb
+                                        {
+                                            self.automixer_spectral_gate = false;
+                                        }
+                                    });
+
+                                    ui.separator();
+                                    ui.checkbox(
+                                        &mut self.automixer_dfn3_dereverb,
+                                        "Dereverb (DeepFilterNet3)",
+                                    );
+                                    if self.automixer_dfn3_dereverb {
+                                        ui.add(
+                                            egui::Slider::new(&mut self.automixer_dfn3_mix, 0.0..=1.0)
+                                                .text("Dereverb mix")
+                                                .fixed_decimals(2),
+                                        );
+                                        ui.checkbox(
+                                            &mut self.automixer_dfn3_postfilter,
+                                            "Post-filter (aggressive)",
+                                        );
+                                    }
+
+                                    ui.separator();
+                                    // Module 5: Downward Expander
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(
+                                            &mut self.automixer_expander,
+                                            "Downward Expander (noise floor)",
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("Compute heavy!")
+                                                .small()
+                                                .weak()
+                                                .italics(),
+                                        );
+                                    });
+                                    if self.automixer_expander {
+                                        ui.add(
+                                            egui::Slider::new(
+                                                &mut self.automixer_expander_safety_pct,
+                                                0.0..=100.0,
+                                            )
+                                            .text("Safety Margin")
+                                            .suffix("%")
+                                            .fixed_decimals(0),
+                                        )
+                                        .on_hover_text(
+                                            "Higher = safer, touches less material.\n\
+                                             50% is a good starting point.\n\
+                                             The threshold sits below the detected noise floor\n\
+                                             by a margin derived from this setting.",
+                                        );
+
+                                        egui::ComboBox::from_label("Reduction profile")
+                                            .selected_text(
+                                                self.automixer_expander_reduction_profile.label(),
+                                            )
+                                            .show_ui(ui, |ui| {
+                                                for &profile in ReductionProfile::all() {
+                                                    ui.selectable_value(
+                                                        &mut self.automixer_expander_reduction_profile,
+                                                        profile,
+                                                        profile.label(),
+                                                    );
+                                                }
+                                            });
+
+                                        if self.automixer_expander_reduction_profile
+                                            == ReductionProfile::Max
+                                        {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(255, 200, 80),
+                                                "\u{26a0} MAX (-32 dB) is aggressive \u{2014} can sound \
+                                                 like a hard gate on RMS-detected material below an \
+                                                 already-conservative threshold.",
+                                            );
+                                        }
+                                    }
+
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Voice EQ works automatically (50% strength)",
+                                        )
+                                        .small()
+                                        .italics(),
+                                    );
+                                });
+
+                                ui.add_space(4.0);
+                                let warning =
+                                    "\u{26a0}  Attention! There is no way to create a universal mixing \
+                                    tool. This is the closest I can think of to a universal mixing chain \
+                                    without doing proper mixing, but the results may drastically vary based \
+                                    on the provided material. Use with caution!";
+                                ui.colored_label(egui::Color32::from_rgb(255, 200, 80), warning);
+                            }
+                        });
+                    });
+            });
         });
     }
 }

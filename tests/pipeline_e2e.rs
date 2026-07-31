@@ -159,6 +159,51 @@ fn automixer_pipeline_produces_finite_non_clipping_output() {
     );
 }
 
+/// Regression test for a bug where the Rust-DSP (Automixer) pipeline left
+/// the output file at its internal 48kHz processing rate instead of
+/// restoring the source's original sample rate, whenever normalization was
+/// off or fell back past the Standard/Padded EBU R128 passes (see
+/// `apply_norm_decision` in src/processing.rs). Uses a 44.1kHz source with
+/// normalization disabled -- exactly the case that previously skipped `-ar`
+/// entirely.
+#[test]
+#[ignore]
+fn automixer_without_normalization_preserves_source_sample_rate() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    use vocan::ffmpeg::get_sample_rate;
+
+    let dir = tempfile::tempdir().unwrap();
+    let input_base = dir.path().join("in");
+    let output_base = dir.path().join("out");
+    std::fs::create_dir_all(&input_base).unwrap();
+    let input_path = input_base.join("tone.wav");
+    write_sine_wav(&input_path, 2.0, 44100, 440.0, 0.4);
+
+    let mut opts = base_opts();
+    opts.target_lufs = None; // normalization off -- previously skipped `-ar` entirely
+    opts.automixer = true;
+    opts.automixer_spectral_gate = true;
+    opts.output_format = OutputFormat::Pcm24Wav;
+
+    process_single_file(
+        &input_path,
+        &input_base,
+        &output_base,
+        &opts,
+        &ffmpeg_path(),
+    )
+    .expect("automixer pipeline without normalization should succeed");
+
+    let output_path = output_base.join("tone.wav");
+    let sr = get_sample_rate(&output_path, &ffmpeg_path()).expect("output sample rate");
+    assert_eq!(
+        sr, 44100,
+        "expected output resampled back to source rate (44100), got {sr}"
+    );
+}
+
 #[test]
 #[ignore]
 fn automixer_toggle_combinations_do_not_error() {

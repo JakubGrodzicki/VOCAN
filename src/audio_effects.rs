@@ -138,50 +138,6 @@ pub fn apply_spectral_gate(
 // MODULE 2: Voice EQ (static biquad bank)
 // ===========================================================================
 
-#[allow(dead_code)]
-pub fn apply_voice_eq(
-    samples: &[f32],
-    sample_rate: u32,
-    channels: u16,
-    strength: f32,
-) -> Result<Vec<f32>> {
-    use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Type, Q_BUTTERWORTH_F32};
-
-    let fs = (sample_rate as f32).hz();
-    let s = strength.clamp(0.0, 1.0);
-
-    let bands: Vec<(Type<f32>, f32, f32)> = vec![
-        (Type::LowShelf(-3.0 * s), 120.0, Q_BUTTERWORTH_F32),
-        (Type::PeakingEQ(-1.5 * s), 400.0, 1.0),
-        (Type::PeakingEQ(2.0 * s), 2500.0, 1.2),
-        (Type::HighShelf(1.5 * s), 10000.0, Q_BUTTERWORTH_F32),
-    ];
-
-    let ch = channels as usize;
-    let mut out = samples.to_vec();
-
-    for c in 0..ch {
-        let mut filters: Vec<DirectForm2Transposed<f32>> = bands
-            .iter()
-            .map(|(t, f, q)| {
-                let coeffs = Coefficients::<f32>::from_params(*t, fs, f.hz(), *q).unwrap();
-                DirectForm2Transposed::<f32>::new(coeffs)
-            })
-            .collect();
-
-        let frames = out.len() / ch;
-        for i in 0..frames {
-            let idx = i * ch + c;
-            let mut x = out[idx];
-            for f in filters.iter_mut() {
-                x = f.run(x);
-            }
-            out[idx] = x;
-        }
-    }
-    Ok(out)
-}
-
 pub fn apply_voice_eq_inplace(
     buf: &mut [f32],
     sample_rate: u32,

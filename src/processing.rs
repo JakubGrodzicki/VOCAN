@@ -151,6 +151,15 @@ fn measure_and_decide_normalization(
 
 /// Applies a [`NormDecision`] to the FFmpeg command (pass-2 filter args) and
 /// returns the corresponding [`NormResult`] for logging.
+///
+/// Every branch explicitly sets `-ar source_sr`, even when the caller's own
+/// pipeline never resampled the signal (in which case this is a no-op, since
+/// FFmpeg would already output at `source_sr`). This matters for the Rust-DSP
+/// (Automixer) pipeline, which always works at a fixed 48kHz internally: the
+/// Peak/Skipped fallbacks used to omit `-ar` entirely, silently leaving the
+/// exported file at 48kHz instead of the original sample rate whenever
+/// loudness normalization was off or fell back past the Standard/Padded
+/// EBU R128 passes.
 fn apply_norm_decision(
     cmd: &mut Command,
     decision: &NormDecision,
@@ -173,13 +182,14 @@ fn apply_norm_decision(
                 Some(p) => format!("{},{}", p, vol_filter),
                 None => vol_filter,
             };
-            cmd.args(["-af", &filter]);
+            cmd.args(["-af", &filter, "-ar", &source_sr.to_string()]);
             NormResult::Peak { gain_db: *gain_db }
         }
         NormDecision::Skipped => {
             if let Some(p) = prefix {
                 cmd.args(["-af", p]);
             }
+            cmd.args(["-ar", &source_sr.to_string()]);
             NormResult::Skipped
         }
     }
@@ -372,7 +382,10 @@ fn process_with_rust_dsp(
         )?;
         apply_norm_decision(&mut cmd, &decision, lufs, source_sr, Some(&post_filters))
     } else {
-        cmd.args(["-af", &post_filters]);
+        // No normalization requested at all -- still must restore the
+        // original sample rate, since the DSP stage above always runs at a
+        // fixed 48kHz and the temp WAV we're now reading is 48kHz too.
+        cmd.args(["-af", &post_filters, "-ar", &source_sr.to_string()]);
         NormResult::Skipped
     };
 
@@ -570,7 +583,10 @@ mod tests {
         );
         assert_eq!(result, NormResult::Peak { gain_db: 2.5 });
         let args = args_of(&cmd);
-        assert_eq!(args, vec!["-af", "highpass=f=70,volume=2.5000dB"]);
+        assert_eq!(
+            args,
+            vec!["-af", "highpass=f=70,volume=2.5000dB", "-ar", "44100"]
+        );
     }
 
     #[test]
@@ -583,7 +599,32 @@ mod tests {
             44100,
             None,
         );
-        assert_eq!(args_of(&cmd), vec!["-af", "volume=-1.0000dB"]);
+        assert_eq!(
+            args_of(&cmd),
+            vec!["-af", "volume=-1.0000dB", "-ar", "44100"]
+        );
+    }
+
+    #[test]
+    fn apply_peak_decision_restores_source_sample_rate_even_when_it_differs_from_44100() {
+        // Regression test: the Rust-DSP (Automixer) pipeline always measures
+        // and encodes at 48kHz internally, so `apply_norm_decision` must
+        // restore whatever `source_sr` the *original* input actually had --
+        // previously this branch never set `-ar` at all, silently leaving
+        // Automixer output stuck at 48kHz whenever normalization fell back
+        // to Peak.
+        let mut cmd = Command::new("ffmpeg");
+        apply_norm_decision(
+            &mut cmd,
+            &NormDecision::Peak { gain_db: 1.0 },
+            -16.0,
+            22050,
+            None,
+        );
+        assert_eq!(
+            args_of(&cmd),
+            vec!["-af", "volume=1.0000dB", "-ar", "22050"]
+        );
     }
 
     #[test]
@@ -597,13 +638,17 @@ mod tests {
             Some("highpass=f=70"),
         );
         assert_eq!(result, NormResult::Skipped);
-        assert_eq!(args_of(&cmd), vec!["-af", "highpass=f=70"]);
+        assert_eq!(args_of(&cmd), vec!["-af", "highpass=f=70", "-ar", "44100"]);
     }
 
     #[test]
-    fn apply_skipped_decision_without_prefix_adds_no_args() {
+    fn apply_skipped_decision_without_prefix_still_restores_sample_rate() {
+        // Regression test: previously this branch added no args at all,
+        // which meant the Automixer pipeline's Skipped fallback (e.g. a
+        // fully silent file) left the output at the DSP stage's fixed
+        // 48kHz instead of the original source rate.
         let mut cmd = Command::new("ffmpeg");
-        apply_norm_decision(&mut cmd, &NormDecision::Skipped, -16.0, 44100, None);
-        assert!(args_of(&cmd).is_empty());
+        apply_norm_decision(&mut cmd, &NormDecision::Skipped, -16.0, 48000, None);
+        assert_eq!(args_of(&cmd), vec!["-ar", "48000"]);
     }
 }

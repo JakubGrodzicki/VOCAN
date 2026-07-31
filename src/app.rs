@@ -1,6 +1,6 @@
 use eframe::egui;
 use rayon::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{
     mpsc::{self, Receiver, Sender},
@@ -58,6 +58,22 @@ pub struct AudioBatchApp {
     cancel_flag: Arc<AtomicBool>,
 }
 
+/// Returns `true` if `a` and `b` refer to the same directory on disk.
+///
+/// Compares canonicalized paths (resolving `.`/`..`/symlinks) where possible,
+/// falling back to plain path equality if either side can't be canonicalized
+/// (e.g. it doesn't exist yet). Used to stop the user from pointing the
+/// output folder at the source folder: with the default ADPCM output format
+/// (which keeps the `.wav` extension), that makes every output path
+/// byte-identical to its input path, and FFmpeg reading and writing the same
+/// file at once risks corrupting the original source audio.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => a == b,
+    }
+}
+
 impl AudioBatchApp {
     pub fn new(ffmpeg_path: PathBuf) -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -92,6 +108,15 @@ impl AudioBatchApp {
     }
 
     fn start_analysis(&mut self, ctx: egui::Context) {
+        // Guard against re-entrant/concurrent runs: analysis and processing
+        // share cancel_flag/logs/progress state, and a Finished/Stopped
+        // message from either one clears both is_processing and
+        // is_analyzing. The UI already disables this action's button while
+        // either flag is set; this check makes the invariant hold
+        // regardless of caller, and is cheap enough to always run.
+        if self.is_analyzing || self.is_processing {
+            return;
+        }
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             let folder_path = path.to_path_buf();
             self.is_analyzing = true;
@@ -191,14 +216,23 @@ impl AudioBatchApp {
     }
 
     fn start_processing(&mut self, ctx: egui::Context) {
+        let input_path = PathBuf::from(&self.input_dir);
+        let output_path = PathBuf::from(&self.output_dir);
+
+        if same_folder(&input_path, &output_path) {
+            self.logs.push(
+                "[ERROR] Source and output folders must be different -- processing in place \
+                 risks overwriting your original files."
+                    .to_string(),
+            );
+            return;
+        }
+
         self.is_processing = true;
         self.logs.clear();
         self.current_progress = 0;
         self.total_files = 0;
         self.cancel_flag.store(false, Ordering::Relaxed);
-
-        let input_path = PathBuf::from(&self.input_dir);
-        let output_path = PathBuf::from(&self.output_dir);
 
         let opts = ProcessingOptions {
             target_lufs: if self.normalize_volume {
@@ -458,15 +492,24 @@ impl eframe::App for AudioBatchApp {
                             ui.label("Loudness:");
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.normalize_volume, "Normalize volume");
-                                if ui
-                                    .button("Analyze folder loudness...")
-                                    .on_hover_text(
-                                        "Select a folder to check its average loudness level",
-                                    )
-                                    .clicked()
-                                {
-                                    self.start_analysis(ctx.clone());
-                                }
+                                // The enclosing settings ScrollArea is already disabled
+                                // while `is_processing`; additionally guard against
+                                // `is_analyzing` here so a second click can't start a
+                                // re-entrant analysis run while one is already in
+                                // flight (both share cancel_flag/logs/progress state,
+                                // and AppMsg::Finished/Stopped clear both is_processing
+                                // and is_analyzing together).
+                                ui.add_enabled_ui(!self.is_analyzing, |ui| {
+                                    if ui
+                                        .button("Analyze folder loudness...")
+                                        .on_hover_text(
+                                            "Select a folder to check its average loudness level",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.start_analysis(ctx.clone());
+                                    }
+                                });
                             });
 
                             if let Some(avg) = self.average_lufs {
@@ -683,6 +726,72 @@ mod tests {
 
     fn test_app() -> AudioBatchApp {
         AudioBatchApp::new(PathBuf::from("ffmpeg"))
+    }
+
+    // -----------------------------------------------------------------------
+    // same_folder
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn same_folder_true_for_identical_nonexistent_paths() {
+        // Neither path exists, so canonicalize() fails on both and this
+        // falls back to raw equality.
+        let p = PathBuf::from("/nonexistent/vocan-test-path-xyz");
+        assert!(same_folder(&p, &p));
+    }
+
+    #[test]
+    fn same_folder_false_for_different_paths() {
+        let a = PathBuf::from("/nonexistent/vocan-test-a");
+        let b = PathBuf::from("/nonexistent/vocan-test-b");
+        assert!(!same_folder(&a, &b));
+    }
+
+    #[test]
+    fn same_folder_true_for_equivalent_paths_via_canonicalize() {
+        // Two textually different but equivalent paths to the same existing
+        // directory must canonicalize to the same target, even though a raw
+        // PathBuf comparison says they differ. Rust's `Path` equality already
+        // normalizes away a bare trailing "." (CurDir), so that alone isn't
+        // a valid textual-difference example -- ".." (ParentDir) components
+        // are kept as real path segments, so routing through a real sibling
+        // directory and back up is what actually needs canonicalize to
+        // resolve.
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("subdir");
+        let sibling = root.path().join("sibling");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
+
+        let direct = target.clone();
+        let via_sibling = sibling.join("..").join("subdir");
+
+        assert_ne!(
+            direct, via_sibling,
+            "test setup: paths should differ textually"
+        );
+        assert!(same_folder(&direct, &via_sibling));
+    }
+
+    // -----------------------------------------------------------------------
+    // start_processing: source/output folder collision guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn start_processing_refuses_when_output_equals_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app();
+        app.input_dir = dir.path().display().to_string();
+        app.output_dir = dir.path().display().to_string();
+
+        app.start_processing(egui::Context::default());
+
+        assert!(
+            !app.is_processing,
+            "must not start processing when input == output"
+        );
+        assert_eq!(app.logs.len(), 1);
+        assert!(app.logs[0].starts_with("[ERROR]"));
     }
 
     #[test]

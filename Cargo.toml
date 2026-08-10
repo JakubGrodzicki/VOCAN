@@ -1,7 +1,8 @@
 [package]
 name = "VOCAN"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "vocan"
@@ -21,6 +22,34 @@ num_cpus = "1.16"
 # new dependencies for DSP and temporary files
 rustfft = "6.2"
 biquad = "0.4"
-nnnoiseless = "0.5"
+# default features are `bin` + `dasp`, which exist only for the crate's own CLI
+# binaries and pull in clap and three dasp crates. We use `DenoiseState` only,
+# which is not feature-gated.
+nnnoiseless = { version = "0.5", default-features = false }
 tempfile = "3.10"
 hound = "3.5"
+
+# Terminating a running child from another thread (src/proc.rs) is the one thing
+# std cannot express: `Child::kill` needs `&mut Child`, which the worker thread
+# parked in `wait()` is holding. Both crates are already in the dependency graph
+# via eframe/winit/rfd, and the versions selected here are ones the lockfile
+# already resolves, so neither adds a crate to the build.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The DSP stages are tight per-sample/per-bin loops calling small functions
+# across crate boundaries (biquad, rustfft), so cross-crate inlining matters.
+#
+# `panic = "abort"` is deliberately NOT set: the batch worker in src/app.rs
+# relies on `catch_unwind` so that one bad file logs an error instead of
+# taking down the whole run.
+[profile.release]
+lto = "fat"
+codegen-units = 1

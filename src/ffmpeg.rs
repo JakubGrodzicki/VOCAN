@@ -5,13 +5,57 @@ use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::proc::output_supervised;
 use crate::types::LoudnormStats;
 
+std::thread_local! {
+    /// How many ffmpeg invocations this thread has built.
+    ///
+    /// Process startup dominates the cost of a short voice-over file -- a
+    /// typical line is converted in less time than it takes to launch the four
+    /// processes involved -- so the per-file process count is a performance
+    /// budget, not an implementation detail. `tests/spawn_budget.rs` asserts it.
+    ///
+    /// Two deliberate choices:
+    ///
+    /// * **Unconditional, not `#[cfg(test)]`.** Integration tests under
+    ///   `tests/` link `vocan` compiled *without* `cfg(test)`, so a counter
+    ///   behind that attribute would not exist in the code being measured, and
+    ///   the assertion would silently be checking nothing. One non-atomic
+    ///   increment against a `Command::spawn` is unmeasurable.
+    /// * **Thread-local, not a global atomic.** `cargo test` runs test
+    ///   functions on separate threads of one binary, and several ffmpeg tests
+    ///   spawn concurrently; a shared counter would total them up and make any
+    ///   assertion flaky -- worse than no assertion, because it would look like
+    ///   coverage.
+    ///
+    /// Every construction here is followed by a spawn, so this counts real
+    /// processes. If that ever stops being true the budget test's numbers
+    /// change, which is the alarm doing its job.
+    static SPAWN_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of ffmpeg invocations built on the current thread since the last
+/// [`reset_spawn_count`]. See [`struct@SPAWN_COUNT`].
+pub fn spawn_count() -> u64 {
+    SPAWN_COUNT.with(|c| c.get())
+}
+
+/// Zeroes the current thread's counter, returning its previous value.
+pub fn reset_spawn_count() -> u64 {
+    SPAWN_COUNT.with(|c| c.replace(0))
+}
+
 pub fn ffmpeg_cmd(ffmpeg: &Path) -> Command {
-    #[cfg_attr(not(windows), allow(unused_mut))]
+    SPAWN_COUNT.with(|c| c.set(c.get() + 1));
+
     let mut cmd = Command::new(ffmpeg);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    // Nothing here ever feeds ffmpeg on stdin, and an inherited stdin lets it
+    // consume input meant for the parent process.
+    cmd.arg("-nostdin");
     cmd
 }
 
@@ -46,7 +90,22 @@ pub fn is_audio_file(path: &Path) -> bool {
 ///   1. `ffmpeg` available on PATH (verified by running `ffmpeg -version`)
 ///   2. `ffmpeg.exe` / `ffmpeg` sitting next to the current executable
 pub fn find_ffmpeg() -> Result<PathBuf> {
-    let path_probe = Command::new("ffmpeg")
+    /// A `Command` that will not flash a console window on Windows.
+    ///
+    /// The probes below used to build `Command::new` directly, bypassing
+    /// `ffmpeg_cmd` and therefore missing `CREATE_NO_WINDOW` -- so launching
+    /// VOCAN briefly popped up one or two console windows every single time.
+    /// `ffmpeg_cmd` itself is not reused here because it appends `-nostdin`,
+    /// which a bare `-version` probe has no reason to depend on.
+    fn silent_probe(bin: &Path) -> Command {
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut cmd = Command::new(bin);
+        #[cfg(windows)]
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd
+    }
+
+    let path_probe = silent_probe(Path::new("ffmpeg"))
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -64,7 +123,7 @@ pub fn find_ffmpeg() -> Result<PathBuf> {
                 "ffmpeg"
             });
             if candidate.is_file() {
-                let local_probe = Command::new(&candidate)
+                let local_probe = silent_probe(&candidate)
                     .arg("-version")
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -83,16 +142,17 @@ pub fn find_ffmpeg() -> Result<PathBuf> {
     ))
 }
 
-/// Returns the sample rate of the source file.
-pub fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
-    let output = ffmpeg_cmd(ffmpeg)
-        .args(["-hide_banner", "-i"])
-        .arg(input)
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
+/// Runs `ffmpeg -i <input>` once and returns its stderr, which is where FFmpeg
+/// prints the stream summary (sample rate, duration) when no output is given.
+fn probe_stderr(input: &Path, ffmpeg: &Path) -> Option<String> {
+    let mut cmd = ffmpeg_cmd(ffmpeg);
+    cmd.args(["-hide_banner", "-i"]).arg(input);
+    let output = output_supervised(&mut cmd).ok()?;
+    Some(String::from_utf8_lossy(&output.stderr).into_owned())
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+/// Extracts the sample rate from a probe's stderr text.
+fn parse_sample_rate(stderr: &str) -> Option<u32> {
     let tokens: Vec<&str> = stderr.split_whitespace().collect();
     for window in tokens.windows(2) {
         // Real ffmpeg output is "<rate> Hz, <channels> ..." -- "Hz" carries
@@ -108,16 +168,8 @@ pub fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
     None
 }
 
-/// Returns the duration of the file in seconds.
-pub fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
-    let output = ffmpeg_cmd(ffmpeg)
-        .args(["-hide_banner", "-i"])
-        .arg(input)
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
+/// Extracts the duration in seconds from a probe's stderr text.
+fn parse_duration(stderr: &str) -> Option<f32> {
     for line in stderr.lines() {
         if line.contains("Duration:") {
             for token in line.split_whitespace() {
@@ -138,18 +190,65 @@ pub fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
     None
 }
 
+/// Returns both the sample rate and the duration from a **single** ffmpeg
+/// process.
+///
+/// Callers that need both (the non-Automixer path in `process_single_file`)
+/// should use this rather than calling [`get_sample_rate`] and
+/// [`get_duration`] back to back: those spawn one process each and then parse
+/// the very same stderr text, doubling the process count for every file in a
+/// batch.
+pub fn probe_input(input: &Path, ffmpeg: &Path) -> (Option<u32>, Option<f32>) {
+    match probe_stderr(input, ffmpeg) {
+        Some(stderr) => (parse_sample_rate(&stderr), parse_duration(&stderr)),
+        None => (None, None),
+    }
+}
+
+/// Returns the sample rate of the source file.
+pub fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
+    parse_sample_rate(&probe_stderr(input, ffmpeg)?)
+}
+
+/// Returns the duration of the file in seconds.
+pub fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
+    parse_duration(&probe_stderr(input, ffmpeg)?)
+}
+
+/// Builds an error carrying FFmpeg's own explanation of a failed run.
+///
+/// The measurement helpers below used to ignore the exit status entirely and go
+/// straight to parsing, so a file FFmpeg refused outright came back as
+/// "Missing JSON in FFmpeg output" -- a description of our parser, not of the
+/// problem. FFmpeg prints the actual reason last, after the banner and the
+/// stream dump, so the tail is the part worth keeping.
+pub(crate) fn ffmpeg_failed(stage: &str, stderr: &str) -> anyhow::Error {
+    const MAX_TAIL_CHARS: usize = 600;
+    let trimmed = stderr.trim_end();
+    let tail = match trimmed.char_indices().nth_back(MAX_TAIL_CHARS - 1) {
+        Some((start, _)) => format!("...{}", &trimmed[start..]),
+        None => trimmed.to_string(),
+    };
+    if tail.is_empty() {
+        anyhow!("FFmpeg failed during {stage} without reporting a reason")
+    } else {
+        anyhow!("FFmpeg failed during {stage}: {tail}")
+    }
+}
+
 /// Measures the integrated loudness (LUFS-I) for folder overview analysis.
 pub fn measure_lufs(input: &Path, ffmpeg: &Path) -> Result<Option<f32>> {
     let filter = "loudnorm=I=-23:TP=-1.5:LRA=1.0:print_format=json";
-    let output = ffmpeg_cmd(ffmpeg)
-        .args(["-y", "-hide_banner", "-i"])
+    let mut cmd = ffmpeg_cmd(ffmpeg);
+    cmd.args(["-y", "-hide_banner", "-i"])
         .arg(input)
-        .args(["-vn", "-af", filter, "-f", "null", "-"])
-        .stderr(Stdio::piped())
-        .output()
-        .context("FFmpeg error during loudness measurement")?;
+        .args(["-vn", "-af", filter, "-f", "null", "-"]);
+    let output = output_supervised(&mut cmd).context("FFmpeg error during loudness measurement")?;
 
     let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(ffmpeg_failed("loudness measurement", &stderr_str));
+    }
     let stats = extract_loudnorm_stats(&stderr_str)?;
 
     match stats.input_i.parse::<f32>() {
@@ -173,15 +272,17 @@ pub fn get_file_stats(
         Some(p) => format!("{},{}", p, loudnorm),
         None => loudnorm,
     };
-    let output = ffmpeg_cmd(ffmpeg)
-        .args(["-y", "-hide_banner", "-i"])
+    let mut cmd = ffmpeg_cmd(ffmpeg);
+    cmd.args(["-y", "-hide_banner", "-i"])
         .arg(input)
-        .args(["-vn", "-af", &filter, "-f", "null", "-"])
-        .stderr(Stdio::piped())
-        .output()
-        .context("FFmpeg error during loudnorm analysis (pass 1)")?;
+        .args(["-vn", "-af", &filter, "-f", "null", "-"]);
+    let output =
+        output_supervised(&mut cmd).context("FFmpeg error during loudnorm analysis (pass 1)")?;
 
     let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(ffmpeg_failed("loudnorm analysis (pass 1)", &stderr_str));
+    }
     let stats = extract_loudnorm_stats(&stderr_str)?;
 
     match stats.input_i.parse::<f32>() {
@@ -211,15 +312,20 @@ pub fn get_file_stats_padded(
         Some(p) => format!("{},{}", p, pad_chain),
         None => pad_chain,
     };
-    let output = ffmpeg_cmd(ffmpeg)
-        .args(["-y", "-hide_banner", "-i"])
+    let mut cmd = ffmpeg_cmd(ffmpeg);
+    cmd.args(["-y", "-hide_banner", "-i"])
         .arg(input)
-        .args(["-vn", "-af", &filter, "-f", "null", "-"])
-        .stderr(Stdio::piped())
-        .output()
+        .args(["-vn", "-af", &filter, "-f", "null", "-"]);
+    let output = output_supervised(&mut cmd)
         .context("FFmpeg error during padded loudnorm analysis (pass 1)")?;
 
     let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(ffmpeg_failed(
+            "padded loudnorm analysis (pass 1)",
+            &stderr_str,
+        ));
+    }
     let stats = extract_loudnorm_stats(&stderr_str)?;
 
     match stats.input_i.parse::<f32>() {
@@ -234,15 +340,16 @@ pub fn measure_peak_dbfs(input: &Path, ffmpeg: &Path, prefix: Option<&str>) -> R
         Some(p) => format!("{},volumedetect", p),
         None => "volumedetect".to_string(),
     };
-    let output = ffmpeg_cmd(ffmpeg)
-        .args(["-y", "-hide_banner", "-i"])
+    let mut cmd = ffmpeg_cmd(ffmpeg);
+    cmd.args(["-y", "-hide_banner", "-i"])
         .arg(input)
-        .args(["-vn", "-af", &filter, "-f", "null", "-"])
-        .stderr(Stdio::piped())
-        .output()
-        .context("FFmpeg error during peak measurement")?;
+        .args(["-vn", "-af", &filter, "-f", "null", "-"]);
+    let output = output_supervised(&mut cmd).context("FFmpeg error during peak measurement")?;
 
     let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(ffmpeg_failed("peak measurement", &stderr_str));
+    }
 
     for line in stderr_str.lines() {
         if line.contains("max_volume:") {
@@ -290,6 +397,14 @@ pub fn apply_loudnorm_pass2(
 pub fn extract_loudnorm_stats(stderr: &str) -> Result<LoudnormStats> {
     let start_idx = stderr.rfind('{').context("Missing JSON in FFmpeg output")?;
     let end_idx = stderr.rfind('}').context("Missing JSON in FFmpeg output")?;
+    // Each brace is located independently, so a stray '{' printed *after* the
+    // JSON block (ffmpeg is free to keep writing to stderr) leaves start_idx
+    // past end_idx. Slicing that range panics rather than failing the parse --
+    // and the caller's `catch_unwind` would report it as an opaque
+    // "Panic while processing" with no indication of the real cause.
+    if start_idx >= end_idx {
+        return Err(anyhow!("Malformed JSON block in FFmpeg output"));
+    }
     let json_str = &stderr[start_idx..=end_idx];
     let stats: LoudnormStats = serde_json::from_str(json_str)?;
     Ok(stats)
@@ -346,6 +461,56 @@ size=N/A time=00:00:05.00 bitrate=N/A speed=  42x
     #[test]
     fn extract_loudnorm_stats_only_opening_brace_errors() {
         let stderr = "[Parsed_loudnorm_0]\n{ \"input_i\": \"-23.50\" \n";
+        assert!(extract_loudnorm_stats(stderr).is_err());
+    }
+
+    #[test]
+    fn extract_loudnorm_stats_trailing_open_brace_after_json_errors_without_panicking() {
+        // Regression test: `rfind('{')` and `rfind('}')` are independent, so a
+        // '{' emitted after the JSON block puts start_idx past end_idx. The
+        // slice `&stderr[start_idx..=end_idx]` used to panic here instead of
+        // returning Err.
+        let stderr = "{ \"input_i\" : \"-23.50\" }\nffmpeg: unexpected {\n";
+        assert!(extract_loudnorm_stats(stderr).is_err());
+    }
+
+    #[test]
+    fn ffmpeg_failed_keeps_the_tail_where_the_real_reason_lives() {
+        // FFmpeg prints the banner and stream dump first and the actual error
+        // last, so truncation has to keep the end, not the beginning.
+        let stderr = format!(
+            "{}\nInvalid data found when processing input\n",
+            "x".repeat(5000)
+        );
+        let err = ffmpeg_failed("conversion", &stderr).to_string();
+        assert!(err.contains("Invalid data found"), "got: {err}");
+        assert!(err.contains("conversion"));
+        assert!(
+            err.len() < 1000,
+            "the tail should be bounded, got {}",
+            err.len()
+        );
+    }
+
+    #[test]
+    fn ffmpeg_failed_truncates_on_a_char_boundary() {
+        // Slicing a multi-byte codepoint in half would panic. Each 'ą' is two
+        // bytes, so a byte-offset cut would land inside one.
+        let stderr = "ą".repeat(5000);
+        let err = ffmpeg_failed("conversion", &stderr).to_string();
+        assert!(err.contains('ą'));
+    }
+
+    #[test]
+    fn ffmpeg_failed_reports_something_useful_when_stderr_is_empty() {
+        let err = ffmpeg_failed("conversion", "   \n").to_string();
+        assert!(err.contains("without reporting a reason"), "got: {err}");
+    }
+
+    #[test]
+    fn extract_loudnorm_stats_braces_in_reverse_order_errors_without_panicking() {
+        // The minimal shape of the same bug: a '}' that precedes the last '{'.
+        let stderr = "closing } first, opening { last";
         assert!(extract_loudnorm_stats(stderr).is_err());
     }
 }

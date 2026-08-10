@@ -1,7 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use eframe::egui;
-use std::path::PathBuf;
 use vocan::{app, ffmpeg};
 
 fn configure_fonts_and_style(ctx: &egui::Context) {
@@ -80,10 +79,15 @@ fn configure_fonts_and_style(ctx: &egui::Context) {
 }
 
 fn main() -> eframe::Result<()> {
-    let ffmpeg_path = ffmpeg::find_ffmpeg().unwrap_or_else(|e| {
-        eprintln!("{}", e);
-        PathBuf::from("ffmpeg")
-    });
+    // Deliberately not unwrapped here: with `windows_subsystem = "windows"`
+    // there is no console, so reporting the failure has to happen inside the
+    // GUI. `AudioBatchApp::from_ffmpeg_lookup` keeps the message and shows it.
+    let ffmpeg_lookup = ffmpeg::find_ffmpeg();
+
+    // Reclaim scratch directories abandoned by instances that were killed
+    // mid-batch. Age-based and skipping our own, so a second VOCAN running
+    // right now keeps its files.
+    vocan::proc::sweep_scratch();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -103,7 +107,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             configure_fonts_and_style(&cc.egui_ctx);
-            Box::new(app::AudioBatchApp::new(ffmpeg_path))
+            Box::new(app::AudioBatchApp::from_ffmpeg_lookup(ffmpeg_lookup))
         }),
     )
 }

@@ -14,7 +14,7 @@ VOCAN writes the output files in a format that you select. The default format is
 
 VOCAN is written in Rust. The graphical interface uses the `egui` library. VOCAN sends the audio encoding tasks to FFmpeg and, for some tasks, to external DSP tools. VOCAN also has its own DSP modules for the spectral gate, the equalizer, and the expander.
 
-VOCAN scans folders and processes files in parallel. VOCAN uses a Rayon thread pool. The size of the pool matches the number of CPU cores on the host computer.
+VOCAN scans folders and processes files in parallel. VOCAN uses a Rayon thread pool. The size of the pool matches the number of CPU cores on the host computer, minus one.
 
 ## Features
 
@@ -186,10 +186,12 @@ The full test suite also includes tests for the DeepFilterNet3 dereverb feature.
 
 ### Audio pipeline (Automixer mode)
 
-When Automixer is on, each file goes through a pipeline of Rust steps and FFmpeg steps. Every Rust DSP step uses 48 kHz mono, 32-bit float audio. VOCAN restores the original sample rate at the final encoding step.
+When Automixer is on, each file goes through a pipeline of Rust steps and FFmpeg steps. Every Rust DSP step uses mono, 32-bit float audio.
 
-1. **De-esser**: the FFmpeg `deesser` filter (`i=0.4:m=0.5:f=0.5:s=o`) processes the file. FFmpeg sends the output to Rust, as 48 kHz mono f32le audio.
-2. **Noise floor estimation**: this step runs only when the expander is on. VOCAN measures the windowed RMS level of the signal. The window is 25 ms long, with 50% overlap and a Hann shape. VOCAN takes the 12th percentile of the result. This step runs on the signal after the de-esser step and before the dereverb step. This order stops the dereverb step from changing the noise floor estimate. If the file is too short or too quiet, VOCAN skips the expander step for that file.
+VOCAN runs the Rust chain at the **source sample rate**. Two steps are the exception: nnnoiseless and DeepFilterNet3 are models trained at 48 kHz and require it. When you enable either one, VOCAN converts the whole Rust chain to 48 kHz instead. VOCAN restores the original sample rate at the final encoding step in every case. This means a 44.1 kHz file with neither of those two steps enabled is never resampled at all.
+
+1. **De-esser**: the FFmpeg `deesser` filter (`i=0.4:m=0.5:f=0.5:s=o`) processes the file. FFmpeg sends the output to Rust, as mono f32le audio at the pipeline rate described above.
+2. **Noise floor estimation**: this step runs only when the expander is on. VOCAN measures the windowed RMS level of the signal. The window is 25 ms long, with 50% overlap and a Hann shape. VOCAN normalizes the windowed energy by the sum of squares of the window itself, so the result is a true RMS level. VOCAN takes the 12th percentile of the result. This step runs on the signal after the de-esser step and before the dereverb step. This order stops the dereverb step from changing the noise floor estimate. If the file is too short or too quiet, VOCAN skips the expander step for that file.
 3. **DeepFilterNet3**: this step runs only when dereverb is on. The model removes noise and reverb at the same time, at 48 kHz mono. The `-D` flag aligns the output with the input, sample for sample. VOCAN reads and writes the WAV data with the `hound` library. This step does not need an extra FFmpeg process. VOCAN mixes the output with the dry signal, at the ratio that you set. The default attenuation limit is 30 dB. You can enable an optional `--pf` post-filter.
 4. **Downward Expander**: this step runs only when the expander is on. The level detector uses an RMS window of about 3 ms. The expander has a soft knee, attack and release smoothing, and a mandatory hold time. The hold time stops the expander from opening and closing too fast. The threshold is the noise floor minus the margin. The Safety Margin slider sets the margin, from 2 dB to 8 dB. The reduction profile sets the maximum attenuation. The attenuation never reaches −∞ dB.
 
@@ -200,7 +202,9 @@ When Automixer is on, each file goes through a pipeline of Rust steps and FFmpeg
    | Hard | −18.0 dB |
    | Max | −32.0 dB |
 
-5. **Spectral Gate or nnnoiseless**: select one of these two options. Both run at 48 kHz mono.
+   **Note on calibration:** before this was corrected, the noise floor estimate read 4.26 dB lower than the true level, because it normalized the Hann-windowed energy by the sample count instead of by the window's sum of squares. The threshold sat that much lower too, so the Safety Margin slider behaved as though it spanned 6.3 dB to 12.3 dB. The margin now matches the documented 2 dB to 8 dB. If you tuned the slider against an older build, expect the expander to act more strongly at the same setting, and lower the slider to compensate.
+
+5. **Spectral Gate or nnnoiseless**: select one of these two options. The spectral gate runs at the pipeline rate. nnnoiseless always runs at 48 kHz.
 6. **Voice EQ**: a four-band biquad filter processes the signal. The bands are: a low shelf at 120 Hz (−3 dB), a cut at 400 Hz (−1.5 dB), a boost at 2.5 kHz (+2 dB), and a high shelf at 10 kHz (+1.5 dB). VOCAN always applies this filter at 50% strength.
 7. **Post-EQ and dynamics** (FFmpeg):
    - A 2-pole high-pass filter and a 1-pole high-pass filter, both at 70 Hz.
@@ -217,6 +221,7 @@ When Automixer is off, FFmpeg processes the file directly. FFmpeg applies only t
 ### Spectral Gate
 
 - The FFT size is 2048 samples. The hop size is 512 samples, for 75% overlap. VOCAN uses a Hann window.
+- VOCAN pads the signal with one FFT frame of silence at each end before the analysis. Without this padding, the samples near each end receive only partial overlap-add: the file starts with an audible fade-in, and up to 2047 samples at the end (about 43 ms at 48 kHz) are never written and stay silent.
 - An envelope follower tracks each frequency bin. Each bin has its own attack rate and release rate.
 - The threshold sets the expansion knee. The ratio sets the slope of the expansion below the threshold.
 

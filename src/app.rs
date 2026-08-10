@@ -1,5 +1,6 @@
 use eframe::egui;
 use rayon::prelude::*;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{
@@ -10,7 +11,7 @@ use std::thread;
 use walkdir::WalkDir;
 
 use crate::ffmpeg::{is_audio_file, measure_lufs};
-use crate::processing::process_single_file;
+use crate::processing::{output_path_for, process_single_file};
 use crate::types::{AppMsg, NormResult, OutputFormat, ProcessingOptions, ReductionProfile};
 
 // ---------------------------------------------------------------------------
@@ -48,15 +49,36 @@ pub struct AudioBatchApp {
     is_processing: bool,
     is_analyzing: bool,
     average_lufs: Option<f32>,
-    logs: Vec<String>,
+    logs: VecDeque<String>,
     current_progress: usize,
     total_files: usize,
     receiver: Receiver<AppMsg>,
     sender: Sender<AppMsg>,
     ffmpeg_path: PathBuf,
+    /// Why `find_ffmpeg` failed, if it did.
+    ///
+    /// The binary is built with `windows_subsystem = "windows"`, so there is no
+    /// console for the startup `eprintln!` this replaces: the message went
+    /// nowhere and the user was left with an app whose every file failed with an
+    /// opaque "FFmpeg spawn failed".
+    ffmpeg_error: Option<String>,
     /// Shared cancellation flag — set to `true` to request the worker thread to stop.
     cancel_flag: Arc<AtomicBool>,
 }
+
+/// Maximum number of log lines retained.
+///
+/// A batch produces at least one line per file, so an unbounded log grows
+/// without limit -- and the log pane re-lays-out every retained line on every
+/// frame, which makes the UI crawl exactly when the user wants to scroll back
+/// through a long run's errors.
+const MAX_LOG_LINES: usize = 5_000;
+
+/// Maximum length of a single log line, in characters.
+///
+/// A failing FFmpeg invocation appends its whole stderr, which can run to
+/// several kilobytes; the useful part is at the front.
+const MAX_LOG_LINE_CHARS: usize = 2_000;
 
 /// Returns `true` if `a` and `b` refer to the same directory on disk.
 ///
@@ -70,7 +92,126 @@ pub struct AudioBatchApp {
 fn same_folder(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(ca), Ok(cb)) => ca == cb,
-        _ => a == b,
+        // At least one path could not be resolved (typically: it does not exist
+        // yet). Raw `==` is case-sensitive even on Windows, where the
+        // filesystem is not -- so `C:\Out` and `C:\out`, the very same folder,
+        // used to compare unequal and walk straight past this guard.
+        _ => paths_equal_ignoring_platform_case(a, b),
+    }
+}
+
+#[cfg(windows)]
+fn paths_equal_ignoring_platform_case(a: &Path, b: &Path) -> bool {
+    a.as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn paths_equal_ignoring_platform_case(a: &Path, b: &Path) -> bool {
+    a == b
+}
+
+/// Returns `true` if `output` sits *inside* `input`'s tree.
+///
+/// The single run in front of us would survive this (the file list is collected
+/// before any output is written), but the *next* one would not: the scan would
+/// pick up this run's results as fresh input and re-process them into
+/// `out/out/...`, deeper each time, quietly polluting the source tree.
+fn output_nested_in_input(input: &Path, output: &Path) -> bool {
+    match (input.canonicalize(), output.canonicalize()) {
+        (Ok(ci), Ok(co)) => co != ci && co.starts_with(&ci),
+        _ => false,
+    }
+}
+
+/// Validates the source/output folder pair, returning the message to log when
+/// the pair is unusable.
+///
+/// Creates the output folder as a side effect, deliberately: `canonicalize`
+/// cannot resolve a path that does not exist, and without it both checks above
+/// fall back to weaker textual comparisons.
+fn validate_folders(input: &Path, output: &Path) -> Result<(), String> {
+    if !input.is_dir() {
+        return Err(format!(
+            "Source folder does not exist, or is not a folder: {}",
+            input.display()
+        ));
+    }
+    if let Err(e) = std::fs::create_dir_all(output) {
+        return Err(format!(
+            "Cannot create the output folder {}: {}",
+            output.display(),
+            e
+        ));
+    }
+    if same_folder(input, output) {
+        return Err(
+            "Source and output folders must be different -- processing in place \
+             risks overwriting your original files."
+                .to_string(),
+        );
+    }
+    if output_nested_in_input(input, output) {
+        return Err(format!(
+            "The output folder is inside the source folder ({} is under {}). \
+             This run would work, but the next one would pick up these results \
+             as new source files and nest them deeper each time.",
+            output.display(),
+            input.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Guarantees that a worker thread reports a terminal [`AppMsg`], even if it
+/// unwinds.
+///
+/// `AppMsg::Finished`/`Stopped` is what clears `is_processing`/`is_analyzing`
+/// in [`AudioBatchApp::handle_messages`]. The per-file `catch_unwind` inside
+/// the rayon closure does not cover the whole thread: rayon re-raises a worker
+/// panic in whichever thread called `par_iter().for_each`, and `sum.lock()` /
+/// `tx.clone()` sit outside it entirely. Without this guard such a panic kills
+/// the worker thread with no terminal message ever sent, and the UI stays stuck
+/// with `is_processing == true` forever -- settings disabled, START greyed out,
+/// and Stop only setting the cancel flag without clearing the flag itself. The
+/// only way out was killing the application.
+///
+/// Unwinding runs destructors (the release profile deliberately does not set
+/// `panic = "abort"`), so `Drop` still fires on the panic path.
+struct CompletionGuard {
+    tx: Sender<AppMsg>,
+    ctx: egui::Context,
+    armed: bool,
+}
+
+impl CompletionGuard {
+    fn new(tx: Sender<AppMsg>, ctx: egui::Context) -> Self {
+        Self {
+            tx,
+            ctx,
+            armed: true,
+        }
+    }
+
+    /// Call once the thread has sent its own terminal message on the normal path.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.tx.send(AppMsg::Error(
+            "Worker thread ended unexpectedly; the run was aborted. \
+             Any remaining files were not processed."
+                .into(),
+        ));
+        let _ = self.tx.send(AppMsg::Finished);
+        self.ctx.request_repaint();
     }
 }
 
@@ -87,7 +228,7 @@ impl AudioBatchApp {
             automixer_spectral_gate: false,
             automixer_nn_dereverb: false,
             automixer_dfn3_dereverb: false,
-            automixer_dfn3_mix: 0.8,
+            automixer_dfn3_mix: 80.0,
             automixer_dfn3_postfilter: false,
             automixer_expander: false,
             automixer_expander_safety_pct: 50.0,
@@ -97,14 +238,46 @@ impl AudioBatchApp {
             is_processing: false,
             is_analyzing: false,
             average_lufs: None,
-            logs: Vec::new(),
+            logs: VecDeque::new(),
             current_progress: 0,
             total_files: 0,
             receiver,
             sender,
             ffmpeg_path,
+            ffmpeg_error: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Builds the app from the result of [`crate::ffmpeg::find_ffmpeg`],
+    /// keeping the failure reason so the UI can show it.
+    ///
+    /// Falls back to the bare name `ffmpeg` so that a user who installs it
+    /// while the app is open can simply retry, rather than having to restart.
+    pub fn from_ffmpeg_lookup(found: anyhow::Result<PathBuf>) -> Self {
+        match found {
+            Ok(path) => Self::new(path),
+            Err(e) => {
+                let mut app = Self::new(PathBuf::from("ffmpeg"));
+                let message = e.to_string();
+                app.push_log(format!("[ERROR] {message}"));
+                app.ffmpeg_error = Some(message);
+                app
+            }
+        }
+    }
+
+    /// Appends one line to the log, truncating over-long lines and evicting
+    /// the oldest once [`MAX_LOG_LINES`] is reached.
+    fn push_log(&mut self, text: String) {
+        let text = match text.char_indices().nth(MAX_LOG_LINE_CHARS) {
+            Some((cut, _)) => format!("{}... [truncated]", &text[..cut]),
+            None => text,
+        };
+        if self.logs.len() >= MAX_LOG_LINES {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(text);
     }
 
     fn start_analysis(&mut self, ctx: egui::Context) {
@@ -121,8 +294,15 @@ impl AudioBatchApp {
             let folder_path = path.to_path_buf();
             self.is_analyzing = true;
             self.average_lufs = None;
+            // Reset the progress counters like `start_processing` does. The log
+            // is deliberately *not* cleared here: analysis is a side query run
+            // against a folder of the user's choosing, not a fresh batch, so
+            // wiping the record of the previous run would lose real information.
+            self.current_progress = 0;
+            self.total_files = 0;
             self.cancel_flag.store(false, Ordering::Relaxed);
-            self.logs.push(format!(
+            crate::proc::resume();
+            self.push_log(format!(
                 "Started folder analysis: {}",
                 folder_path.display()
             ));
@@ -131,6 +311,7 @@ impl AudioBatchApp {
             let ffmpeg_path = self.ffmpeg_path.clone();
             let cancel = Arc::clone(&self.cancel_flag);
             thread::spawn(move || {
+                let mut completion = CompletionGuard::new(tx.clone(), ctx.clone());
                 let files: Vec<PathBuf> = WalkDir::new(&folder_path)
                     .into_iter()
                     .filter_map(|e| e.ok())
@@ -188,6 +369,7 @@ impl AudioBatchApp {
 
                 if cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(AppMsg::Log("Analysis stopped by user.".into()));
+                    completion.disarm();
                     let _ = tx.send(AppMsg::Stopped);
                     ctx.request_repaint();
                     return;
@@ -209,6 +391,7 @@ impl AudioBatchApp {
                         "No valid audio files found for analysis.".into(),
                     ));
                 }
+                completion.disarm();
                 let _ = tx.send(AppMsg::Finished);
                 ctx.request_repaint();
             });
@@ -216,15 +399,19 @@ impl AudioBatchApp {
     }
 
     fn start_processing(&mut self, ctx: egui::Context) {
+        // Same re-entrancy guard as `start_analysis`: the two runs share
+        // cancel_flag/logs/progress state, and a Finished/Stopped from either
+        // clears both flags. The UI's `can_start` already covers this, but the
+        // invariant should not depend on the caller.
+        if self.is_processing || self.is_analyzing {
+            return;
+        }
+
         let input_path = PathBuf::from(&self.input_dir);
         let output_path = PathBuf::from(&self.output_dir);
 
-        if same_folder(&input_path, &output_path) {
-            self.logs.push(
-                "[ERROR] Source and output folders must be different -- processing in place \
-                 risks overwriting your original files."
-                    .to_string(),
-            );
+        if let Err(msg) = validate_folders(&input_path, &output_path) {
+            self.push_log(format!("[ERROR] {msg}"));
             return;
         }
 
@@ -233,41 +420,77 @@ impl AudioBatchApp {
         self.current_progress = 0;
         self.total_files = 0;
         self.cancel_flag.store(false, Ordering::Relaxed);
+        // Clear the latch a previous Stop left behind, or every child this run
+        // spawns would be killed the moment it registers.
+        crate::proc::resume();
 
-        let opts = ProcessingOptions {
-            target_lufs: if self.normalize_volume {
-                Some(self.target_lufs)
-            } else {
-                None
-            },
-            target_peak_dbfs: self.target_peak_dbfs,
-            automixer: self.automixer,
-            automixer_spectral_gate: self.automixer_spectral_gate,
-            automixer_nn_dereverb: self.automixer_nn_dereverb,
-            automixer_dfn3_dereverb: self.automixer_dfn3_dereverb,
-            automixer_dfn3_mix: self.automixer_dfn3_mix,
-            automixer_dfn3_postfilter: self.automixer_dfn3_postfilter,
-            automixer_expander: self.automixer_expander,
-            automixer_expander_safety_pct: self.automixer_expander_safety_pct,
-            automixer_expander_reduction_profile: self.automixer_expander_reduction_profile,
-            output_format: self.output_format,
-            bitrate_kbps: self.bitrate_kbps,
-        };
+        let opts = self.processing_options();
 
         let tx = self.sender.clone();
         let ffmpeg_path = self.ffmpeg_path.clone();
         let cancel = Arc::clone(&self.cancel_flag);
 
         thread::spawn(move || {
+            let mut completion = CompletionGuard::new(tx.clone(), ctx.clone());
             let _ = tx.send(AppMsg::Log("Scanning directory...".into()));
             ctx.request_repaint();
 
-            let files: Vec<PathBuf> = WalkDir::new(&input_path)
+            let scanned: Vec<PathBuf> = WalkDir::new(&input_path)
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().is_file() && is_audio_file(e.path()))
                 .map(|e| e.path().to_path_buf())
                 .collect();
+
+            // Two sources in one folder can map to one output: every format
+            // rewrites the extension, so `line1.wav` and `line1.mp3` both become
+            // `line1.wav`. Since files are processed in parallel, that means two
+            // ffmpeg processes writing the same path at the same time -- a
+            // corrupted, non-deterministic result with no error anywhere. Drop
+            // the duplicates here, loudly, instead.
+            let files = {
+                let mut claimed: std::collections::HashMap<String, PathBuf> =
+                    std::collections::HashMap::new();
+                let mut keep = Vec::with_capacity(scanned.len());
+                for file in scanned {
+                    let out =
+                        match output_path_for(&file, &input_path, &output_path, opts.output_format)
+                        {
+                            Ok(out) => out,
+                            Err(e) => {
+                                let _ = tx.send(AppMsg::Error(format!(
+                                    "Skipping {}: cannot determine its output path: {}",
+                                    file.display(),
+                                    e
+                                )));
+                                continue;
+                            }
+                        };
+                    // Windows filenames are case-insensitive, so `A.wav` and
+                    // `a.wav` collide there too.
+                    let key = if cfg!(windows) {
+                        out.to_string_lossy().to_lowercase()
+                    } else {
+                        out.to_string_lossy().into_owned()
+                    };
+                    match claimed.get(&key) {
+                        Some(first) => {
+                            let _ = tx.send(AppMsg::Error(format!(
+                                "Skipping {}: it would be written to the same file as {} ({}). \
+                                 Rename one of them so both can be converted.",
+                                file.display(),
+                                first.display(),
+                                out.display()
+                            )));
+                        }
+                        None => {
+                            claimed.insert(key, file.clone());
+                            keep.push(file);
+                        }
+                    }
+                }
+                keep
+            };
 
             let total = files.len();
             let _ = tx.send(AppMsg::Progress(0, total));
@@ -328,6 +551,7 @@ impl AudioBatchApp {
                 ctx.request_repaint();
             });
 
+            completion.disarm();
             if cancel.load(Ordering::Relaxed) {
                 let _ = tx.send(AppMsg::Log("Processing stopped by user.".into()));
                 let _ = tx.send(AppMsg::Stopped);
@@ -339,13 +563,47 @@ impl AudioBatchApp {
         });
     }
 
+    /// Snapshots the UI settings into the value the worker threads consume.
+    ///
+    /// Kept as its own method so `ProcessingOptions::default()` can be checked
+    /// against it (see `processing_options_default_matches_the_ui_defaults`) --
+    /// the two are separate declarations of the same set of defaults, and
+    /// nothing else would notice them drifting apart.
+    fn processing_options(&self) -> ProcessingOptions {
+        ProcessingOptions {
+            target_lufs: if self.normalize_volume {
+                Some(self.target_lufs)
+            } else {
+                None
+            },
+            target_peak_dbfs: self.target_peak_dbfs,
+            automixer: self.automixer,
+            automixer_spectral_gate: self.automixer_spectral_gate,
+            automixer_nn_dereverb: self.automixer_nn_dereverb,
+            automixer_dfn3_dereverb: self.automixer_dfn3_dereverb,
+            automixer_dfn3_mix: self.automixer_dfn3_mix,
+            automixer_dfn3_postfilter: self.automixer_dfn3_postfilter,
+            automixer_expander: self.automixer_expander,
+            automixer_expander_safety_pct: self.automixer_expander_safety_pct,
+            automixer_expander_reduction_profile: self.automixer_expander_reduction_profile,
+            output_format: self.output_format,
+            bitrate_kbps: self.bitrate_kbps,
+            log: Some(self.sender.clone()),
+        }
+    }
+
     fn handle_messages(&mut self) {
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
-                AppMsg::Log(text) => self.logs.push(text),
-                AppMsg::Error(text) => self.logs.push(format!("[ERROR] {}", text)),
+                AppMsg::Log(text) => self.push_log(text),
+                AppMsg::Error(text) => self.push_log(format!("[ERROR] {}", text)),
                 AppMsg::Progress(current, total) => {
-                    self.current_progress = current;
+                    // Workers bump a shared counter and send immediately after,
+                    // so two threads can deliver out of order and make the
+                    // displayed count jump backwards. Both runs reset the
+                    // counter before starting, so `max` cannot carry a stale
+                    // value in from a previous one.
+                    self.current_progress = self.current_progress.max(current);
                     self.total_files = total;
                 }
                 AppMsg::Finished => {
@@ -372,6 +630,16 @@ impl eframe::App for AudioBatchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_messages();
 
+        // Closing the window while a batch runs used to leave every ffmpeg (and
+        // deep-filter) child of ours running: the process exits without
+        // unwinding, so no destructor gets a chance, and Windows gives us no job
+        // object to tear the tree down. Those orphans kept writing to output
+        // files, which could leave a truncated file that still looks valid.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.cancel_flag.store(true, Ordering::Relaxed);
+            crate::proc::terminate_all();
+        }
+
         // Pinned to the bottom of the window so START PROCESSING and the log
         // pane are always visible, regardless of how tall the settings
         // section above (in the CentralPanel) grows. Must be registered
@@ -379,6 +647,14 @@ impl eframe::App for AudioBatchApp {
         // space is left after Top/Bottom/Side panels for the frame.
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.add_space(10.0);
+
+            if let Some(err) = &self.ffmpeg_error {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("\u{26a0} {err}\nProcessing will fail until this is fixed."),
+                );
+                ui.add_space(6.0);
+            }
 
             let can_start = !self.is_processing
                 && !self.is_analyzing
@@ -416,12 +692,20 @@ impl eframe::App for AudioBatchApp {
                             egui::RichText::new("\u{23f9} Stop")
                                 .color(egui::Color32::from_rgb(255, 90, 90)),
                         ))
-                        .on_hover_text("Stop after the current file finishes")
+                        .on_hover_text(
+                            "Stops now: the files still in flight are cancelled \
+                             mid-conversion and their partial output is discarded",
+                        )
                         .clicked()
                     {
                         self.cancel_flag.store(true, Ordering::Relaxed);
-                        self.logs
-                            .push("Stop requested \u{2014} waiting for current file...".into());
+                        // Terminating the running children is what makes Stop
+                        // take effect *now*: the worker threads are parked in
+                        // `wait()` and cannot see the flag until their
+                        // subprocess returns, which for a long file with
+                        // DeepFilterNet3 is minutes away.
+                        crate::proc::terminate_all();
+                        self.push_log("Stop requested \u{2014} finishing up...".into());
                     }
                 });
             }
@@ -464,65 +748,84 @@ impl eframe::App for AudioBatchApp {
                         ui.heading("Voice-Over Compression and Normalization (ADPCM 4-bit)");
 
                         ui.add_space(10.0);
-                        ui.group(|ui| {
-                            ui.label("Path Settings:");
-                            ui.horizontal(|ui| {
-                                ui.label("Source: ");
-                                ui.text_edit_singleline(&mut self.input_dir);
-                                if ui.button("Browse...").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                        self.input_dir = path.display().to_string();
-                                    }
-                                }
-                            });
-                            ui.horizontal(|ui| {
-                                ui.label("Output: ");
-                                ui.text_edit_singleline(&mut self.output_dir);
-                                if ui.button("Browse...").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                        self.output_dir = path.display().to_string();
-                                    }
-                                }
-                            });
-                        });
-
+                        ui.group(|ui| self.ui_paths(ui));
                         ui.add_space(10.0);
+                        ui.group(|ui| self.ui_loudness(ui, ctx));
+                        ui.add_space(10.0);
+                        ui.group(|ui| self.ui_output_format(ui));
+                        ui.add_space(10.0);
+                        ui.group(|ui| self.ui_automixer(ui));
+                    });
+            });
+        });
+    }
+}
 
-                        ui.group(|ui| {
-                            ui.label("Loudness:");
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut self.normalize_volume, "Normalize volume");
-                                // The enclosing settings ScrollArea is already disabled
-                                // while `is_processing`; additionally guard against
-                                // `is_analyzing` here so a second click can't start a
-                                // re-entrant analysis run while one is already in
-                                // flight (both share cancel_flag/logs/progress state,
-                                // and AppMsg::Finished/Stopped clear both is_processing
-                                // and is_analyzing together).
-                                ui.add_enabled_ui(!self.is_analyzing, |ui| {
-                                    if ui
-                                        .button("Analyze folder loudness...")
-                                        .on_hover_text(
-                                            "Select a folder to check its average loudness level",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.start_analysis(ctx.clone());
-                                    }
-                                });
-                            });
+// ---------------------------------------------------------------------------
+// Settings sections
+// ---------------------------------------------------------------------------
+//
+// Split out of `update` rather than left inline: as one function this was ~340
+// lines nested seven closures deep, where the enclosing `if` a given widget
+// belongs to is several screens above it.
 
-                            if let Some(avg) = self.average_lufs {
-                                ui.colored_label(
-                                    egui::Color32::KHAKI,
-                                    format!("Average level of your files: {:.2} LUFS", avg),
-                                );
-                                if ui.button("Set as target").clicked() {
-                                    self.target_lufs = avg.round();
-                                }
-                            }
+impl AudioBatchApp {
+    fn ui_paths(&mut self, ui: &mut egui::Ui) {
+        ui.label("Path Settings:");
+        ui.horizontal(|ui| {
+            ui.label("Source: ");
+            ui.text_edit_singleline(&mut self.input_dir);
+            if ui.button("Browse...").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.input_dir = path.display().to_string();
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Output: ");
+            ui.text_edit_singleline(&mut self.output_dir);
+            if ui.button("Browse...").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.output_dir = path.display().to_string();
+                }
+            }
+        });
+    }
 
-                            ui.add_enabled_ui(self.normalize_volume, |ui| {
+    fn ui_loudness(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        {
+            ui.label("Loudness:");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.normalize_volume, "Normalize volume");
+                // The enclosing settings ScrollArea is already disabled
+                // while `is_processing`; additionally guard against
+                // `is_analyzing` here so a second click can't start a
+                // re-entrant analysis run while one is already in
+                // flight (both share cancel_flag/logs/progress state,
+                // and AppMsg::Finished/Stopped clear both is_processing
+                // and is_analyzing together).
+                ui.add_enabled_ui(!self.is_analyzing, |ui| {
+                    if ui
+                        .button("Analyze folder loudness...")
+                        .on_hover_text("Select a folder to check its average loudness level")
+                        .clicked()
+                    {
+                        self.start_analysis(ctx.clone());
+                    }
+                });
+            });
+
+            if let Some(avg) = self.average_lufs {
+                ui.colored_label(
+                    egui::Color32::KHAKI,
+                    format!("Average level of your files: {:.2} LUFS", avg),
+                );
+                if ui.button("Set as target").clicked() {
+                    self.target_lufs = avg.round();
+                }
+            }
+
+            ui.add_enabled_ui(self.normalize_volume, |ui| {
                                 ui.add(
                                     egui::Slider::new(&mut self.target_lufs, -23.0..=-6.0)
                                         .text("Target LUFS-I (EBU R128, padded below 3s)"),
@@ -538,53 +841,53 @@ impl eframe::App for AudioBatchApp {
                                      Recommended: -3 dBFS (safe headroom for 4-bit ADPCM).",
                                 );
                             });
-                        });
+        }
+    }
 
-                        ui.add_space(10.0);
+    fn ui_output_format(&mut self, ui: &mut egui::Ui) {
+        {
+            ui.label("Output Format:");
+            egui::ComboBox::from_label("Format")
+                .selected_text(self.output_format.label())
+                .show_ui(ui, |ui| {
+                    for &fmt in OutputFormat::all() {
+                        ui.selectable_value(&mut self.output_format, fmt, fmt.label());
+                    }
+                });
+            if self.output_format.needs_bitrate() {
+                ui.add(
+                    egui::Slider::new(&mut self.bitrate_kbps, 64..=320)
+                        .text("Bitrate (kbps)")
+                        .suffix(" kbps"),
+                );
+            }
+            if self.output_format == OutputFormat::AdpcmWav {
+                ui.label(
+                    egui::RichText::new("Suggested for video game voice-over")
+                        .small()
+                        .italics(),
+                );
+            }
+        }
+    }
 
-                        ui.group(|ui| {
-                            ui.label("Output Format:");
-                            egui::ComboBox::from_label("Format")
-                                .selected_text(self.output_format.label())
-                                .show_ui(ui, |ui| {
-                                    for &fmt in OutputFormat::all() {
-                                        ui.selectable_value(&mut self.output_format, fmt, fmt.label());
-                                    }
-                                });
-                            if self.output_format.needs_bitrate() {
-                                ui.add(
-                                    egui::Slider::new(&mut self.bitrate_kbps, 64..=320)
-                                        .text("Bitrate (kbps)")
-                                        .suffix(" kbps"),
-                                );
-                            }
-                            if self.output_format == OutputFormat::AdpcmWav {
-                                ui.label(
-                                    egui::RichText::new("Suggested for video game voice-over")
-                                        .small()
-                                        .italics(),
-                                );
-                            }
-                        });
+    fn ui_automixer(&mut self, ui: &mut egui::Ui) {
+        {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.automixer, "Automixer");
+                ui.label(
+                    egui::RichText::new(
+                        "(De-esser -> EQ -> Compressor, applied before normalization)",
+                    )
+                    .weak()
+                    .italics(),
+                );
+            });
 
-                        ui.add_space(10.0);
-
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.checkbox(&mut self.automixer, "Automixer");
-                                ui.label(
-                                    egui::RichText::new(
-                                        "(De-esser -> EQ -> Compressor, applied before normalization)",
-                                    )
-                                    .weak()
-                                    .italics(),
-                                );
-                            });
-
-                            // Sub-options fully collapse when automixer is off (not just
-                            // grayed out), so the settings area stays compact by default.
-                            if self.automixer {
-                                ui.indent("automixer_opts", |ui| {
+            // Sub-options fully collapse when automixer is off (not just
+            // grayed out), so the settings area stays compact by default.
+            if self.automixer {
+                ui.indent("automixer_opts", |ui| {
                                     // SG and NN are mutually exclusive (both live in the "noise" slot).
                                     // DFN3 is independent — it's proper dereverb, runs before the others.
                                     let sg_disabled = self.automixer_nn_dereverb;
@@ -623,9 +926,10 @@ impl eframe::App for AudioBatchApp {
                                     );
                                     if self.automixer_dfn3_dereverb {
                                         ui.add(
-                                            egui::Slider::new(&mut self.automixer_dfn3_mix, 0.0..=1.0)
+                                            egui::Slider::new(&mut self.automixer_dfn3_mix, 0.0..=100.0)
                                                 .text("Dereverb mix")
-                                                .fixed_decimals(2),
+                                                .suffix("%")
+                                                .fixed_decimals(0),
                                         );
                                         ui.checkbox(
                                             &mut self.automixer_dfn3_postfilter,
@@ -697,20 +1001,29 @@ impl eframe::App for AudioBatchApp {
                                         .small()
                                         .italics(),
                                     );
+                                    // The Rust DSP stages all run on a single
+                                    // mono channel, so enabling Automixer
+                                    // downmixes stereo sources. Documented in
+                                    // the README, but the UI is where someone
+                                    // about to run a batch will look.
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Stereo sources are downmixed to mono",
+                                        )
+                                        .small()
+                                        .italics(),
+                                    );
                                 });
 
-                                ui.add_space(4.0);
-                                let warning =
+                ui.add_space(4.0);
+                let warning =
                                     "\u{26a0}  Attention! There is no way to create a universal mixing \
                                     tool. This is the closest I can think of to a universal mixing chain \
                                     without doing proper mixing, but the results may drastically vary based \
                                     on the provided material. Use with caution!";
-                                ui.colored_label(egui::Color32::from_rgb(255, 200, 80), warning);
-                            }
-                        });
-                    });
-            });
-        });
+                ui.colored_label(egui::Color32::from_rgb(255, 200, 80), warning);
+            }
+        }
     }
 }
 
@@ -773,6 +1086,75 @@ mod tests {
         assert!(same_folder(&direct, &via_sibling));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn same_folder_ignores_case_when_neither_path_can_be_canonicalized() {
+        // On Windows the filesystem is case-insensitive, so these name the same
+        // folder. Neither exists, so `canonicalize` fails on both and the
+        // comparison falls back to raw `==` -- which used to be case-sensitive
+        // and let this pair straight through the overwrite guard.
+        let a = PathBuf::from(r"C:\nonexistent\VOCAN-Case-Test");
+        let b = PathBuf::from(r"C:\nonexistent\vocan-case-test");
+        assert_ne!(a, b, "test setup: the paths must differ textually");
+        assert!(same_folder(&a, &b));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_folders
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_folders_rejects_a_nested_output_folder() {
+        // Survives one run, then poisons the next: the scan picks the previous
+        // run's results up as source files and nests them deeper each time.
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().to_path_buf();
+        let output = input.join("out");
+
+        let err = validate_folders(&input, &output).expect_err("nested output must be rejected");
+        assert!(err.contains("inside the source folder"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_folders_rejects_a_missing_source_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("does-not-exist");
+        let output = root.path().join("out");
+        let err = validate_folders(&missing, &output).expect_err("missing source must be rejected");
+        assert!(err.contains("does not exist"), "got: {err}");
+        assert!(
+            !output.exists(),
+            "a rejected source must not leave an output folder behind"
+        );
+    }
+
+    #[test]
+    fn validate_folders_accepts_a_sibling_output_and_creates_it() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("in");
+        let output = root.path().join("out");
+        std::fs::create_dir(&input).unwrap();
+
+        validate_folders(&input, &output).expect("sibling folders are fine");
+        assert!(
+            output.is_dir(),
+            "the output folder should have been created"
+        );
+    }
+
+    #[test]
+    fn validate_folders_accepts_a_source_nested_inside_the_output() {
+        // The reverse nesting is harmless: outputs land beside the source tree,
+        // never inside the part being scanned, so no run feeds on its own
+        // results. Rejecting it would block a legitimate layout.
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().to_path_buf();
+        let input = output.join("src");
+        std::fs::create_dir(&input).unwrap();
+
+        assert!(validate_folders(&input, &output).is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // start_processing: source/output folder collision guard
     // -----------------------------------------------------------------------
@@ -792,6 +1174,94 @@ mod tests {
         );
         assert_eq!(app.logs.len(), 1);
         assert!(app.logs[0].starts_with("[ERROR]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // CompletionGuard: a worker thread must always report a terminal message
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn completion_guard_delivers_finished_when_dropped_without_disarm() {
+        let mut app = test_app();
+        app.is_processing = true;
+        drop(CompletionGuard::new(
+            app.sender.clone(),
+            egui::Context::default(),
+        ));
+        app.handle_messages();
+        assert!(
+            !app.is_processing,
+            "a guard dropped without disarm must deliver Finished"
+        );
+        assert!(app.logs.iter().any(|l| l.starts_with("[ERROR]")));
+    }
+
+    #[test]
+    fn completion_guard_stays_silent_after_disarm() {
+        let mut app = test_app();
+        app.is_processing = true;
+        let mut guard = CompletionGuard::new(app.sender.clone(), egui::Context::default());
+        guard.disarm();
+        drop(guard);
+        app.handle_messages();
+        assert!(
+            app.is_processing,
+            "a disarmed guard must not send anything of its own"
+        );
+        assert!(app.logs.is_empty());
+    }
+
+    #[test]
+    fn completion_guard_unsticks_the_ui_when_the_worker_thread_panics() {
+        // The actual regression: rayon re-raises a worker panic in the thread
+        // that called par_iter().for_each, outside the per-file catch_unwind.
+        // Before the guard, that killed the worker with no terminal message and
+        // left is_processing == true for the rest of the session -- settings
+        // disabled, START greyed out, Stop unable to clear it.
+        //
+        // The panic message this prints to stderr during the run is expected.
+        let mut app = test_app();
+        app.is_processing = true;
+        let tx = app.sender.clone();
+        let handle = thread::spawn(move || {
+            let _completion = CompletionGuard::new(tx, egui::Context::default());
+            panic!("simulated worker panic");
+        });
+        assert!(handle.join().is_err(), "test setup: the thread must panic");
+
+        app.handle_messages();
+        assert!(
+            !app.is_processing,
+            "UI must recover after a worker thread unwinds"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // start_processing: re-entrancy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn start_processing_is_a_no_op_while_a_run_is_already_in_flight() {
+        for (processing, analyzing) in [(true, false), (false, true)] {
+            let dir_in = tempfile::tempdir().unwrap();
+            let dir_out = tempfile::tempdir().unwrap();
+            let mut app = test_app();
+            app.input_dir = dir_in.path().display().to_string();
+            app.output_dir = dir_out.path().display().to_string();
+            app.push_log("pre-existing".to_string());
+            app.is_processing = processing;
+            app.is_analyzing = analyzing;
+
+            app.start_processing(egui::Context::default());
+
+            // A run that actually started would have cleared the log first.
+            assert_eq!(
+                app.logs.len(),
+                1,
+                "re-entrant call (processing={processing}, analyzing={analyzing}) \
+                 must not clear state or spawn a second run"
+            );
+        }
     }
 
     #[test]
@@ -868,6 +1338,96 @@ mod tests {
         assert!(app.logs.is_empty());
         assert_eq!(app.current_progress, 0);
         assert_eq!(app.total_files, 0);
+    }
+
+    #[test]
+    fn push_log_evicts_oldest_lines_past_the_cap() {
+        let mut app = test_app();
+        for i in 0..MAX_LOG_LINES + 10 {
+            app.push_log(format!("line {i}"));
+        }
+        assert_eq!(app.logs.len(), MAX_LOG_LINES);
+        // The oldest 10 were dropped, the newest is still present.
+        assert_eq!(app.logs.front().unwrap(), "line 10");
+        assert_eq!(
+            app.logs.back().unwrap(),
+            &format!("line {}", MAX_LOG_LINES + 9)
+        );
+    }
+
+    #[test]
+    fn push_log_truncates_an_over_long_line() {
+        let mut app = test_app();
+        app.push_log("x".repeat(MAX_LOG_LINE_CHARS * 3));
+        let line = app.logs.front().unwrap();
+        assert!(line.ends_with("... [truncated]"));
+        assert_eq!(
+            line.chars().count(),
+            MAX_LOG_LINE_CHARS + "... [truncated]".len()
+        );
+    }
+
+    #[test]
+    fn push_log_truncates_on_a_char_boundary() {
+        // Truncating by byte offset would panic mid-codepoint; each 'ą' is two
+        // bytes, so a byte-based cut at MAX_LOG_LINE_CHARS would land inside one.
+        let mut app = test_app();
+        app.push_log("ą".repeat(MAX_LOG_LINE_CHARS * 2));
+        let line = app.logs.front().unwrap();
+        assert!(line.starts_with('ą'));
+        assert!(line.ends_with("... [truncated]"));
+    }
+
+    #[test]
+    fn processing_options_default_matches_the_ui_defaults() {
+        // `ProcessingOptions::default()` and `AudioBatchApp::new` declare the
+        // same defaults in two places. Nothing else notices them drifting, and
+        // the drift is silent where it matters most: a wrong
+        // `target_peak_dbfs` or `bitrate_kbps` in the Default impl would leave
+        // every test that builds options with `..Default::default()` passing
+        // while quietly exercising a different configuration.
+        //
+        // Destructured exhaustively on purpose -- adding a field to
+        // ProcessingOptions without deciding its default breaks this test to
+        // compile, which is the point.
+        let ProcessingOptions {
+            target_lufs,
+            target_peak_dbfs,
+            automixer,
+            automixer_spectral_gate,
+            automixer_nn_dereverb,
+            automixer_dfn3_dereverb,
+            automixer_dfn3_mix,
+            automixer_dfn3_postfilter,
+            automixer_expander,
+            automixer_expander_safety_pct,
+            automixer_expander_reduction_profile,
+            output_format,
+            bitrate_kbps,
+            log: _, // wired to the live UI channel, deliberately None by default
+        } = test_app().processing_options();
+
+        let d = ProcessingOptions::default();
+        assert_eq!(target_lufs, d.target_lufs);
+        assert_eq!(target_peak_dbfs, d.target_peak_dbfs);
+        assert_eq!(automixer, d.automixer);
+        assert_eq!(automixer_spectral_gate, d.automixer_spectral_gate);
+        assert_eq!(automixer_nn_dereverb, d.automixer_nn_dereverb);
+        assert_eq!(automixer_dfn3_dereverb, d.automixer_dfn3_dereverb);
+        assert_eq!(automixer_dfn3_mix, d.automixer_dfn3_mix);
+        assert_eq!(automixer_dfn3_postfilter, d.automixer_dfn3_postfilter);
+        assert_eq!(automixer_expander, d.automixer_expander);
+        assert_eq!(
+            automixer_expander_safety_pct,
+            d.automixer_expander_safety_pct
+        );
+        assert_eq!(
+            automixer_expander_reduction_profile,
+            d.automixer_expander_reduction_profile
+        );
+        assert_eq!(output_format, d.output_format);
+        assert_eq!(bitrate_kbps, d.bitrate_kbps);
+        assert!(ProcessingOptions::default().log.is_none());
     }
 
     #[test]

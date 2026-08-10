@@ -13,6 +13,7 @@ mod common;
 use common::{ffmpeg_path, skip_if_no_ffmpeg, write_sine_wav};
 use vocan::ffmpeg::{
     get_duration, get_file_stats, get_file_stats_padded, get_sample_rate, measure_peak_dbfs,
+    probe_input,
 };
 
 #[test]
@@ -43,6 +44,38 @@ fn get_sample_rate_matches_generated_wav() {
         let got = get_sample_rate(&path, &ffmpeg_path()).expect("sample rate");
         assert_eq!(got, sr);
     }
+}
+
+/// `probe_input` exists to replace a back-to-back `get_sample_rate` +
+/// `get_duration` pair (two ffmpeg processes parsing the same stderr) with a
+/// single process. It must agree with both of them exactly.
+#[test]
+#[ignore]
+fn probe_input_agrees_with_the_individual_probes() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tone.wav");
+    write_sine_wav(&path, 2.345, 48000, 440.0, 0.5);
+
+    let (sr, duration) = probe_input(&path, &ffmpeg_path());
+    assert_eq!(sr, get_sample_rate(&path, &ffmpeg_path()));
+    assert_eq!(duration, get_duration(&path, &ffmpeg_path()));
+    assert_eq!(sr, Some(48000));
+    assert!((duration.expect("duration") - 2.345).abs() < 0.05);
+}
+
+#[test]
+#[ignore]
+fn probe_input_on_a_nonexistent_file_returns_no_values() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (sr, duration) = probe_input(&dir.path().join("nope.wav"), &ffmpeg_path());
+    assert_eq!(sr, None);
+    assert_eq!(duration, None);
 }
 
 #[test]
@@ -98,7 +131,7 @@ fn measure_peak_dbfs_matches_known_amplitude() {
 fn process_single_file_with_missing_ffmpeg_returns_err_not_panic() {
     use std::path::PathBuf;
     use vocan::processing::process_single_file;
-    use vocan::types::{OutputFormat, ProcessingOptions, ReductionProfile};
+    use vocan::types::{OutputFormat, ProcessingOptions};
 
     let dir = tempfile::tempdir().unwrap();
     let input_base = dir.path().join("in");
@@ -108,19 +141,8 @@ fn process_single_file_with_missing_ffmpeg_returns_err_not_panic() {
     write_sine_wav(&input_path, 1.0, 44100, 440.0, 0.5);
 
     let opts = ProcessingOptions {
-        target_lufs: None,
-        target_peak_dbfs: -3.0,
-        automixer: false,
-        automixer_spectral_gate: false,
-        automixer_nn_dereverb: false,
-        automixer_dfn3_dereverb: false,
-        automixer_dfn3_mix: 0.8,
-        automixer_dfn3_postfilter: false,
-        automixer_expander: false,
-        automixer_expander_safety_pct: 50.0,
-        automixer_expander_reduction_profile: ReductionProfile::Recommended,
         output_format: OutputFormat::Pcm24Wav,
-        bitrate_kbps: 128,
+        ..Default::default()
     };
 
     let bogus_ffmpeg = PathBuf::from("/nonexistent/ffmpeg-binary-xyz");
@@ -139,7 +161,7 @@ fn norm_result_matches_decision_table_at_boundary_durations() {
         return;
     }
     use vocan::processing::process_single_file;
-    use vocan::types::{NormResult, OutputFormat, ProcessingOptions, ReductionProfile};
+    use vocan::types::{NormResult, OutputFormat, ProcessingOptions};
 
     let dir = tempfile::tempdir().unwrap();
     let input_base = dir.path().join("in");
@@ -149,18 +171,8 @@ fn norm_result_matches_decision_table_at_boundary_durations() {
 
     let opts = ProcessingOptions {
         target_lufs: Some(-16.0),
-        target_peak_dbfs: -3.0,
-        automixer: false,
-        automixer_spectral_gate: false,
-        automixer_nn_dereverb: false,
-        automixer_dfn3_dereverb: false,
-        automixer_dfn3_mix: 0.8,
-        automixer_dfn3_postfilter: false,
-        automixer_expander: false,
-        automixer_expander_safety_pct: 50.0,
-        automixer_expander_reduction_profile: ReductionProfile::Recommended,
         output_format: OutputFormat::Pcm24Wav,
-        bitrate_kbps: 128,
+        ..Default::default()
     };
 
     // Matches the boundary table in src/processing.rs's decide_normalization tests.

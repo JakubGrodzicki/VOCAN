@@ -86,7 +86,7 @@ fn process_single_file_with_dfn3_dereverb_enabled_succeeds() {
         return;
     };
     use vocan::processing::process_single_file;
-    use vocan::types::{OutputFormat, ProcessingOptions, ReductionProfile};
+    use vocan::types::{OutputFormat, ProcessingOptions};
 
     let dir = tempfile::tempdir().unwrap();
     let input_base = dir.path().join("in");
@@ -97,18 +97,10 @@ fn process_single_file_with_dfn3_dereverb_enabled_succeeds() {
 
     let opts = ProcessingOptions {
         target_lufs: Some(-16.0),
-        target_peak_dbfs: -3.0,
         automixer: true,
-        automixer_spectral_gate: false,
-        automixer_nn_dereverb: false,
         automixer_dfn3_dereverb: true,
-        automixer_dfn3_mix: 0.8,
-        automixer_dfn3_postfilter: false,
-        automixer_expander: false,
-        automixer_expander_safety_pct: 50.0,
-        automixer_expander_reduction_profile: ReductionProfile::Recommended,
         output_format: OutputFormat::Pcm24Wav,
-        bitrate_kbps: 128,
+        ..Default::default()
     };
 
     // Pass the *resolved* ffmpeg path, not a bare "ffmpeg": process_with_rust_dsp

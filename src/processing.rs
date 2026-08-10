@@ -5,10 +5,12 @@ use std::process::{Command, Stdio};
 
 use crate::audio_effects;
 use crate::ffmpeg::{
-    apply_loudnorm_pass2, ffmpeg_cmd, get_file_stats, get_file_stats_padded, get_sample_rate,
-    measure_peak_dbfs, probe_input,
+    apply_loudnorm_pass2, ffmpeg_cmd, get_file_stats, get_file_stats_padded, measure_peak_dbfs,
+    probe_input,
 };
-use crate::types::{LoudnormStats, NormResult, OutputFormat, ProcessingOptions};
+use crate::memory;
+use crate::proc::{self, output_supervised};
+use crate::types::{AppMsg, LoudnormStats, NormResult, OutputFormat, ProcessingOptions};
 
 // ---------------------------------------------------------------------------
 // Automixer filter chains
@@ -103,50 +105,86 @@ fn measure_and_decide_normalization(
     duration: f32,
     prefix: Option<&str>,
     target_peak_dbfs: f32,
-) -> Result<NormDecision> {
+    log: Option<&std::sync::mpsc::Sender<AppMsg>>,
+) -> NormDecision {
+    /// A measurement that fails is not a file that fails.
+    ///
+    /// There are two more strategies behind each of these passes (padded
+    /// loudnorm, then peak normalization), and the peak pass was already
+    /// softened with `.ok()`. The EBU R128 passes were not: an unparseable
+    /// pass-1 output -- FFmpeg refusing the file, or a build whose loudnorm
+    /// prints something unexpected -- propagated straight out with `?` and
+    /// killed the file, even though the very next strategy would have produced
+    /// a perfectly good result. Note this cannot mask a missing FFmpeg: the
+    /// final encoding pass still reports that, with its own stderr attached.
+    fn soften(
+        result: Result<Option<LoudnormStats>>,
+        pass: &str,
+        log: Option<&std::sync::mpsc::Sender<AppMsg>>,
+    ) -> Option<LoudnormStats> {
+        match result {
+            Ok(stats) => stats,
+            Err(e) => {
+                if let Some(tx) = log {
+                    let _ = tx.send(AppMsg::Log(format!(
+                        "{pass} loudness measurement unavailable ({e}); \
+                         falling back to the next strategy."
+                    )));
+                }
+                None
+            }
+        }
+    }
+
     let standard_stats = if duration >= 3.0 {
-        get_file_stats(input, ffmpeg, target_lufs, prefix)?
+        soften(
+            get_file_stats(input, ffmpeg, target_lufs, prefix),
+            "Standard",
+            log,
+        )
     } else {
         None
     };
-    if matches!(
-        decide_normalization(
-            duration,
-            standard_stats.as_ref(),
-            None,
-            None,
-            target_peak_dbfs
-        ),
-        NormDecision::Standard(_)
+    // `decide_normalization` stays the single source of truth for the
+    // precedence rules; taking the stats back out of the decision (rather than
+    // unwrapping the Option alongside it) keeps that from depending on an
+    // unstated invariant about when Standard can be returned.
+    if let NormDecision::Standard(stats) = decide_normalization(
+        duration,
+        standard_stats.as_ref(),
+        None,
+        None,
+        target_peak_dbfs,
     ) {
-        return Ok(NormDecision::Standard(standard_stats.unwrap()));
+        return NormDecision::Standard(stats);
     }
 
     let pad_secs = f32::max(5.0, duration + 1.0);
-    let padded_stats = get_file_stats_padded(input, ffmpeg, target_lufs, pad_secs, prefix)?;
-    if matches!(
-        decide_normalization(
-            duration,
-            standard_stats.as_ref(),
-            padded_stats.as_ref(),
-            None,
-            target_peak_dbfs
-        ),
-        NormDecision::Padded(_)
+    let padded_stats = soften(
+        get_file_stats_padded(input, ffmpeg, target_lufs, pad_secs, prefix),
+        "Padded",
+        log,
+    );
+    if let NormDecision::Padded(stats) = decide_normalization(
+        duration,
+        standard_stats.as_ref(),
+        padded_stats.as_ref(),
+        None,
+        target_peak_dbfs,
     ) {
-        return Ok(NormDecision::Padded(padded_stats.unwrap()));
+        return NormDecision::Padded(stats);
     }
 
     let peak_dbfs = measure_peak_dbfs(input, ffmpeg, prefix)
         .ok()
         .filter(|p| p.is_finite());
-    Ok(decide_normalization(
+    decide_normalization(
         duration,
         standard_stats.as_ref(),
         padded_stats.as_ref(),
         peak_dbfs,
         target_peak_dbfs,
-    ))
+    )
 }
 
 /// Applies a [`NormDecision`] to the FFmpeg command (pass-2 filter args) and
@@ -207,6 +245,63 @@ fn add_format_args(cmd: &mut std::process::Command, format: OutputFormat, bitrat
     }
 }
 
+/// The scratch name the encoder writes to before the result is committed.
+///
+/// The extension is preserved (`line1.wav` -> `line1.vocan-partial.wav`)
+/// because FFmpeg picks its muxer from it.
+fn partial_path(output: &Path) -> std::path::PathBuf {
+    let mut name = output.file_stem().unwrap_or_default().to_os_string();
+    name.push(".vocan-partial.");
+    name.push(output.extension().unwrap_or_default());
+    output.with_file_name(name)
+}
+
+/// Runs the final encoding pass, publishing its result only if it completed.
+///
+/// FFmpeg writes straight to the path it is given, so an interrupted run leaves
+/// a truncated file sitting at the destination looking exactly like a finished
+/// conversion -- and a half-written voice-over line is worse than a missing one,
+/// because nothing downstream can tell. That was survivable while Stop only took
+/// effect between files; now that it terminates children mid-encode (and closing
+/// the window does too), it is a live hazard.
+///
+/// So: encode to a sibling scratch name and rename on success. Rename within one
+/// directory is atomic on both Windows and POSIX, and `std::fs::rename` replaces
+/// an existing destination on both.
+fn run_encode(cmd: &mut Command, output: &Path) -> Result<()> {
+    let partial = partial_path(output);
+    cmd.arg(&partial);
+
+    let result = output_supervised(cmd).context("Failed to run FFmpeg (Conversion)");
+    let cleanup = || {
+        let _ = std::fs::remove_file(&partial);
+    };
+
+    let final_output = match result {
+        Ok(out) => out,
+        Err(e) => {
+            cleanup();
+            return Err(e);
+        }
+    };
+    if !final_output.status.success() {
+        cleanup();
+        return Err(crate::ffmpeg::ffmpeg_failed(
+            "conversion",
+            &String::from_utf8_lossy(&final_output.stderr),
+        ));
+    }
+
+    std::fs::rename(&partial, output).map_err(|e| {
+        cleanup();
+        anyhow!(
+            "encoded {} but could not move it into place: {}",
+            partial.display(),
+            e
+        )
+    })
+}
+
 /// Reads a raw little-endian f32 stream directly into a `Vec<f32>`.
 ///
 /// Buffering the whole stream into a `Vec<u8>` and converting afterwards would
@@ -215,7 +310,28 @@ fn add_format_args(cmd: &mut std::process::Command, format: OutputFormat, bitrat
 /// promise about landing on a 4-byte boundary, so a 0-3 byte remainder is
 /// carried across iterations.
 fn read_f32le_stream(reader: &mut impl Read) -> Result<Vec<f32>> {
-    let mut samples: Vec<f32> = Vec::with_capacity(1 << 18);
+    /// `Vec::try_reserve` with a message a user can act on.
+    ///
+    /// This is the one allocation in the pipeline whose size is not known in
+    /// advance, so it is the one that has to grow fallibly: an infallible
+    /// `extend` that cannot get memory **aborts the process**, which
+    /// `catch_unwind` in the batch worker never sees -- one oversized file
+    /// would take the whole run down rather than being skipped with an error.
+    ///
+    /// `try_reserve` (not `try_reserve_exact`) because it keeps `Vec`'s
+    /// geometric growth; reserving exactly per chunk would make this O(n^2).
+    fn grow(samples: &mut Vec<f32>, extra: usize) -> Result<()> {
+        samples.try_reserve(extra).map_err(|_| {
+            anyhow!(
+                "ran out of memory decoding this file ({:.2} GB of samples read so far). \
+                 Process it without Automixer, or split it into shorter takes.",
+                (samples.len() as f64 * 4.0) / (1024.0 * 1024.0 * 1024.0)
+            )
+        })
+    }
+
+    let mut samples: Vec<f32> = Vec::new();
+    grow(&mut samples, 1 << 18)?;
     let mut buf = vec![0u8; 1 << 16];
     let mut rem = [0u8; 4];
     let mut rem_len = 0usize;
@@ -234,12 +350,14 @@ fn read_f32le_stream(reader: &mut impl Read) -> Result<Vec<f32>> {
             rem_len += take;
             chunk = &chunk[take..];
             if rem_len == 4 {
+                grow(&mut samples, 1)?;
                 samples.push(f32::from_le_bytes(rem));
                 rem_len = 0;
             }
         }
 
         let usable = chunk.len() - chunk.len() % 4;
+        grow(&mut samples, usable / 4)?;
         samples.extend(
             chunk[..usable]
                 .chunks_exact(4)
@@ -274,8 +392,14 @@ fn process_with_rust_dsp(
     opts: &ProcessingOptions,
     ffmpeg: &Path,
 ) -> Result<NormResult> {
-    // 1. Get original sample rate (to restore later)
-    let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
+    // 1. Get original sample rate (to restore later).
+    //
+    // `probe_input` rather than `get_sample_rate`: both spawn exactly one
+    // ffmpeg process and parse the same stderr, but this one also returns the
+    // duration, which the memory gate below needs to size its request. The
+    // per-file process count is unchanged.
+    let (probed_sr, probed_duration) = probe_input(input, ffmpeg);
+    let source_sr = probed_sr.unwrap_or(44100);
 
     // Only nnnoiseless (RNNoise) and DeepFilterNet3 hard-require 48kHz; every
     // other stage takes the rate as a parameter and is correct at any of them.
@@ -284,6 +408,21 @@ fn process_with_rust_dsp(
     // source on encode) along with the quality loss they carry.
     let needs_48k = opts.automixer_dfn3_dereverb || opts.automixer_nn_dereverb;
     let dsp_sr: u32 = if needs_48k { 48_000 } else { source_sr };
+
+    // Admission gate for the in-memory stages below. Weighted by this file's
+    // own estimated footprint, so a batch of short voice-over lines never
+    // contends and pays only one uncontended mutex acquisition per file. It
+    // exists for the collective case -- `cores - 1` files that each fit but
+    // together do not -- where the alternative is a failed allocation, which in
+    // Rust aborts the process and loses the entire run.
+    let memory_permit = memory::gate().acquire(
+        memory::estimated_dsp_bytes(probed_duration, dsp_sr, opts.automixer_dfn3_dereverb),
+        |msg| {
+            if let Some(tx) = &opts.log {
+                let _ = tx.send(AppMsg::Log(msg));
+            }
+        },
+    );
 
     // 2+3. FFmpeg de-esser → stdout (f32le) → memory (no temp file)
     let mut child = ffmpeg_cmd(ffmpeg)
@@ -297,6 +436,11 @@ fn process_with_rust_dsp(
         .spawn()
         .context("FFmpeg spawn failed (de-esser pass)")?;
 
+    // Registered so Stop / closing the window can terminate this pass mid-file
+    // instead of only between files. Declared after `child` so it drops first;
+    // see `proc::register` for why that ordering is load-bearing.
+    let _child_guard = proc::register(&child);
+
     // Read stderr in a separate thread to avoid blocking FFmpeg
     // when there is large diagnostic output.
     let mut stderr_pipe = child.stderr.take().expect("stderr piped");
@@ -306,12 +450,24 @@ fn process_with_rust_dsp(
         s
     });
 
-    let samples = {
-        let stdout = child.stdout.as_mut().context("FFmpeg stdout not piped")?;
-        read_f32le_stream(stdout)?
+    // `Child::drop` neither kills nor reaps. Propagating a read error with `?`
+    // straight out of this scope therefore used to leak a live ffmpeg process
+    // *and* the stderr thread above, permanently blocked in `read_to_string` --
+    // once per failing file, for the rest of the session. So: take the result,
+    // tear the child down unconditionally, and only then propagate.
+    let read_result = match child.stdout.as_mut() {
+        Some(stdout) => read_f32le_stream(stdout),
+        None => Err(anyhow!("FFmpeg stdout not piped")),
     };
-    let status = child.wait().context("FFmpeg de-esser wait failed")?;
+    // Close our read end before waiting. If the read above bailed out early,
+    // ffmpeg is still producing output, and leaving the pipe open would block it
+    // as soon as the buffer filled -- deadlocking the `wait()` below.
+    drop(child.stdout.take());
+    let status = child.wait();
     let stderr_text = stderr_handle.join().unwrap_or_default();
+
+    let samples = read_result.context("reading FFmpeg de-esser output")?;
+    let status = status.context("FFmpeg de-esser wait failed")?;
     if !status.success() {
         return Err(anyhow!("FFmpeg de-esser pass failed: {}", stderr_text));
     }
@@ -399,10 +555,13 @@ fn process_with_rust_dsp(
     //    This file is used for BOTH loudnorm pass-1 measurement AND as the
     //    input to the final FFmpeg encoding pass, ensuring the signal measured
     //    is the same signal that gets normalized and encoded.
-    let temp_wav = tempfile::Builder::new()
-        .suffix(".wav")
-        .tempfile()
-        .context("cannot create temp wav for DSP output")?;
+    let mut temp_builder = tempfile::Builder::new();
+    temp_builder.suffix(".wav");
+    let temp_wav = match proc::scratch_dir() {
+        Some(dir) => temp_builder.tempfile_in(dir),
+        None => temp_builder.tempfile(),
+    }
+    .context("cannot create temp wav for DSP output")?;
     let temp_wav_path = temp_wav.path().to_path_buf();
     let processed_len = processed.len();
     {
@@ -423,6 +582,10 @@ fn process_with_rust_dsp(
     // holding the in-memory copy through the measurement and encoding passes
     // below would pin a full-length buffer for no reason.
     drop(processed);
+    // The signal lives on disk from here on and the remaining passes stream it
+    // through ffmpeg, so the reservation goes back to the pool now rather than
+    // at the end of the function.
+    drop(memory_permit);
 
     // 6. Second FFmpeg call: temp WAV → filters (HPF, EQ, compressor) → normalization → encoding
     let mut cmd = ffmpeg_cmd(ffmpeg);
@@ -445,7 +608,8 @@ fn process_with_rust_dsp(
             duration,
             Some(&post_filters),
             opts.target_peak_dbfs,
-        )?;
+            opts.log.as_ref(),
+        );
         apply_norm_decision(&mut cmd, &decision, lufs, source_sr, Some(&post_filters))
     } else {
         // No normalization requested at all -- still must restore the
@@ -456,17 +620,7 @@ fn process_with_rust_dsp(
     };
 
     add_format_args(&mut cmd, opts.output_format, opts.bitrate_kbps);
-    cmd.arg(output);
-
-    let final_output = cmd
-        .stderr(Stdio::piped())
-        .output()
-        .context("Failed to run FFmpeg (Conversion)")?;
-
-    if !final_output.status.success() {
-        let err = String::from_utf8_lossy(&final_output.stderr);
-        return Err(anyhow!("FFmpeg Error: {}", err));
-    }
+    run_encode(&mut cmd, output)?;
 
     Ok(norm_result)
 }
@@ -475,6 +629,24 @@ fn process_with_rust_dsp(
 // Main file processing function
 // ---------------------------------------------------------------------------
 
+/// Where the processed version of `input` will be written.
+///
+/// Exposed so the batch scanner can detect two inputs that map to the same
+/// output *before* processing starts, rather than letting two ffmpeg processes
+/// write the same file at once. Both callers going through one function is what
+/// makes that check agree with reality by construction.
+pub fn output_path_for(
+    input: &Path,
+    input_base: &Path,
+    output_base: &Path,
+    format: OutputFormat,
+) -> Result<std::path::PathBuf> {
+    let rel_path = input.strip_prefix(input_base)?;
+    Ok(output_base
+        .join(rel_path)
+        .with_extension(format.extension()))
+}
+
 pub fn process_single_file(
     input: &Path,
     input_base: &Path,
@@ -482,10 +654,7 @@ pub fn process_single_file(
     opts: &ProcessingOptions,
     ffmpeg: &Path,
 ) -> Result<NormResult> {
-    let rel_path = input.strip_prefix(input_base)?;
-    let output = output_base
-        .join(rel_path)
-        .with_extension(opts.output_format.extension());
+    let output = output_path_for(input, input_base, output_base, opts.output_format)?;
 
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -513,24 +682,15 @@ pub fn process_single_file(
             duration,
             None,
             opts.target_peak_dbfs,
-        )?;
+            opts.log.as_ref(),
+        );
         apply_norm_decision(&mut cmd, &decision, lufs, source_sr, None)
     } else {
         NormResult::Skipped
     };
 
     add_format_args(&mut cmd, opts.output_format, opts.bitrate_kbps);
-    cmd.arg(&output);
-
-    let final_output = cmd
-        .stderr(Stdio::piped())
-        .output()
-        .context("Failed to run FFmpeg (Conversion)")?;
-
-    if !final_output.status.success() {
-        let err = String::from_utf8_lossy(&final_output.stderr);
-        return Err(anyhow!("FFmpeg Error: {}", err));
-    }
+    run_encode(&mut cmd, &output)?;
 
     Ok(norm_result)
 }
@@ -707,6 +867,76 @@ mod tests {
         );
         assert_eq!(result, NormResult::Skipped);
         assert_eq!(args_of(&cmd), vec!["-af", "highpass=f=70", "-ar", "44100"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // output_path_for
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn output_path_for_mirrors_the_input_tree_and_rewrites_the_extension() {
+        let out = output_path_for(
+            Path::new("/in/voice/line1.mp3"),
+            Path::new("/in"),
+            Path::new("/out"),
+            OutputFormat::Flac,
+        )
+        .unwrap();
+        assert_eq!(out, Path::new("/out/voice/line1.flac"));
+    }
+
+    #[test]
+    fn output_path_for_maps_different_source_extensions_onto_one_output() {
+        // The collision the batch scanner has to catch: because every format
+        // rewrites the extension, two sources that differ only in theirs land
+        // on the same path -- and the batch processes files in parallel, so
+        // both would be written at once.
+        let a = output_path_for(
+            Path::new("/in/line1.wav"),
+            Path::new("/in"),
+            Path::new("/out"),
+            OutputFormat::AdpcmWav,
+        )
+        .unwrap();
+        let b = output_path_for(
+            Path::new("/in/line1.mp3"),
+            Path::new("/in"),
+            Path::new("/out"),
+            OutputFormat::AdpcmWav,
+        )
+        .unwrap();
+        assert_eq!(a, b, "this is the collision, and it must be detectable");
+    }
+
+    #[test]
+    fn partial_path_keeps_the_extension_ffmpeg_selects_its_muxer_from() {
+        assert_eq!(
+            partial_path(Path::new("/out/voice/line1.wav")),
+            Path::new("/out/voice/line1.vocan-partial.wav")
+        );
+        assert_eq!(
+            partial_path(Path::new("/out/line1.flac")),
+            Path::new("/out/line1.vocan-partial.flac")
+        );
+    }
+
+    #[test]
+    fn partial_path_stays_in_the_destination_directory() {
+        // The commit is a rename, which is only atomic within one filesystem
+        // directory -- so the scratch file must be a sibling of the target.
+        let out = Path::new("/out/voice/line1.wav");
+        assert_eq!(partial_path(out).parent(), out.parent());
+    }
+
+    #[test]
+    fn output_path_for_errors_when_the_input_is_outside_the_base() {
+        assert!(output_path_for(
+            Path::new("/elsewhere/line1.wav"),
+            Path::new("/in"),
+            Path::new("/out"),
+            OutputFormat::AdpcmWav,
+        )
+        .is_err());
     }
 
     #[test]

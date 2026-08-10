@@ -28,6 +28,21 @@ nnnoiseless = { version = "0.5", default-features = false }
 tempfile = "3.10"
 hound = "3.5"
 
+# Terminating a running child from another thread (src/proc.rs) is the one thing
+# std cannot express: `Child::kill` needs `&mut Child`, which the worker thread
+# parked in `wait()` is holding. Both crates are already in the dependency graph
+# via eframe/winit/rfd, and the versions selected here are ones the lockfile
+# already resolves, so neither adds a crate to the build.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # The DSP stages are tight per-sample/per-bin loops calling small functions
 # across crate boundaries (biquad, rustfft), so cross-crate inlining matters.
 #

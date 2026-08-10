@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::sync::mpsc::Sender;
 
 // ---------------------------------------------------------------------------
 // Expander Reduction Profile
@@ -190,6 +191,41 @@ pub struct ProcessingOptions {
     pub output_format: OutputFormat,
     /// Bitrate in kbps for lossy formats (MP3, OGG). Ignored for lossless.
     pub bitrate_kbps: u32,
+    /// Optional channel back to the UI log, for conditions the caller should
+    /// see but that are not errors -- currently only the memory gate making a
+    /// file wait, which without an explanation is indistinguishable from a hang.
+    pub log: Option<Sender<AppMsg>>,
+}
+
+/// Mirrors the initial state of `AudioBatchApp`, so that constructing
+/// `ProcessingOptions::default()` in a test exercises the same configuration
+/// the application actually ships with.
+///
+/// Written out by hand rather than `#[derive(Default)]` on purpose: the derive
+/// would produce `target_peak_dbfs: 0.0`, `bitrate_kbps: 0`,
+/// `automixer_dfn3_mix: 0.0` and `automixer_expander_safety_pct: 0.0`, none of
+/// which is the real default. Tests would still pass -- they would just quietly
+/// be testing peak normalization to 0 dBFS and `-b:a 0k`. The parity test in
+/// `app.rs` keeps this in step with the UI.
+impl Default for ProcessingOptions {
+    fn default() -> Self {
+        Self {
+            target_lufs: None,
+            target_peak_dbfs: -3.0,
+            automixer: false,
+            automixer_spectral_gate: false,
+            automixer_nn_dereverb: false,
+            automixer_dfn3_dereverb: false,
+            automixer_dfn3_mix: 0.8,
+            automixer_dfn3_postfilter: false,
+            automixer_expander: false,
+            automixer_expander_safety_pct: 50.0,
+            automixer_expander_reduction_profile: ReductionProfile::Recommended,
+            output_format: OutputFormat::AdpcmWav,
+            bitrate_kbps: 128,
+            log: None,
+        }
+    }
 }
 
 #[cfg(test)]

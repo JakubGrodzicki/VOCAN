@@ -62,6 +62,13 @@ pub fn apply_spectral_gate(
     if samples.is_empty() {
         return Ok(Vec::new());
     }
+    // `frames_total` below divides by `ch`, so a zero channel count panics.
+    // `apply_expander_inplace` already treats that as "leave the signal alone"
+    // rather than as a hard error; this is a public entry point too, so it
+    // mirrors that contract instead of introducing a second one.
+    if channels == 0 {
+        return Ok(samples.to_vec());
+    }
 
     let fft_size = 2048usize;
     let hop = fft_size / 4;
@@ -110,6 +117,18 @@ pub fn apply_spectral_gate(
     let pad = fft_size;
     let padded_len = frames_total + 2 * pad;
     let comp = 2.0 / 3.0;
+
+    // Both buffers below stay `vec![0f32; n]` rather than becoming
+    // `try_reserve` + `resize`: that form hits std's `IsZero` specialisation and
+    // goes to `alloc_zeroed`, which for a ~100 MB accumulator hands back
+    // already-zeroed pages instead of writing over the whole buffer. Since the
+    // sizes are known up front, checking them is fallible *and* free, whereas
+    // `try_reserve` + `resize` would be fallible at the cost of a full extra
+    // write pass over the largest buffer in the pipeline.
+    crate::memory::check_alloc(padded_len, 4, "the spectral gate accumulator")?;
+    if ch != 1 {
+        crate::memory::check_alloc(samples.len(), 4, "the spectral gate output buffer")?;
+    }
 
     // Mono reuses the per-channel accumulator as the return buffer, so only the
     // multi-channel path needs a separate interleaved output up front.
@@ -211,6 +230,12 @@ pub fn apply_voice_eq_inplace(
     strength: f32,
 ) -> Result<()> {
     use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Type, Q_BUTTERWORTH_F32};
+
+    // Same guard as `apply_spectral_gate` / `apply_expander_inplace`: `frames`
+    // below divides by `ch`, which panics at zero.
+    if buf.is_empty() || channels == 0 {
+        return Ok(());
+    }
 
     let fs = (sample_rate as f32).hz();
     let s = strength.clamp(0.0, 1.0);
@@ -388,15 +413,31 @@ fn read_wav_f32(path: &Path) -> Result<Vec<f32>> {
     let spec = reader.spec();
 
     // Convert any sample format to f32.
+    //
+    // Decode errors are propagated rather than filtered away. The previous
+    // `.filter_map(|s| s.ok())` turned a truncated or malformed WAV into a
+    // silently *shorter* signal, and the dry/wet mix below then padded the
+    // missing tail with dry audio -- producing a file that looked correct but
+    // had quietly lost its dereverb from some arbitrary point onwards.
     let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<Result<Vec<f32>, _>>()
+            .with_context(|| format!("corrupt WAV sample data in {}", path.display()))?,
         hound::SampleFormat::Int => {
+            if spec.bits_per_sample == 0 || spec.bits_per_sample > 32 {
+                anyhow::bail!(
+                    "unsupported bit depth {} in {}",
+                    spec.bits_per_sample,
+                    path.display()
+                );
+            }
             let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
             reader
                 .samples::<i32>()
-                .filter_map(|s| s.ok())
-                .map(|s| s as f32 / max_val)
-                .collect()
+                .map(|s| s.map(|v| v as f32 / max_val))
+                .collect::<Result<Vec<f32>, _>>()
+                .with_context(|| format!("corrupt WAV sample data in {}", path.display()))?
         }
     };
 
@@ -428,17 +469,25 @@ pub fn apply_dereverb_dfn3(
     }
 
     // 1. Write input WAV using hound (no FFmpeg subprocess needed).
-    let temp_wav_in = tempfile::Builder::new()
-        .suffix(".wav")
-        .tempfile()
-        .context("cannot create temp wav input")?;
+    let scratch = crate::proc::scratch_dir();
+    let mut temp_builder = tempfile::Builder::new();
+    temp_builder.suffix(".wav");
+    let temp_wav_in = match scratch {
+        Some(dir) => temp_builder.tempfile_in(dir),
+        None => temp_builder.tempfile(),
+    }
+    .context("cannot create temp wav input")?;
     let wav_in_path = temp_wav_in.path().to_path_buf();
     write_wav_f32(&wav_in_path, samples_48k_mono)?;
 
     // 2. DeepFilterNet3 inference.
     // We use a dedicated temp directory and take the first produced WAV
     // instead of guessing the naming scheme (which differs between CLI builds).
-    let out_dir = tempfile::tempdir().context("cannot create temp dir for deep-filter")?;
+    let out_dir = match scratch {
+        Some(dir) => tempfile::tempdir_in(dir),
+        None => tempfile::tempdir(),
+    }
+    .context("cannot create temp dir for deep-filter")?;
 
     let mut cmd = silent_command(dfn_binary);
     cmd.arg("-D")
@@ -453,7 +502,9 @@ pub fn apply_dereverb_dfn3(
         cmd.arg("--pf");
     }
 
-    let out = cmd.output().context("deep-filter invocation failed")?;
+    // Supervised: DeepFilterNet3 is the slowest stage in the pipeline and the
+    // most likely to wedge, so it has to be interruptible from the UI thread.
+    let out = crate::proc::output_supervised(&mut cmd).context("deep-filter invocation failed")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         anyhow::bail!("deep-filter returned non-zero: {}", stderr);
@@ -566,7 +617,22 @@ pub fn estimate_noise_floor_db(samples: &[f32], sample_rate: u32) -> Option<f32>
     let win_len = (sample_rate as f32 * 0.025).round() as usize; // 25 ms
     let hop = win_len / 2; // 50% overlap
 
-    if win_len == 0 || samples.len() < win_len {
+    // Three separate degeneracies collapse into one bound. All need an absurd
+    // sample rate (below ~100 Hz), but this function is public, so none of them
+    // is unreachable:
+    //   * win_len == 1 -> hop == 0, and the analysis loop below advances by
+    //     `hop`, so it spins forever. A hang, which `catch_unwind` cannot
+    //     recover and the Stop button cannot interrupt.
+    //   * win_len == 1 -> the Hann window divides by `win_len - 1`, making
+    //     every coefficient 0.0/0.0 = NaN.
+    //   * win_len == 2 -> the window is [0.0, 0.0] (a Hann window is zero at
+    //     both endpoints, and length 2 is nothing but endpoints), so
+    //     `w2_sum` is 0 and `inv_w2_sum` is infinite -- every RMS comes out NaN.
+    // Only win_len >= 3 gives a window with real energy in it. The NaN cases
+    // are not unsafe on their own (NaN fails the `rms > 1e-7` test, so the
+    // function returns None anyway), but reaching that answer costs a full
+    // O(n) pass over the signal.
+    if win_len < 3 || samples.len() < win_len {
         return None;
     }
 
@@ -877,6 +943,29 @@ mod tests {
     }
 
     #[test]
+    fn estimate_noise_floor_db_at_absurdly_low_sample_rate_returns_none_without_hanging() {
+        // Regression test for a hang, so it has to terminate at all to pass.
+        //
+        // sample_rate 40 -> win_len = round(40 * 0.025) = 1 -> hop = 0. The
+        // analysis loop advances by `hop`, so it used to spin forever on any
+        // input long enough to enter it: a hang that catch_unwind cannot
+        // recover and Stop cannot interrupt.
+        let noise = xorshift_noise(4000, 0.2, 9);
+        assert_eq!(estimate_noise_floor_db(&noise, 40), None);
+        // sample_rate 60 -> win_len = 2. The loop terminates, but a Hann window
+        // of length 2 is [0.0, 0.0], so w2_sum is 0 and every RMS is NaN.
+        assert_eq!(estimate_noise_floor_db(&noise, 60), None);
+    }
+
+    #[test]
+    fn estimate_noise_floor_db_accepts_the_smallest_non_degenerate_window() {
+        // sample_rate 100 -> win_len = round(2.5) = 3, the shortest Hann window
+        // with any energy in it. The guard above must not swallow this case.
+        let noise = xorshift_noise(4000, 0.2, 9);
+        assert!(estimate_noise_floor_db(&noise, 100).is_some());
+    }
+
+    #[test]
     fn estimate_noise_floor_db_on_pure_silence_returns_none() {
         let samples = vec![0.0f32; 96000]; // 2s at 48kHz, well above the length floor
         assert_eq!(estimate_noise_floor_db(&samples, 48000), None);
@@ -1071,6 +1160,15 @@ mod tests {
     }
 
     #[test]
+    fn apply_spectral_gate_zero_channels_leaves_input_unchanged() {
+        // `frames_total = samples.len() / ch` panicked at ch == 0. Mirrors
+        // apply_expander_zero_channels_leaves_input_unchanged.
+        let samples = sine_wave(440.0, 48000, 0.1, 0.5);
+        let out = apply_spectral_gate(&samples, 48000, 0, &SpectralGateParams::default()).unwrap();
+        assert_eq!(out, samples);
+    }
+
+    #[test]
     fn apply_spectral_gate_never_produces_nan_or_inf() {
         let samples = xorshift_noise(96000, 0.3, 5);
         let out = apply_spectral_gate(&samples, 48000, 1, &SpectralGateParams::default()).unwrap();
@@ -1110,6 +1208,15 @@ mod tests {
         let settle = 500; // skip filter startup transient
         let ratio = rms(&buf[settle..]) / rms(&original[settle..]);
         assert!((0.9..=1.1).contains(&ratio), "ratio={ratio}");
+    }
+
+    #[test]
+    fn apply_voice_eq_inplace_zero_channels_leaves_input_unchanged() {
+        // `frames = buf.len() / ch` panicked at ch == 0.
+        let samples = sine_wave(440.0, 48000, 0.1, 0.5);
+        let mut buf = samples.clone();
+        apply_voice_eq_inplace(&mut buf, 48000, 0, 0.5).unwrap();
+        assert_eq!(buf, samples);
     }
 
     #[test]

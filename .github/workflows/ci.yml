@@ -15,8 +15,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # No `@stable`: rust-toolchain.toml pins the version, so a new stable
+      # release cannot turn CI red (via `clippy -D warnings`) on a commit that
+      # changed nothing. Bumping the toolchain is its own commit.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.95.0"
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
@@ -45,3 +49,14 @@ jobs:
 
       - name: Full tests (ffmpeg-dependent, --ignored)
         run: cargo test -- --ignored
+
+  # Separate job: a newly published advisory against a dependency is not a
+  # reason to fail the build of a commit that did not touch dependencies, but it
+  # is something someone has to see.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources licenses

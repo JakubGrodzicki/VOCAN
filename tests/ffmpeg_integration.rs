@@ -131,7 +131,7 @@ fn measure_peak_dbfs_matches_known_amplitude() {
 fn process_single_file_with_missing_ffmpeg_returns_err_not_panic() {
     use std::path::PathBuf;
     use vocan::processing::process_single_file;
-    use vocan::types::{OutputFormat, ProcessingOptions, ReductionProfile};
+    use vocan::types::{OutputFormat, ProcessingOptions};
 
     let dir = tempfile::tempdir().unwrap();
     let input_base = dir.path().join("in");
@@ -141,19 +141,8 @@ fn process_single_file_with_missing_ffmpeg_returns_err_not_panic() {
     write_sine_wav(&input_path, 1.0, 44100, 440.0, 0.5);
 
     let opts = ProcessingOptions {
-        target_lufs: None,
-        target_peak_dbfs: -3.0,
-        automixer: false,
-        automixer_spectral_gate: false,
-        automixer_nn_dereverb: false,
-        automixer_dfn3_dereverb: false,
-        automixer_dfn3_mix: 0.8,
-        automixer_dfn3_postfilter: false,
-        automixer_expander: false,
-        automixer_expander_safety_pct: 50.0,
-        automixer_expander_reduction_profile: ReductionProfile::Recommended,
         output_format: OutputFormat::Pcm24Wav,
-        bitrate_kbps: 128,
+        ..Default::default()
     };
 
     let bogus_ffmpeg = PathBuf::from("/nonexistent/ffmpeg-binary-xyz");
@@ -172,7 +161,7 @@ fn norm_result_matches_decision_table_at_boundary_durations() {
         return;
     }
     use vocan::processing::process_single_file;
-    use vocan::types::{NormResult, OutputFormat, ProcessingOptions, ReductionProfile};
+    use vocan::types::{NormResult, OutputFormat, ProcessingOptions};
 
     let dir = tempfile::tempdir().unwrap();
     let input_base = dir.path().join("in");
@@ -182,18 +171,8 @@ fn norm_result_matches_decision_table_at_boundary_durations() {
 
     let opts = ProcessingOptions {
         target_lufs: Some(-16.0),
-        target_peak_dbfs: -3.0,
-        automixer: false,
-        automixer_spectral_gate: false,
-        automixer_nn_dereverb: false,
-        automixer_dfn3_dereverb: false,
-        automixer_dfn3_mix: 0.8,
-        automixer_dfn3_postfilter: false,
-        automixer_expander: false,
-        automixer_expander_safety_pct: 50.0,
-        automixer_expander_reduction_profile: ReductionProfile::Recommended,
         output_format: OutputFormat::Pcm24Wav,
-        bitrate_kbps: 128,
+        ..Default::default()
     };
 
     // Matches the boundary table in src/processing.rs's decide_normalization tests.

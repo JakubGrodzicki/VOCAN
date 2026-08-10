@@ -11,6 +11,7 @@ dependencies = [
  "eframe",
  "egui",
  "hound",
+ "libc",
  "nnnoiseless",
  "num_cpus",
  "rayon",
@@ -20,6 +21,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "walkdir",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

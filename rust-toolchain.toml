@@ -1,0 +1,11 @@
+# Pinned deliberately.
+#
+# CI runs `cargo clippy -- -D warnings`, so every new stable Rust can break the
+# build with lints that did not exist when the code was written -- a red CI on a
+# commit that changed nothing, at a moment nobody chose. Pinning moves that to a
+# decision: bump this file, fix what the new lints found, in its own commit.
+#
+# Bump regularly; the point is to control *when*, not to stay behind.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]

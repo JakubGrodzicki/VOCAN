@@ -15,23 +15,17 @@ use common::{
     ffmpeg_has_encoder, ffmpeg_path, read_wav_samples_f32, skip_if_no_ffmpeg, write_sine_wav,
 };
 use vocan::processing::process_single_file;
-use vocan::types::{OutputFormat, ProcessingOptions, ReductionProfile};
+use vocan::types::{OutputFormat, ProcessingOptions};
 
+/// Only the fields that differ from the shipped defaults are named here, so
+/// this stays correct when a new option is added. `ProcessingOptions::default()`
+/// is hand-written to mirror `AudioBatchApp::new` and is checked against it by
+/// `processing_options_default_matches_the_ui_defaults` in src/app.rs.
 fn base_opts() -> ProcessingOptions {
     ProcessingOptions {
         target_lufs: Some(-16.0),
-        target_peak_dbfs: -3.0,
-        automixer: false,
-        automixer_spectral_gate: false,
-        automixer_nn_dereverb: false,
-        automixer_dfn3_dereverb: false,
-        automixer_dfn3_mix: 0.8,
-        automixer_dfn3_postfilter: false,
-        automixer_expander: false,
-        automixer_expander_safety_pct: 50.0,
-        automixer_expander_reduction_profile: ReductionProfile::Recommended,
         output_format: OutputFormat::Pcm24Wav,
-        bitrate_kbps: 128,
+        ..Default::default()
     }
 }
 

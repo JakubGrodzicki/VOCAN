@@ -1,0 +1,21 @@
+version: 2
+updates:
+  # Cargo dependencies. `eframe`/`egui` are pinned at 0.27.x, which is well
+  # behind; grouping the patch/minor noise separately keeps those major-version
+  # PRs visible instead of buried.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        update-types:
+          - minor
+          - patch
+
+  # The workflow's own actions go stale silently otherwise.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly

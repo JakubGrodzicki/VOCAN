@@ -216,7 +216,7 @@ impl Default for ProcessingOptions {
             automixer_spectral_gate: false,
             automixer_nn_dereverb: false,
             automixer_dfn3_dereverb: false,
-            automixer_dfn3_mix: 0.8,
+            automixer_dfn3_mix: 80.0,
             automixer_dfn3_postfilter: false,
             automixer_expander: false,
             automixer_expander_safety_pct: 50.0,

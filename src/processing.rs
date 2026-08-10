@@ -491,7 +491,7 @@ fn process_with_rust_dsp(
     // and smear bands that the EQ would later emphasize.
     if opts.automixer_dfn3_dereverb {
         let params = audio_effects::DereverbParams {
-            mix: opts.automixer_dfn3_mix,
+            mix: opts.automixer_dfn3_mix / 100.0,
             attenuation_limit: 30.0,
             post_filter: opts.automixer_dfn3_postfilter,
         };

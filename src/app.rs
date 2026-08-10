@@ -228,7 +228,7 @@ impl AudioBatchApp {
             automixer_spectral_gate: false,
             automixer_nn_dereverb: false,
             automixer_dfn3_dereverb: false,
-            automixer_dfn3_mix: 0.8,
+            automixer_dfn3_mix: 80.0,
             automixer_dfn3_postfilter: false,
             automixer_expander: false,
             automixer_expander_safety_pct: 50.0,
@@ -926,9 +926,10 @@ impl AudioBatchApp {
                                     );
                                     if self.automixer_dfn3_dereverb {
                                         ui.add(
-                                            egui::Slider::new(&mut self.automixer_dfn3_mix, 0.0..=1.0)
+                                            egui::Slider::new(&mut self.automixer_dfn3_mix, 0.0..=100.0)
                                                 .text("Dereverb mix")
-                                                .fixed_decimals(2),
+                                                .suffix("%")
+                                                .fixed_decimals(0),
                                         );
                                         ui.checkbox(
                                             &mut self.automixer_dfn3_postfilter,

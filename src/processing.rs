@@ -5,8 +5,8 @@ use std::process::{Command, Stdio};
 
 use crate::audio_effects;
 use crate::ffmpeg::{
-    apply_loudnorm_pass2, ffmpeg_cmd, get_duration, get_file_stats, get_file_stats_padded,
-    get_sample_rate, measure_peak_dbfs,
+    apply_loudnorm_pass2, ffmpeg_cmd, get_file_stats, get_file_stats_padded, get_sample_rate,
+    measure_peak_dbfs, probe_input,
 };
 use crate::types::{LoudnormStats, NormResult, OutputFormat, ProcessingOptions};
 
@@ -207,6 +207,57 @@ fn add_format_args(cmd: &mut std::process::Command, format: OutputFormat, bitrat
     }
 }
 
+/// Reads a raw little-endian f32 stream directly into a `Vec<f32>`.
+///
+/// Buffering the whole stream into a `Vec<u8>` and converting afterwards would
+/// keep a second full-length copy of the signal alive (115 MB for a 10-minute
+/// mono 48kHz file) for the remainder of the pipeline. `Read::read` makes no
+/// promise about landing on a 4-byte boundary, so a 0-3 byte remainder is
+/// carried across iterations.
+fn read_f32le_stream(reader: &mut impl Read) -> Result<Vec<f32>> {
+    let mut samples: Vec<f32> = Vec::with_capacity(1 << 18);
+    let mut buf = vec![0u8; 1 << 16];
+    let mut rem = [0u8; 4];
+    let mut rem_len = 0usize;
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let mut chunk = &buf[..n];
+
+        // Finish the sample straddling the previous read, if any.
+        if rem_len > 0 {
+            let take = (4 - rem_len).min(chunk.len());
+            rem[rem_len..rem_len + take].copy_from_slice(&chunk[..take]);
+            rem_len += take;
+            chunk = &chunk[take..];
+            if rem_len == 4 {
+                samples.push(f32::from_le_bytes(rem));
+                rem_len = 0;
+            }
+        }
+
+        let usable = chunk.len() - chunk.len() % 4;
+        samples.extend(
+            chunk[..usable]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        );
+
+        // Only overwrite the remainder when this read actually left one --
+        // `chunk` can be empty here after topping up a previous remainder.
+        let tail = &chunk[usable..];
+        if !tail.is_empty() {
+            rem[..tail.len()].copy_from_slice(tail);
+            rem_len = tail.len();
+        }
+    }
+
+    Ok(samples)
+}
+
 // ---------------------------------------------------------------------------
 // New pipeline with Rust DSP (when automixer + new modules are active)
 // ---------------------------------------------------------------------------
@@ -226,12 +277,21 @@ fn process_with_rust_dsp(
     // 1. Get original sample rate (to restore later)
     let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
 
+    // Only nnnoiseless (RNNoise) and DeepFilterNet3 hard-require 48kHz; every
+    // other stage takes the rate as a parameter and is correct at any of them.
+    // When neither is enabled we run the DSP at the source rate, which drops
+    // two sample-rate conversions per file (source -> 48k on decode, 48k ->
+    // source on encode) along with the quality loss they carry.
+    let needs_48k = opts.automixer_dfn3_dereverb || opts.automixer_nn_dereverb;
+    let dsp_sr: u32 = if needs_48k { 48_000 } else { source_sr };
+
     // 2+3. FFmpeg de-esser → stdout (f32le) → memory (no temp file)
     let mut child = ffmpeg_cmd(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
         .args(["-vn", "-af", &deesser_only_filter()])
-        .args(["-ac", "1", "-ar", "48000", "-f", "f32le", "pipe:1"])
+        .args(["-ac", "1", "-ar", &dsp_sr.to_string()])
+        .args(["-f", "f32le", "pipe:1"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -246,22 +306,15 @@ fn process_with_rust_dsp(
         s
     });
 
-    let mut raw = Vec::with_capacity(1 << 20);
-    child
-        .stdout
-        .as_mut()
-        .context("FFmpeg stdout not piped")?
-        .read_to_end(&mut raw)?;
+    let samples = {
+        let stdout = child.stdout.as_mut().context("FFmpeg stdout not piped")?;
+        read_f32le_stream(stdout)?
+    };
     let status = child.wait().context("FFmpeg de-esser wait failed")?;
     let stderr_text = stderr_handle.join().unwrap_or_default();
     if !status.success() {
         return Err(anyhow!("FFmpeg de-esser pass failed: {}", stderr_text));
     }
-
-    let samples: Vec<f32> = raw
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
 
     // 4. Rust DSP
     let mut processed = samples;
@@ -273,7 +326,7 @@ fn process_with_rust_dsp(
     // the de-esser is a subtle HF filter that won't materially affect broadband
     // RMS noise-floor estimation.
     let expander_noise_floor = if opts.automixer_expander {
-        audio_effects::estimate_noise_floor_db(&processed, 48000)
+        audio_effects::estimate_noise_floor_db(&processed, dsp_sr)
     } else {
         None
     };
@@ -316,8 +369,13 @@ fn process_with_rust_dsp(
                 reduction_profile: opts.automixer_expander_reduction_profile,
                 ..Default::default()
             };
-            processed =
-                audio_effects::apply_expander(&processed, 48000, 1, &params, noise_floor_db);
+            audio_effects::apply_expander_inplace(
+                &mut processed,
+                dsp_sr,
+                1,
+                &params,
+                noise_floor_db,
+            );
         }
     }
 
@@ -325,7 +383,7 @@ fn process_with_rust_dsp(
     if opts.automixer_spectral_gate {
         processed = audio_effects::apply_spectral_gate(
             &processed,
-            48000,
+            dsp_sr,
             1,
             &audio_effects::SpectralGateParams::default(),
         )?;
@@ -335,7 +393,7 @@ fn process_with_rust_dsp(
     }
 
     // Voice EQ always at 50% strength — LAST in the chain (in-place)
-    audio_effects::apply_voice_eq_inplace(&mut processed, 48000, 1, 0.5)?;
+    audio_effects::apply_voice_eq_inplace(&mut processed, dsp_sr, 1, 0.5)?;
 
     // 5. Write processed samples to a temp WAV file using hound.
     //    This file is used for BOTH loudnorm pass-1 measurement AND as the
@@ -346,9 +404,10 @@ fn process_with_rust_dsp(
         .tempfile()
         .context("cannot create temp wav for DSP output")?;
     let temp_wav_path = temp_wav.path().to_path_buf();
+    let processed_len = processed.len();
     {
         let spec = hound::WavSpec {
-            sample_rate: 48000,
+            sample_rate: dsp_sr,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
             channels: 1,
@@ -360,6 +419,10 @@ fn process_with_rust_dsp(
         }
         writer.finalize()?;
     }
+    // The signal now lives on disk and is only ever read back through FFmpeg;
+    // holding the in-memory copy through the measurement and encoding passes
+    // below would pin a full-length buffer for no reason.
+    drop(processed);
 
     // 6. Second FFmpeg call: temp WAV → filters (HPF, EQ, compressor) → normalization → encoding
     let mut cmd = ffmpeg_cmd(ffmpeg);
@@ -371,7 +434,10 @@ fn process_with_rust_dsp(
 
     // Normalization and encoding — stats measured on the PROCESSED temp WAV.
     let norm_result = if let Some(lufs) = opts.target_lufs {
-        let duration = get_duration(&temp_wav_path, ffmpeg).unwrap_or(0.0);
+        // We wrote this WAV ourselves one step above, so its duration is known
+        // exactly -- shelling out to FFmpeg just to re-measure it would be a
+        // whole extra process per file.
+        let duration = processed_len as f32 / dsp_sr as f32;
         let decision = measure_and_decide_normalization(
             &temp_wav_path,
             ffmpeg,
@@ -436,8 +502,10 @@ pub fn process_single_file(
     cmd.args(["-y", "-hide_banner", "-i"]).arg(input).arg("-vn");
 
     let norm_result = if let Some(lufs) = opts.target_lufs {
-        let source_sr = get_sample_rate(input, ffmpeg).unwrap_or(44100);
-        let duration = get_duration(input, ffmpeg).unwrap_or(0.0);
+        // One probe process yields both values; they come from the same stderr.
+        let (probed_sr, probed_duration) = probe_input(input, ffmpeg);
+        let source_sr = probed_sr.unwrap_or(44100);
+        let duration = probed_duration.unwrap_or(0.0);
         let decision = measure_and_decide_normalization(
             input,
             ffmpeg,

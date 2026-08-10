@@ -13,6 +13,7 @@ mod common;
 use common::{ffmpeg_path, skip_if_no_ffmpeg, write_sine_wav};
 use vocan::ffmpeg::{
     get_duration, get_file_stats, get_file_stats_padded, get_sample_rate, measure_peak_dbfs,
+    probe_input,
 };
 
 #[test]
@@ -43,6 +44,38 @@ fn get_sample_rate_matches_generated_wav() {
         let got = get_sample_rate(&path, &ffmpeg_path()).expect("sample rate");
         assert_eq!(got, sr);
     }
+}
+
+/// `probe_input` exists to replace a back-to-back `get_sample_rate` +
+/// `get_duration` pair (two ffmpeg processes parsing the same stderr) with a
+/// single process. It must agree with both of them exactly.
+#[test]
+#[ignore]
+fn probe_input_agrees_with_the_individual_probes() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tone.wav");
+    write_sine_wav(&path, 2.345, 48000, 440.0, 0.5);
+
+    let (sr, duration) = probe_input(&path, &ffmpeg_path());
+    assert_eq!(sr, get_sample_rate(&path, &ffmpeg_path()));
+    assert_eq!(duration, get_duration(&path, &ffmpeg_path()));
+    assert_eq!(sr, Some(48000));
+    assert!((duration.expect("duration") - 2.345).abs() < 0.05);
+}
+
+#[test]
+#[ignore]
+fn probe_input_on_a_nonexistent_file_returns_no_values() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (sr, duration) = probe_input(&dir.path().join("nope.wav"), &ffmpeg_path());
+    assert_eq!(sr, None);
+    assert_eq!(duration, None);
 }
 
 #[test]

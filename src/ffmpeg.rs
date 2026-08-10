@@ -8,10 +8,13 @@ use std::process::{Command, Stdio};
 use crate::types::LoudnormStats;
 
 pub fn ffmpeg_cmd(ffmpeg: &Path) -> Command {
-    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(ffmpeg);
     #[cfg(windows)]
     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    // Nothing here ever feeds ffmpeg on stdin, and an inherited stdin lets it
+    // consume input meant for the parent process.
+    cmd.arg("-nostdin");
     cmd
 }
 
@@ -83,16 +86,20 @@ pub fn find_ffmpeg() -> Result<PathBuf> {
     ))
 }
 
-/// Returns the sample rate of the source file.
-pub fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
+/// Runs `ffmpeg -i <input>` once and returns its stderr, which is where FFmpeg
+/// prints the stream summary (sample rate, duration) when no output is given.
+fn probe_stderr(input: &Path, ffmpeg: &Path) -> Option<String> {
     let output = ffmpeg_cmd(ffmpeg)
         .args(["-hide_banner", "-i"])
         .arg(input)
         .stderr(Stdio::piped())
         .output()
         .ok()?;
+    Some(String::from_utf8_lossy(&output.stderr).into_owned())
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+/// Extracts the sample rate from a probe's stderr text.
+fn parse_sample_rate(stderr: &str) -> Option<u32> {
     let tokens: Vec<&str> = stderr.split_whitespace().collect();
     for window in tokens.windows(2) {
         // Real ffmpeg output is "<rate> Hz, <channels> ..." -- "Hz" carries
@@ -108,16 +115,8 @@ pub fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
     None
 }
 
-/// Returns the duration of the file in seconds.
-pub fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
-    let output = ffmpeg_cmd(ffmpeg)
-        .args(["-hide_banner", "-i"])
-        .arg(input)
-        .stderr(Stdio::piped())
-        .output()
-        .ok()?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
+/// Extracts the duration in seconds from a probe's stderr text.
+fn parse_duration(stderr: &str) -> Option<f32> {
     for line in stderr.lines() {
         if line.contains("Duration:") {
             for token in line.split_whitespace() {
@@ -136,6 +135,31 @@ pub fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
         }
     }
     None
+}
+
+/// Returns both the sample rate and the duration from a **single** ffmpeg
+/// process.
+///
+/// Callers that need both (the non-Automixer path in `process_single_file`)
+/// should use this rather than calling [`get_sample_rate`] and
+/// [`get_duration`] back to back: those spawn one process each and then parse
+/// the very same stderr text, doubling the process count for every file in a
+/// batch.
+pub fn probe_input(input: &Path, ffmpeg: &Path) -> (Option<u32>, Option<f32>) {
+    match probe_stderr(input, ffmpeg) {
+        Some(stderr) => (parse_sample_rate(&stderr), parse_duration(&stderr)),
+        None => (None, None),
+    }
+}
+
+/// Returns the sample rate of the source file.
+pub fn get_sample_rate(input: &Path, ffmpeg: &Path) -> Option<u32> {
+    parse_sample_rate(&probe_stderr(input, ffmpeg)?)
+}
+
+/// Returns the duration of the file in seconds.
+pub fn get_duration(input: &Path, ffmpeg: &Path) -> Option<f32> {
+    parse_duration(&probe_stderr(input, ffmpeg)?)
 }
 
 /// Measures the integrated loudness (LUFS-I) for folder overview analysis.

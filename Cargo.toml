@@ -21,6 +21,19 @@ num_cpus = "1.16"
 # new dependencies for DSP and temporary files
 rustfft = "6.2"
 biquad = "0.4"
-nnnoiseless = "0.5"
+# default features are `bin` + `dasp`, which exist only for the crate's own CLI
+# binaries and pull in clap and three dasp crates. We use `DenoiseState` only,
+# which is not feature-gated.
+nnnoiseless = { version = "0.5", default-features = false }
 tempfile = "3.10"
 hound = "3.5"
+
+# The DSP stages are tight per-sample/per-bin loops calling small functions
+# across crate boundaries (biquad, rustfft), so cross-crate inlining matters.
+#
+# `panic = "abort"` is deliberately NOT set: the batch worker in src/app.rs
+# relies on `catch_unwind` so that one bad file logs an error instead of
+# taking down the whole run.
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -204,6 +204,59 @@ fn automixer_without_normalization_preserves_source_sample_rate() {
     );
 }
 
+/// The Rust DSP stages take their sample rate as a parameter, so the pipeline
+/// only forces 48kHz when a stage that genuinely requires it is enabled
+/// (nnnoiseless or DeepFilterNet3). With neither on, a 44.1kHz source is
+/// processed at 44.1kHz end to end and never round-trips through 48kHz.
+///
+/// This asserts the observable half of that: the output rate. The absence of
+/// the intermediate resample is not visible in the output file itself, which
+/// is exactly why the previous test above (which pins the same output rate for
+/// a different reason) does not cover it.
+#[test]
+#[ignore]
+fn automixer_at_source_rate_still_produces_correct_output_rate() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    use vocan::ffmpeg::get_sample_rate;
+
+    let dir = tempfile::tempdir().unwrap();
+    let input_base = dir.path().join("in");
+    let output_base = dir.path().join("out");
+    std::fs::create_dir_all(&input_base).unwrap();
+
+    // 22050 Hz: neither the source rate nor the old hard-coded DSP rate, so a
+    // stray 48000 anywhere in the chain would show up plainly.
+    for &(rate, nn) in &[(22050u32, false), (44100, false), (44100, true)] {
+        let input_path = input_base.join(format!("tone_{rate}_{nn}.wav"));
+        write_sine_wav(&input_path, 2.0, rate, 440.0, 0.4);
+
+        let mut opts = base_opts();
+        opts.automixer = true;
+        opts.automixer_expander = true;
+        // With nn = true the DSP must internally run at 48kHz (RNNoise
+        // requires it) and still restore `rate` on the way out.
+        opts.automixer_nn_dereverb = nn;
+        opts.output_format = OutputFormat::Pcm24Wav;
+
+        process_single_file(
+            &input_path,
+            &input_base,
+            &output_base,
+            &opts,
+            &ffmpeg_path(),
+        )
+        .unwrap_or_else(|e| panic!("rate={rate} nn={nn} failed: {e}"));
+
+        let output_path = output_base
+            .join(format!("tone_{rate}_{nn}.wav"))
+            .with_extension("wav");
+        let sr = get_sample_rate(&output_path, &ffmpeg_path()).expect("output sample rate");
+        assert_eq!(sr, rate, "rate={rate} nn={nn}: got output at {sr} Hz");
+    }
+}
+
 #[test]
 #[ignore]
 fn automixer_toggle_combinations_do_not_error() {

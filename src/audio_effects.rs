@@ -59,6 +59,10 @@ pub fn apply_spectral_gate(
 ) -> Result<Vec<f32>> {
     use rustfft::{num_complex::Complex, FftPlanner};
 
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let fft_size = 2048usize;
     let hop = fft_size / 4;
     let window: Vec<f32> = (0..fft_size)
@@ -72,29 +76,71 @@ pub fn apply_spectral_gate(
     let fft = planner.plan_fft_forward(fft_size);
     let ifft = planner.plan_fft_inverse(fft_size);
 
+    // rustfft's `Fft::process` allocates and zeroes a fresh scratch buffer on
+    // every single call. At 48kHz with hop=512 that is ~110k allocations for a
+    // 10-minute file, so the scratch is hoisted here and reused through
+    // `process_with_scratch`.
+    let mut scratch = vec![
+        Complex { re: 0.0, im: 0.0 };
+        fft.get_inplace_scratch_len()
+            .max(ifft.get_inplace_scratch_len())
+    ];
+
     let threshold_lin = 10f32.powf(p.threshold_db / 20.0);
     let ratio = p.ratio.max(1.0);
+    // Expansion exponent, hoisted out of the per-bin loop. The default ratio of
+    // 2.0 makes this exactly 1.0, where the gain is just the level ratio and no
+    // transcendental call is needed at all.
+    let gate_exp = ratio - 1.0;
     let frame_time = hop as f32 / sample_rate as f32;
     let a_coef = (-frame_time / p.attack_s).exp();
     let r_coef = (-frame_time / p.release_s).exp();
 
     let ch = channels as usize;
     let frames_total = samples.len() / ch;
-    let mut out = vec![0f32; samples.len()];
+
+    // The STFT runs over a signal padded with `fft_size` zeros at each end.
+    // Without that padding the loop below only visits positions where a whole
+    // analysis window fits inside the real signal, so the leading
+    // `fft_size - hop` samples receive partial overlap-add (an audible
+    // fade-in) and everything past the last full frame -- up to `fft_size - 1`
+    // samples, ~43ms at 48kHz -- is never written at all and stays silent.
+    // Padding puts every real sample in the interior, where the Hann^2 /
+    // 75%-overlap COLA sum is constant and `comp` below is the exact inverse.
+    let pad = fft_size;
+    let padded_len = frames_total + 2 * pad;
+    let comp = 2.0 / 3.0;
+
+    // Mono reuses the per-channel accumulator as the return buffer, so only the
+    // multi-channel path needs a separate interleaved output up front.
+    let mut out = if ch == 1 {
+        Vec::new()
+    } else {
+        vec![0f32; samples.len()]
+    };
 
     let mut buf: Vec<Complex<f32>> = vec![Complex { re: 0.0, im: 0.0 }; fft_size];
 
     for c in 0..ch {
-        let mut ch_out = vec![0f32; frames_total];
+        let mut acc = vec![0f32; padded_len];
         let mut bin_env = vec![0f32; fft_size / 2 + 1];
 
         let mut pos = 0usize;
-        while pos + fft_size <= frames_total {
+        while pos + fft_size <= padded_len {
             for n in 0..fft_size {
-                buf[n].re = samples[(pos + n) * ch + c] * window[n];
+                // `pos + n` indexes the padded signal; shift back onto the real
+                // one. Positions inside either pad wrap to a huge value and so
+                // fail the bounds check, yielding the intended zero.
+                let src = (pos + n).wrapping_sub(pad);
+                let s = if src < frames_total {
+                    samples[src * ch + c]
+                } else {
+                    0.0
+                };
+                buf[n].re = s * window[n];
                 buf[n].im = 0.0;
             }
-            fft.process(&mut buf);
+            fft.process_with_scratch(&mut buf, &mut scratch);
 
             for k in 0..=fft_size / 2 {
                 let mag = (buf[k].re * buf[k].re + buf[k].im * buf[k].im).sqrt();
@@ -104,7 +150,16 @@ pub fn apply_spectral_gate(
                 *env = target + coef * (*env - target);
 
                 let gain = if *env < threshold_lin {
-                    (*env / threshold_lin).powf(ratio - 1.0).max(0.0)
+                    let x = *env / threshold_lin;
+                    // `powf(x, gate_exp)` without its generic slow path. For
+                    // x == 0.0 this is exp2(-inf) == 0.0, matching powf; the
+                    // max() still guards against a NaN reaching the output.
+                    let g = if gate_exp == 1.0 {
+                        x
+                    } else {
+                        (gate_exp * x.log2()).exp2()
+                    };
+                    g.max(0.0)
                 } else {
                     1.0
                 };
@@ -118,17 +173,28 @@ pub fn apply_spectral_gate(
                 }
             }
 
-            ifft.process(&mut buf);
+            ifft.process_with_scratch(&mut buf, &mut scratch);
             let norm = 1.0 / fft_size as f32;
             for n in 0..fft_size {
-                ch_out[pos + n] += buf[n].re * norm * window[n];
+                acc[pos + n] += buf[n].re * norm * window[n];
             }
             pos += hop;
         }
 
-        let comp = 2.0 / 3.0;
-        for i in 0..frames_total {
-            out[i * ch + c] = ch_out[i] * comp;
+        if ch == 1 {
+            // Shift the useful region down over the leading pad and drop the
+            // trailing pad in place, rather than allocating a second
+            // full-length buffer just to copy into.
+            acc.copy_within(pad..pad + frames_total, 0);
+            acc.truncate(frames_total);
+            for v in acc.iter_mut() {
+                *v *= comp;
+            }
+            out = acc;
+        } else {
+            for i in 0..frames_total {
+                out[i * ch + c] = acc[pad + i] * comp;
+            }
         }
     }
     Ok(out)
@@ -214,45 +280,50 @@ pub fn apply_nnnoise(samples_48k_mono: &[f32], params: &NnnoiseParams) -> Result
     let mut state = DenoiseState::new();
     let frame_size = DenoiseState::FRAME_SIZE;
     let mix = params.mix.clamp(0.0, 1.0);
-
-    // Scale to i16 range in-place — avoids a separate copy of the entire signal.
-    let mut scaled: Vec<f32> = Vec::with_capacity(samples_48k_mono.len());
-    for &x in samples_48k_mono {
-        scaled.push((x * 32768.0).clamp(-32768.0, 32767.0));
-    }
-
-    let total_frames = scaled.len().div_ceil(frame_size);
-    let mut wet: Vec<f32> = Vec::with_capacity(total_frames * frame_size);
-    let mut frame_buf = vec![0f32; frame_size];
-    // Reusable input buffer — no per-frame allocation.
-    let mut input_buf = vec![0f32; frame_size];
-
-    for chunk in scaled.chunks(frame_size) {
-        input_buf[..chunk.len()].copy_from_slice(chunk);
-        if chunk.len() < frame_size {
-            input_buf[chunk.len()..].fill(0.0);
-        }
-        state.process_frame(&mut frame_buf, &input_buf);
-        wet.extend_from_slice(&frame_buf);
-    }
-
-    // Scale wet back to ±1.0 in-place (no second Vec).
-    for v in wet.iter_mut() {
-        *v /= 32768.0;
-    }
-
-    let shift = frame_size;
     let dry_len = samples_48k_mono.len();
-    let mut out = Vec::with_capacity(dry_len);
 
-    for i in 0..dry_len {
-        let dry = samples_48k_mono[i];
-        let wet_sample = if i + shift < wet.len() {
-            wet[i + shift]
-        } else {
-            0.0
-        };
-        out.push(dry * (1.0 - mix) + wet_sample * mix);
+    // Seed the output with the dry contribution and mix each denoised frame in
+    // on top as it is produced. Peak memory is one output buffer plus two
+    // frame-sized scratch buffers; the previous version held three
+    // full-length copies of the signal (scaled + wet + out) at once, on top of
+    // the caller's own buffer.
+    let mut out: Vec<f32> = samples_48k_mono
+        .iter()
+        .map(|&dry| dry * (1.0 - mix))
+        .collect();
+
+    // Reusable per-frame buffers — no per-frame allocation.
+    let mut input_buf = vec![0f32; frame_size];
+    let mut frame_buf = vec![0f32; frame_size];
+
+    let total_frames = dry_len.div_ceil(frame_size);
+    for f in 0..total_frames {
+        let start = f * frame_size;
+        let end = (start + frame_size).min(dry_len);
+        let len = end - start;
+        for (dst, &x) in input_buf[..len]
+            .iter_mut()
+            .zip(&samples_48k_mono[start..end])
+        {
+            *dst = (x * 32768.0).clamp(-32768.0, 32767.0);
+        }
+        input_buf[len..].fill(0.0);
+
+        state.process_frame(&mut frame_buf, &input_buf);
+
+        // RNNoise has one frame of algorithmic latency: wet sample `w` lines up
+        // with dry sample `w - frame_size`. Frame 0 therefore maps entirely
+        // before the start of the signal and is dropped -- the same result the
+        // previous `wet[i + frame_size]` lookup produced, which also left the
+        // final `frame_size` dry samples with no wet partner.
+        if f == 0 {
+            continue;
+        }
+        let dst_start = (f - 1) * frame_size;
+        let n = frame_size.min(dry_len - dst_start);
+        for k in 0..n {
+            out[dst_start + k] += frame_buf[k] / 32768.0 * mix;
+        }
     }
 
     Ok(out)
@@ -507,8 +578,17 @@ pub fn estimate_noise_floor_db(samples: &[f32], sample_rate: u32) -> Option<f32>
         })
         .collect();
 
+    // Normalizing the windowed energy by the window's own sum of squares --
+    // rather than by the sample count -- is what makes the result an actual
+    // RMS. Dividing by `win_len` instead understates every window by
+    // 20*log10(sqrt(3/8)) = -4.26 dB for a Hann window, a constant bias that
+    // pushed the detected floor (and so the expander threshold derived from it)
+    // that much lower than the documented safety margin implies.
+    let w2_sum: f32 = window.iter().map(|w| w * w).sum();
+    let inv_w2_sum = 1.0 / w2_sum;
+
     // Collect RMS values (in dB) for all windows.
-    let mut rms_db_values: Vec<f32> = Vec::new();
+    let mut rms_db_values: Vec<f32> = Vec::with_capacity(samples.len() / hop + 1);
     let mut pos = 0usize;
 
     while pos + win_len <= samples.len() {
@@ -517,7 +597,7 @@ pub fn estimate_noise_floor_db(samples: &[f32], sample_rate: u32) -> Option<f32>
             let s = samples[pos + n] * window[n];
             sum_sq += s * s;
         }
-        let rms = (sum_sq / win_len as f32).sqrt();
+        let rms = (sum_sq * inv_w2_sum).sqrt();
 
         // Skip digital silence / near-silence (-inf or extreme outliers).
         if rms > 1e-7 {
@@ -533,10 +613,13 @@ pub fn estimate_noise_floor_db(samples: &[f32], sample_rate: u32) -> Option<f32>
         return None;
     }
 
-    // Sort and take p12 (12th percentile).
-    rms_db_values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Take p12 (12th percentile). Only that one order statistic is needed, so
+    // partition around it in O(n) instead of fully sorting the distribution.
     let idx = (rms_db_values.len() as f32 * 0.12).round() as usize;
     let idx = idx.min(rms_db_values.len() - 1);
+    rms_db_values.select_nth_unstable_by(idx, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Some(rms_db_values[idx])
 }
@@ -552,20 +635,25 @@ pub fn estimate_noise_floor_db(samples: &[f32], sample_rate: u32) -> Option<f32>
 /// smoothing and a mandatory hold time to prevent chattering on soft
 /// word-endings and quiet consonants.
 ///
-/// Returns a new `Vec<f32>` — infallible (no I/O, no external calls).
-pub fn apply_expander(
-    samples: &[f32],
+/// Processes `buf` in place — infallible (no I/O, no external calls).
+///
+/// In-place is safe here because each sample is read and written at the same
+/// index and never read again afterwards; this mirrors
+/// [`apply_voice_eq_inplace`] and avoids a full-length copy of the signal for
+/// what is otherwise a strictly element-wise gain.
+pub fn apply_expander_inplace(
+    buf: &mut [f32],
     sample_rate: u32,
     channels: u16,
     params: &ExpanderParams,
     noise_floor_db: f32,
-) -> Vec<f32> {
-    if samples.is_empty() || channels == 0 || sample_rate == 0 {
-        return samples.to_vec();
+) {
+    if buf.is_empty() || channels == 0 || sample_rate == 0 {
+        return;
     }
 
     let ch = channels as usize;
-    let frames = samples.len() / ch;
+    let frames = buf.len() / ch;
 
     // Derive parameters.
     let margin_db = safety_pct_to_margin_db(params.safety_pct);
@@ -585,7 +673,11 @@ pub fn apply_expander(
     // Hold time in samples.
     let hold_samples = (params.hold_ms * 0.001 * sample_rate as f32).round() as usize;
 
-    let mut out = vec![0.0f32; samples.len()];
+    // 10^(x/20) == 2^(x * log2(10)/20). `exp2` is materially cheaper than the
+    // general `powf`, which internally does this same rewrite plus edge-case
+    // handling that a finite dB value never needs.
+    let db_to_log2 = std::f32::consts::LOG2_10 / 20.0;
+    let inv_rms_win = 1.0 / rms_win as f32;
 
     for c in 0..ch {
         // Per-channel state.
@@ -604,18 +696,25 @@ pub fn apply_expander(
         let mut hold_counter = 0usize;
 
         for i in 0..frames {
-            let sample = samples[i * ch + c];
+            let sample = buf[i * ch + c];
 
             // --- RMS detector (circular buffer) ---
             let old_sq = rms_buf[rms_buf_idx];
             let new_sq = sample * sample;
             rms_buf[rms_buf_idx] = new_sq;
-            rms_buf_idx = (rms_buf_idx + 1) % rms_win;
-            rms_sum_sq = rms_sum_sq - old_sq + new_sq;
-            let rms_sum_sq = rms_sum_sq.max(0.0); // guard against float drift
-            let rms = (rms_sum_sq / rms_win as f32).sqrt();
-            let det_db = if rms > 1e-10 {
-                20.0 * rms.log10()
+            rms_buf_idx += 1;
+            if rms_buf_idx == rms_win {
+                rms_buf_idx = 0;
+            }
+            // The drift guard writes back into the accumulator: clamping only a
+            // local copy would let a negative running sum persist and re-poison
+            // every later iteration.
+            rms_sum_sq = (rms_sum_sq - old_sq + new_sq).max(0.0);
+            let mean_sq = rms_sum_sq * inv_rms_win;
+            // 20*log10(sqrt(m)) == 10*log10(m), so the per-sample sqrt is
+            // redundant. The threshold matches the old `rms > 1e-10`.
+            let det_db = if mean_sq > 1e-20 {
+                10.0 * mean_sq.log10()
             } else {
                 -200.0 // effectively -inf
             };
@@ -648,7 +747,7 @@ pub fn apply_expander(
                 // At threshold_db - knee_db → max_reduction_db (gain = min_gain_lin)
                 let ratio = (threshold_db - env_db) / knee_db; // 0..1
                 let gain_db = max_reduction_db * ratio;
-                10.0f32.powf(gain_db / 20.0)
+                (gain_db * db_to_log2).exp2()
             } else {
                 min_gain_lin
             };
@@ -693,11 +792,9 @@ pub fn apply_expander(
             gain_lin = effective_target + gain_coef * (gain_lin - effective_target);
 
             // Apply gain.
-            out[i * ch + c] = sample * gain_lin;
+            buf[i * ch + c] = sample * gain_lin;
         }
     }
-
-    out
 }
 
 #[cfg(test)]
@@ -786,6 +883,26 @@ mod tests {
     }
 
     #[test]
+    fn estimate_noise_floor_db_is_absolutely_calibrated_against_a_known_sine() {
+        // A steady sine of amplitude A has RMS A/sqrt(2), so a correctly
+        // normalized windowed RMS must report 20*log10(A/sqrt(2)) dB.
+        //
+        // This is the test the old implementation failed: normalizing the
+        // Hann-windowed energy by `win_len` instead of by the window's own sum
+        // of squares understated every window by 20*log10(sqrt(3/8)) = 4.26 dB.
+        // The relative test below could not catch that, because the bias is
+        // multiplicative and cancels between two amplitudes.
+        let amplitude = 0.25f32;
+        let samples = sine_wave(440.0, 48000, 2.0, amplitude);
+        let measured = estimate_noise_floor_db(&samples, 48000).expect("floor");
+        let expected = 20.0 * (amplitude / 2.0f32.sqrt()).log10();
+        assert!(
+            (measured - expected).abs() < 0.5,
+            "measured {measured} dB, expected ~{expected} dB"
+        );
+    }
+
+    #[test]
     fn estimate_noise_floor_db_scales_exactly_with_amplitude() {
         // Same underlying noise, two amplitudes -- windowing/percentile selection
         // is purely multiplicative, so the estimated floor must shift by exactly
@@ -809,17 +926,20 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn apply_expander_on_empty_signal_returns_empty() {
+    fn apply_expander_on_empty_signal_is_a_no_op() {
         let params = ExpanderParams::default();
-        assert!(apply_expander(&[], 48000, 1, &params, -40.0).is_empty());
+        let mut buf: Vec<f32> = Vec::new();
+        apply_expander_inplace(&mut buf, 48000, 1, &params, -40.0);
+        assert!(buf.is_empty());
     }
 
     #[test]
-    fn apply_expander_zero_channels_returns_input_unchanged() {
+    fn apply_expander_zero_channels_leaves_input_unchanged() {
         let samples = sine_wave(440.0, 48000, 0.1, 0.5);
         let params = ExpanderParams::default();
-        let out = apply_expander(&samples, 48000, 0, &params, -40.0);
-        assert_eq!(out, samples);
+        let mut buf = samples.clone();
+        apply_expander_inplace(&mut buf, 48000, 0, &params, -40.0);
+        assert_eq!(buf, samples);
     }
 
     #[test]
@@ -828,8 +948,8 @@ mod tests {
         samples.extend(vec![0.0f32; 4800]); // silence segment
         samples.extend(sine_wave(880.0, 48000, 0.5, 0.8));
         let params = ExpanderParams::default();
-        let out = apply_expander(&samples, 48000, 1, &params, -40.0);
-        assert!(out.iter().all(|s| s.is_finite()));
+        apply_expander_inplace(&mut samples, 48000, 1, &params, -40.0);
+        assert!(samples.iter().all(|s| s.is_finite()));
     }
 
     #[test]
@@ -839,7 +959,8 @@ mod tests {
         let sr = 48000u32;
         let samples = sine_wave(440.0, sr, 1.0, 0.5);
         let params = ExpanderParams::default();
-        let out = apply_expander(&samples, sr, 1, &params, -40.0);
+        let mut out = samples.clone();
+        apply_expander_inplace(&mut out, sr, 1, &params, -40.0);
 
         // Skip the first 50ms (attack warm-up) and compare the tail.
         let warmup = (sr as f32 * 0.05) as usize;
@@ -864,7 +985,8 @@ mod tests {
             ..Default::default()
         };
         // noise_floor_db well above the signal level so it's deep in the gate region.
-        let out = apply_expander(&samples, sr, 1, &params, -20.0);
+        let mut out = samples.clone();
+        apply_expander_inplace(&mut out, sr, 1, &params, -20.0);
 
         let tail_start = samples.len() - 4800; // last 100ms
         let in_tail_rms = rms(&samples[tail_start..]);
@@ -896,11 +1018,56 @@ mod tests {
     }
 
     #[test]
-    fn apply_spectral_gate_shorter_than_fft_window_returns_zeros_same_length() {
+    fn apply_spectral_gate_shorter_than_fft_window_is_still_processed() {
+        // Previously the STFT loop only ran where a whole 2048-sample analysis
+        // window fit inside the signal, so anything shorter than fft_size came
+        // back as pure silence. The padded STFT covers short inputs properly.
         let samples = xorshift_noise(100, 0.2, 3); // shorter than fft_size (2048)
         let out = apply_spectral_gate(&samples, 48000, 1, &SpectralGateParams::default()).unwrap();
         assert_eq!(out.len(), samples.len());
-        assert!(out.iter().all(|s| *s == 0.0));
+        assert!(out.iter().all(|s| s.is_finite()));
+        assert!(
+            out.iter().any(|s| *s != 0.0),
+            "short input must not be silenced outright"
+        );
+    }
+
+    #[test]
+    fn apply_spectral_gate_preserves_the_tail_of_the_signal() {
+        // Regression test: the STFT loop used to stop at the last position
+        // where a full window fit, leaving up to fft_size - 1 samples (~43ms at
+        // 48kHz) never written and therefore silent at the end of every file.
+        let sr = 48000u32;
+        let samples = sine_wave(440.0, sr, 1.0, 0.5);
+        let out = apply_spectral_gate(&samples, sr, 1, &SpectralGateParams::default()).unwrap();
+        assert_eq!(out.len(), samples.len());
+
+        // The last 2048 samples are exactly the region the old loop dropped.
+        let tail = &out[out.len() - 2048..];
+        let mid = &out[out.len() / 2 - 1024..out.len() / 2 + 1024];
+        let tail_rms = rms(tail);
+        let mid_rms = rms(mid);
+        assert!(
+            tail_rms > 0.5 * mid_rms,
+            "tail was attenuated relative to the middle: tail_rms={tail_rms}, mid_rms={mid_rms}"
+        );
+    }
+
+    #[test]
+    fn apply_spectral_gate_passes_a_loud_tone_through_at_roughly_unity() {
+        // The Hann^2 / 75%-overlap COLA sum is 1.5, which the 2/3 compensation
+        // factor inverts -- so a tone well above the threshold should come back
+        // at close to its original level. This pins the padding fix and the
+        // compensation factor together; before the fix the edges alone made
+        // whole-signal RMS come out low.
+        let sr = 48000u32;
+        let samples = sine_wave(440.0, sr, 0.5, 0.5);
+        let out = apply_spectral_gate(&samples, sr, 1, &SpectralGateParams::default()).unwrap();
+        let ratio = rms(&out) / rms(&samples);
+        assert!(
+            (0.9..=1.1).contains(&ratio),
+            "expected near-unity throughput, got ratio={ratio}"
+        );
     }
 
     #[test]
@@ -961,6 +1128,31 @@ mod tests {
         let samples = sine_wave(300.0, 48000, 1.0, 0.3);
         let out = apply_nnnoise(&samples, &NnnoiseParams::default()).unwrap();
         assert_eq!(out.len(), samples.len());
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn apply_nnnoise_with_zero_mix_is_an_exact_bypass() {
+        // At mix = 0.0 the wet path contributes nothing, so the output must be
+        // the input unchanged. This pins the frame-index arithmetic of the
+        // streaming implementation: an off-by-one frame in the latency
+        // compensation would still preserve length and finiteness, but would
+        // no longer reproduce the dry signal exactly.
+        let samples = sine_wave(300.0, 48000, 0.5, 0.3);
+        let out = apply_nnnoise(&samples, &NnnoiseParams { mix: 0.0 }).unwrap();
+        assert_eq!(out, samples);
+    }
+
+    #[test]
+    fn apply_nnnoise_length_is_exact_for_a_non_multiple_of_frame_size() {
+        // FRAME_SIZE is 480; 1000 samples is deliberately not a multiple of it,
+        // so the final partial frame exercises the tail clamping.
+        let samples = sine_wave(300.0, 48000, 0.0, 0.0);
+        assert!(samples.is_empty());
+        let ragged = sine_wave(300.0, 48000, 1000.0 / 48000.0, 0.3);
+        assert_eq!(ragged.len(), 1000);
+        let out = apply_nnnoise(&ragged, &NnnoiseParams::default()).unwrap();
+        assert_eq!(out.len(), 1000);
         assert!(out.iter().all(|s| s.is_finite()));
     }
 }

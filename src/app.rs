@@ -1,5 +1,6 @@
 use eframe::egui;
 use rayon::prelude::*;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{
@@ -48,7 +49,7 @@ pub struct AudioBatchApp {
     is_processing: bool,
     is_analyzing: bool,
     average_lufs: Option<f32>,
-    logs: Vec<String>,
+    logs: VecDeque<String>,
     current_progress: usize,
     total_files: usize,
     receiver: Receiver<AppMsg>,
@@ -57,6 +58,20 @@ pub struct AudioBatchApp {
     /// Shared cancellation flag — set to `true` to request the worker thread to stop.
     cancel_flag: Arc<AtomicBool>,
 }
+
+/// Maximum number of log lines retained.
+///
+/// A batch produces at least one line per file, so an unbounded log grows
+/// without limit -- and the log pane re-lays-out every retained line on every
+/// frame, which makes the UI crawl exactly when the user wants to scroll back
+/// through a long run's errors.
+const MAX_LOG_LINES: usize = 5_000;
+
+/// Maximum length of a single log line, in characters.
+///
+/// A failing FFmpeg invocation appends its whole stderr, which can run to
+/// several kilobytes; the useful part is at the front.
+const MAX_LOG_LINE_CHARS: usize = 2_000;
 
 /// Returns `true` if `a` and `b` refer to the same directory on disk.
 ///
@@ -97,7 +112,7 @@ impl AudioBatchApp {
             is_processing: false,
             is_analyzing: false,
             average_lufs: None,
-            logs: Vec::new(),
+            logs: VecDeque::new(),
             current_progress: 0,
             total_files: 0,
             receiver,
@@ -105,6 +120,19 @@ impl AudioBatchApp {
             ffmpeg_path,
             cancel_flag: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Appends one line to the log, truncating over-long lines and evicting
+    /// the oldest once [`MAX_LOG_LINES`] is reached.
+    fn push_log(&mut self, text: String) {
+        let text = match text.char_indices().nth(MAX_LOG_LINE_CHARS) {
+            Some((cut, _)) => format!("{}... [truncated]", &text[..cut]),
+            None => text,
+        };
+        if self.logs.len() >= MAX_LOG_LINES {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(text);
     }
 
     fn start_analysis(&mut self, ctx: egui::Context) {
@@ -122,7 +150,7 @@ impl AudioBatchApp {
             self.is_analyzing = true;
             self.average_lufs = None;
             self.cancel_flag.store(false, Ordering::Relaxed);
-            self.logs.push(format!(
+            self.push_log(format!(
                 "Started folder analysis: {}",
                 folder_path.display()
             ));
@@ -220,7 +248,7 @@ impl AudioBatchApp {
         let output_path = PathBuf::from(&self.output_dir);
 
         if same_folder(&input_path, &output_path) {
-            self.logs.push(
+            self.push_log(
                 "[ERROR] Source and output folders must be different -- processing in place \
                  risks overwriting your original files."
                     .to_string(),
@@ -342,8 +370,8 @@ impl AudioBatchApp {
     fn handle_messages(&mut self) {
         while let Ok(msg) = self.receiver.try_recv() {
             match msg {
-                AppMsg::Log(text) => self.logs.push(text),
-                AppMsg::Error(text) => self.logs.push(format!("[ERROR] {}", text)),
+                AppMsg::Log(text) => self.push_log(text),
+                AppMsg::Error(text) => self.push_log(format!("[ERROR] {}", text)),
                 AppMsg::Progress(current, total) => {
                     self.current_progress = current;
                     self.total_files = total;
@@ -420,8 +448,7 @@ impl eframe::App for AudioBatchApp {
                         .clicked()
                     {
                         self.cancel_flag.store(true, Ordering::Relaxed);
-                        self.logs
-                            .push("Stop requested \u{2014} waiting for current file...".into());
+                        self.push_log("Stop requested \u{2014} waiting for current file...".into());
                     }
                 });
             }
@@ -868,6 +895,44 @@ mod tests {
         assert!(app.logs.is_empty());
         assert_eq!(app.current_progress, 0);
         assert_eq!(app.total_files, 0);
+    }
+
+    #[test]
+    fn push_log_evicts_oldest_lines_past_the_cap() {
+        let mut app = test_app();
+        for i in 0..MAX_LOG_LINES + 10 {
+            app.push_log(format!("line {i}"));
+        }
+        assert_eq!(app.logs.len(), MAX_LOG_LINES);
+        // The oldest 10 were dropped, the newest is still present.
+        assert_eq!(app.logs.front().unwrap(), "line 10");
+        assert_eq!(
+            app.logs.back().unwrap(),
+            &format!("line {}", MAX_LOG_LINES + 9)
+        );
+    }
+
+    #[test]
+    fn push_log_truncates_an_over_long_line() {
+        let mut app = test_app();
+        app.push_log("x".repeat(MAX_LOG_LINE_CHARS * 3));
+        let line = app.logs.front().unwrap();
+        assert!(line.ends_with("... [truncated]"));
+        assert_eq!(
+            line.chars().count(),
+            MAX_LOG_LINE_CHARS + "... [truncated]".len()
+        );
+    }
+
+    #[test]
+    fn push_log_truncates_on_a_char_boundary() {
+        // Truncating by byte offset would panic mid-codepoint; each 'ą' is two
+        // bytes, so a byte-based cut at MAX_LOG_LINE_CHARS would land inside one.
+        let mut app = test_app();
+        app.push_log("ą".repeat(MAX_LOG_LINE_CHARS * 2));
+        let line = app.logs.front().unwrap();
+        assert!(line.starts_with('ą'));
+        assert!(line.ends_with("... [truncated]"));
     }
 
     #[test]

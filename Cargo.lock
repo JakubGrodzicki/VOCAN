@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "VOCAN"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "biquad",
@@ -21,7 +21,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "walkdir",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2905,7 +2905,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

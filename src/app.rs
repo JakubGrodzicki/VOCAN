@@ -855,11 +855,26 @@ impl AudioBatchApp {
                     }
                 });
             if self.output_format.needs_bitrate() {
-                ui.add(
-                    egui::Slider::new(&mut self.bitrate_kbps, 64..=320)
-                        .text("Bitrate (kbps)")
-                        .suffix(" kbps"),
-                );
+                ui.horizontal(|ui| {
+                    ui.label("Bitrate:");
+                    egui::ComboBox::from_id_source("bitrate_combo")
+                        .selected_text(format!("{} kbps", self.bitrate_kbps))
+                        .show_ui(ui, |ui| {
+                            for &b in &[36, 48, 64, 128, 256, 320] {
+                                ui.selectable_value(
+                                    &mut self.bitrate_kbps,
+                                    b,
+                                    format!("{} kbps", b),
+                                );
+                            }
+                        });
+                });
+                if self.bitrate_kbps <= 48 {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 200, 80),
+                        "Highest compression, requires a verification for quality.",
+                    );
+                }
             }
             if self.output_format == OutputFormat::AdpcmWav {
                 ui.label(

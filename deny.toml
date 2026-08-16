@@ -13,6 +13,7 @@ ignore = [
     "RUSTSEC-2024-0384", # instant
     "RUSTSEC-2024-0436", # paste
     "RUSTSEC-2026-0192", # ttf-parser
+    "RUSTSEC-2026-0257", # webbrowser, pulled in by eframe 0.27.2's egui-winit; resolved once the egui 0.36 bump lands
 ]
 
 [licenses]

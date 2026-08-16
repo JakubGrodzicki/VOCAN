@@ -241,7 +241,13 @@ fn apply_norm_decision(
 fn add_format_args(cmd: &mut std::process::Command, format: OutputFormat, bitrate_kbps: u32) {
     cmd.args(["-c:a", format.ffmpeg_codec()]);
     if format.needs_bitrate() {
-        cmd.args(["-b:a", &format!("{}k", bitrate_kbps)]);
+        if format == OutputFormat::Ogg && bitrate_kbps <= 36 {
+            cmd.args(["-q:a", "-1"]);
+        } else if format == OutputFormat::Ogg && bitrate_kbps <= 48 {
+            cmd.args(["-q:a", "0"]);
+        } else {
+            cmd.args(["-b:a", &format!("{}k", bitrate_kbps)]);
+        }
     }
 }
 

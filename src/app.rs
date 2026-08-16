@@ -861,7 +861,11 @@ impl AudioBatchApp {
                         .selected_text(format!("{} kbps", self.bitrate_kbps))
                         .show_ui(ui, |ui| {
                             for &b in &[36, 48, 64, 128, 256, 320] {
-                                ui.selectable_value(&mut self.bitrate_kbps, b, format!("{} kbps", b));
+                                ui.selectable_value(
+                                    &mut self.bitrate_kbps,
+                                    b,
+                                    format!("{} kbps", b),
+                                );
                             }
                         });
                 });

@@ -4,4 +4,6 @@ pub mod ffmpeg;
 pub mod memory;
 pub mod proc;
 pub mod processing;
+pub mod theme;
 pub mod types;
+pub mod ui;

@@ -1,4 +1,5 @@
 use eframe::egui;
+use eframe::egui::{Align, Layout, RichText, TextStyle, Vec2};
 use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,12 @@ use walkdir::WalkDir;
 
 use crate::ffmpeg::{is_audio_file, measure_lufs};
 use crate::processing::{output_path_for, process_single_file};
+use crate::theme;
+// Aliased: every UI function here already has a local binding called `ui`, and
+// `widgets::card(ui, ..)` reads better than the (legal, but confusing)
+// `ui::card(ui, ..)`.
 use crate::types::{AppMsg, NormResult, OutputFormat, ProcessingOptions, ReductionProfile};
+use crate::ui as widgets;
 
 // ---------------------------------------------------------------------------
 // Application State
@@ -64,6 +70,68 @@ pub struct AudioBatchApp {
     ffmpeg_error: Option<String>,
     /// Shared cancellation flag — set to `true` to request the worker thread to stop.
     cancel_flag: Arc<AtomicBool>,
+    /// Which section the content pane is showing. Pure view state: no
+    /// processing parameter depends on it.
+    section: Section,
+    /// Set when a run starts, so that the pane can switch itself to the log
+    /// once and then leave the user free to navigate away without being
+    /// yanked back on the next message.
+    followed_run: bool,
+    /// How many retained log lines are errors.
+    ///
+    /// Kept as a running count rather than recomputed per frame: the rail
+    /// shows it on every repaint, and scanning up to [`MAX_LOG_LINES`] lines
+    /// sixty times a second to render one small number is exactly the kind of
+    /// per-frame work that made the old log pane crawl.
+    error_count: usize,
+}
+
+/// The sections of the navigation rail.
+///
+/// `Files` holds both ends of the pipeline -- the folders and the output
+/// format -- because separately they were two- and three-control sections
+/// leaving most of the pane empty. Clean-up then loudness is the order the
+/// audio actually travels; the old single-column layout listed loudness
+/// before the automixer, which is the reverse of what the pipeline does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Section {
+    #[default]
+    Files,
+    CleanUp,
+    Loudness,
+    Logs,
+}
+
+impl Section {
+    /// Heading shown at the top of the content pane.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Files => "Files",
+            Self::CleanUp => "Clean up",
+            Self::Loudness => "Loudness",
+            Self::Logs => "Logs",
+        }
+    }
+
+    /// One-line explanation under the heading. The pane has the room for it,
+    /// which is the main thing this layout buys over a single column.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Files => {
+                "Every audio file under the source folder is processed, and the folder tree is \
+                 recreated inside the output folder in the format chosen here."
+            }
+            Self::CleanUp => {
+                "De-ess \u{2192} dereverb \u{2192} expand \u{2192} denoise \u{2192} voice EQ \
+                 \u{2192} compress. The whole chain runs before loudness normalization."
+            }
+            Self::Loudness => {
+                "Two-pass EBU R128, with a padded measurement for files under 3 seconds and \
+                 peak normalization as a last resort."
+            }
+            Self::Logs => "One line per file, plus anything that went wrong.",
+        }
+    }
 }
 
 /// Maximum number of log lines retained.
@@ -246,6 +314,9 @@ impl AudioBatchApp {
             ffmpeg_path,
             ffmpeg_error: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            section: Section::default(),
+            followed_run: false,
+            error_count: 0,
         }
     }
 
@@ -275,7 +346,14 @@ impl AudioBatchApp {
             None => text,
         };
         if self.logs.len() >= MAX_LOG_LINES {
-            self.logs.pop_front();
+            if let Some(evicted) = self.logs.pop_front() {
+                if evicted.starts_with("[ERROR]") {
+                    self.error_count -= 1;
+                }
+            }
+        }
+        if text.starts_with("[ERROR]") {
+            self.error_count += 1;
         }
         self.logs.push_back(text);
     }
@@ -625,6 +703,15 @@ impl AudioBatchApp {
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
+//
+// Layout: a fixed navigation rail on the left, one section at a time in the
+// content pane, and an action bar pinned under the pane.
+//
+// The obvious risk of a rail is that settings you cannot see are settings you
+// forget to check before committing to a long batch. Two things answer that,
+// and both are load-bearing rather than decorative: every rail item carries a
+// live summary of its own section, and the action bar carries the whole recipe
+// directly above the button that acts on it.
 
 impl eframe::App for AudioBatchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -640,405 +727,984 @@ impl eframe::App for AudioBatchApp {
             crate::proc::terminate_all();
         }
 
-        // Pinned to the bottom of the window so START PROCESSING and the log
-        // pane are always visible, regardless of how tall the settings
-        // section above (in the CentralPanel) grows. Must be registered
-        // before CentralPanel, since CentralPanel always claims whatever
-        // space is left after Top/Bottom/Side panels for the frame.
-        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-            ui.add_space(10.0);
-
-            if let Some(err) = &self.ffmpeg_error {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    format!("\u{26a0} {err}\nProcessing will fail until this is fixed."),
-                );
-                ui.add_space(6.0);
+        // Show the log when a run starts -- but only once per run. Re-asserting
+        // it every frame would trap the user in the log pane for the whole
+        // batch, unable to look at the settings the run is using.
+        if self.is_processing || self.is_analyzing {
+            if !self.followed_run {
+                self.section = Section::Logs;
+                self.followed_run = true;
             }
+        } else {
+            self.followed_run = false;
+        }
 
-            let can_start = !self.is_processing
-                && !self.is_analyzing
-                && !self.input_dir.is_empty()
-                && !self.output_dir.is_empty();
-            ui.add_enabled_ui(can_start, |ui| {
-                if ui.button("START PROCESSING").clicked() {
-                    self.start_processing(ctx.clone());
-                }
-            });
+        // The rail is registered first, so every panel after it is laid out in
+        // the width that remains. That is what keeps the action bar inside the
+        // content pane instead of running the full width of the window under
+        // the rail.
+        let rail = egui::SidePanel::left("rail")
+            .exact_width(theme::RAIL_W)
+            .resizable(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin {
+                        left: 12.0,
+                        right: 12.0,
+                        top: 16.0,
+                        bottom: 14.0,
+                    }),
+            )
+            .show(ctx, |ui| self.ui_rail(ui));
 
-            if self.is_processing || self.is_analyzing {
-                ui.add_space(10.0);
-                let label = if self.is_analyzing {
-                    "Analyzing"
-                } else {
-                    "Processing"
-                };
-                let progress = if self.total_files > 0 {
-                    self.current_progress as f32 / self.total_files as f32
-                } else {
-                    0.0
-                };
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::ProgressBar::new(progress)
-                            .text(format!(
-                                "{}: {}/{}",
-                                label, self.current_progress, self.total_files
-                            ))
-                            .desired_width(ui.available_width() - 80.0),
-                    );
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new("\u{23f9} Stop")
-                                .color(egui::Color32::from_rgb(255, 90, 90)),
-                        ))
-                        .on_hover_text(
-                            "Stops now: the files still in flight are cancelled \
-                             mid-conversion and their partial output is discarded",
-                        )
-                        .clicked()
-                    {
-                        self.cancel_flag.store(true, Ordering::Relaxed);
-                        // Terminating the running children is what makes Stop
-                        // take effect *now*: the worker threads are parked in
-                        // `wait()` and cannot see the flag until their
-                        // subprocess returns, which for a long file with
-                        // DeepFilterNet3 is minutes away.
-                        crate::proc::terminate_all();
-                        self.push_log("Stop requested \u{2014} finishing up...".into());
-                    }
-                });
-            }
+        // egui's own panel separator follows the widget stroke, which the theme
+        // has set for controls rather than chrome. One explicit hairline keeps
+        // the rail's edge independent of that.
+        //
+        // Taken from the panel's own rect, never from `RAIL_W`: `exact_width`
+        // sizes the panel's *content*, and the frame's 12px margins are added
+        // outside that, so the panel is 24px wider than the number handed to
+        // it. Painting the hairline at `RAIL_W` put it 24px inside the rail,
+        // which made every nav row look like it spilled across the divider.
+        let screen = ctx.screen_rect();
+        let rail_edge = rail.response.rect.right();
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("rail_edge"),
+        ))
+        .rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rail_edge - 1.0, screen.top()),
+                Vec2::new(1.0, screen.height()),
+            ),
+            egui::Rounding::ZERO,
+            theme::LINE,
+        );
 
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label("Logs:");
+        egui::TopBottomPanel::bottom("action")
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::PANEL)
+                    .inner_margin(egui::Margin {
+                        left: 22.0,
+                        right: 22.0,
+                        top: 13.0,
+                        bottom: 14.0,
+                    }),
+            )
+            .show(ctx, |ui| self.ui_action_bar(ui, ctx));
 
-            // Capped height: an unbounded ScrollArea inside a self-sizing
-            // TopBottomPanel is circular (the panel wants to fit the
-            // ScrollArea, the ScrollArea wants to fill the panel) and
-            // reproduces the original clipping bug one level down.
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .stick_to_bottom(true)
-                .max_height(180.0)
-                .id_source("log_scroll")
-                .show(ui, |ui| {
-                    for log in &self.logs {
-                        let color = if log.starts_with("[ERROR]") {
-                            egui::Color32::LIGHT_RED
-                        } else {
-                            egui::Color32::GRAY
-                        };
-                        ui.colored_label(color, log);
-                    }
-                });
-
-            ui.add_space(5.0);
-        });
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Settings are read-only (visible but not editable) while a
-            // batch job is running, instead of only the Automixer options.
-            ui.add_enabled_ui(!self.is_processing, |ui| {
+        egui::CentralPanel::default()
+            // `Frame::none()` carries no margins at all, so without this the
+            // pane's cards run flush into the window edge and wrapping text
+            // has nothing to wrap against.
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin {
+                        left: 22.0,
+                        right: 22.0,
+                        top: 0.0,
+                        bottom: 0.0,
+                    }),
+            )
+            .show(ctx, |ui| {
+                self.ui_pane_header(ui);
+                let section = self.section;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .id_source("settings_scroll")
+                    .id_source("pane_scroll")
                     .show(ui, |ui| {
-                        ui.heading("Voice-Over Compression and Normalization (ADPCM 4-bit)");
-
-                        ui.add_space(10.0);
-                        ui.group(|ui| self.ui_paths(ui));
-                        ui.add_space(10.0);
-                        ui.group(|ui| self.ui_loudness(ui, ctx));
-                        ui.add_space(10.0);
-                        ui.group(|ui| self.ui_output_format(ui));
-                        ui.add_space(10.0);
-                        ui.group(|ui| self.ui_automixer(ui));
+                        // Settings are visible but not editable while a batch
+                        // runs. The log is exempt: it is the one thing the user
+                        // has any reason to interact with mid-run.
+                        ui.add_enabled_ui(!self.is_processing || section == Section::Logs, |ui| {
+                            match section {
+                                Section::Files => self.ui_files(ui),
+                                Section::CleanUp => self.ui_cleanup(ui),
+                                Section::Loudness => self.ui_loudness(ui, ctx),
+                                Section::Logs => self.ui_logs(ui),
+                            }
+                        });
+                        ui.add_space(14.0);
                     });
             });
-        });
     }
 }
 
 // ---------------------------------------------------------------------------
-// Settings sections
+// Navigation rail
 // ---------------------------------------------------------------------------
-//
-// Split out of `update` rather than left inline: as one function this was ~340
-// lines nested seven closures deep, where the enclosing `if` a given widget
-// belongs to is several screens above it.
 
 impl AudioBatchApp {
-    fn ui_paths(&mut self, ui: &mut egui::Ui) {
-        ui.label("Path Settings:");
-        ui.horizontal(|ui| {
-            ui.label("Source: ");
-            ui.text_edit_singleline(&mut self.input_dir);
-            if ui.button("Browse...").clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.input_dir = path.display().to_string();
-                }
+    fn ui_rail(&mut self, ui: &mut egui::Ui) {
+        widgets::brand(ui);
+        ui.add_space(16.0);
+
+        widgets::rail_group(ui, "SETUP");
+        ui.add_space(4.0);
+
+        ui.scope(|ui| {
+            // Nav rows carry their own 42px height; the default 8px gap between
+            // them would read as separate buttons rather than one list.
+            ui.spacing_mut().item_spacing.y = 2.0;
+
+            let (text, color) = self.summary_files();
+            if widgets::nav_item(
+                ui,
+                self.section == Section::Files,
+                widgets::Icon::Folder,
+                "Files",
+                &text,
+                color,
+            )
+            .clicked()
+            {
+                self.section = Section::Files;
+            }
+
+            let (text, color) = self.summary_cleanup();
+            if widgets::nav_item(
+                ui,
+                self.section == Section::CleanUp,
+                widgets::Icon::Wave,
+                "Clean up",
+                &text,
+                color,
+            )
+            .clicked()
+            {
+                self.section = Section::CleanUp;
+            }
+
+            let (text, color) = self.summary_loudness();
+            if widgets::nav_item(
+                ui,
+                self.section == Section::Loudness,
+                widgets::Icon::Bars,
+                "Loudness",
+                &text,
+                color,
+            )
+            .clicked()
+            {
+                self.section = Section::Loudness;
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Output: ");
-            ui.text_edit_singleline(&mut self.output_dir);
-            if ui.button("Browse...").clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.output_dir = path.display().to_string();
+
+        ui.add_space(16.0);
+        widgets::rail_group(ui, "RUN");
+        ui.add_space(4.0);
+
+        let (text, color) = self.summary_logs();
+        if widgets::nav_item(
+            ui,
+            self.section == Section::Logs,
+            widgets::Icon::List,
+            "Logs",
+            &text,
+            color,
+        )
+        .clicked()
+        {
+            self.section = Section::Logs;
+        }
+
+        // FFmpeg status sits at the bottom of the rail. It used to be a red
+        // paragraph above the start button, which is both the busiest part of
+        // the window and the last place you look before committing to a run.
+        ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+            ui.add_space(2.0);
+            match &self.ffmpeg_error {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        let (dot, _) =
+                            ui.allocate_exact_size(Vec2::splat(6.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 3.0, theme::GREEN);
+                        ui.add_space(1.0);
+                        ui.label(RichText::new("FFmpeg ready").size(11.0).color(theme::GREEN));
+                    });
+                }
+                Some(err) => {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        let (dot, _) =
+                            ui.allocate_exact_size(Vec2::splat(6.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 3.0, theme::RED);
+                        ui.add_space(1.0);
+                        ui.label(RichText::new("FFmpeg missing").size(11.0).color(theme::RED))
+                            .on_hover_text(err);
+                    });
                 }
             }
         });
     }
 
-    fn ui_loudness(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        {
-            ui.label("Loudness:");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.normalize_volume, "Normalize volume");
-                // The enclosing settings ScrollArea is already disabled
-                // while `is_processing`; additionally guard against
-                // `is_analyzing` here so a second click can't start a
-                // re-entrant analysis run while one is already in
-                // flight (both share cancel_flag/logs/progress state,
-                // and AppMsg::Finished/Stopped clear both is_processing
-                // and is_analyzing together).
-                ui.add_enabled_ui(!self.is_analyzing, |ui| {
-                    if ui
-                        .button("Analyze folder loudness...")
-                        .on_hover_text("Select a folder to check its average loudness level")
-                        .clicked()
-                    {
-                        self.start_analysis(ctx.clone());
-                    }
-                });
-            });
+    // -----------------------------------------------------------------------
+    // Rail summaries
+    // -----------------------------------------------------------------------
+    //
+    // Each returns the text and colour for one rail row. Amber means "this
+    // will stop the run"; the muted grey is a setting at rest.
 
-            if let Some(avg) = self.average_lufs {
-                ui.colored_label(
-                    egui::Color32::KHAKI,
-                    format!("Average level of your files: {:.2} LUFS", avg),
-                );
-                if ui.button("Set as target").clicked() {
-                    self.target_lufs = avg.round();
-                }
-            }
+    /// One row now stands for both the folders and the output format, so it
+    /// leads with whatever would stop a run: missing folders first, the
+    /// format only once there is nothing to warn about.
+    fn summary_files(&self) -> (String, egui::Color32) {
+        if self.input_dir.is_empty() || self.output_dir.is_empty() {
+            return ("not set".to_owned(), theme::AMBER);
+        }
+        (
+            format_short(self.output_format, self.bitrate_kbps),
+            theme::TXT3,
+        )
+    }
 
-            ui.add_enabled_ui(self.normalize_volume, |ui| {
-                                ui.add(
-                                    egui::Slider::new(&mut self.target_lufs, -23.0..=-6.0)
-                                        .text("Target LUFS-I (EBU R128, padded below 3s)"),
-                                );
-                                ui.add(
-                                    egui::Slider::new(&mut self.target_peak_dbfs, -12.0..=-1.0)
-                                        .text("Target peak dBFS (fallback)"),
-                                )
-                                .on_hover_text(
-                                    "Peak normalization fallback, used only when EBU R128 loudness \
-                                     measurement (standard or padded) fails -- typically for silent \
-                                     or near-silent samples.\n\
-                                     Recommended: -3 dBFS (safe headroom for 4-bit ADPCM).",
-                                );
-                            });
+    fn summary_cleanup(&self) -> (String, egui::Color32) {
+        if !self.automixer {
+            return ("off".to_owned(), theme::TXT3);
+        }
+        // Voice EQ, the de-esser and the post chain are unconditional once the
+        // automixer is on, so the count is "what you switched on" plus that
+        // fixed stage -- the same set the recipe line in the action bar names.
+        let n = 1
+            + usize::from(self.automixer_dfn3_dereverb)
+            + usize::from(self.automixer_expander)
+            + usize::from(self.automixer_spectral_gate || self.automixer_nn_dereverb);
+        (format!("{n} stages"), theme::TXT3)
+    }
+
+    fn summary_loudness(&self) -> (String, egui::Color32) {
+        if self.normalize_volume {
+            (format!("{:.1}", self.target_lufs), theme::TXT3)
+        } else {
+            ("off".to_owned(), theme::TXT3)
         }
     }
 
-    fn ui_output_format(&mut self, ui: &mut egui::Ui) {
-        {
-            ui.label("Output Format:");
-            egui::ComboBox::from_label("Format")
-                .selected_text(self.output_format.label())
-                .show_ui(ui, |ui| {
-                    for &fmt in OutputFormat::all() {
-                        ui.selectable_value(&mut self.output_format, fmt, fmt.label());
+    fn summary_logs(&self) -> (String, egui::Color32) {
+        if self.error_count > 0 {
+            (
+                format!(
+                    "{} error{}",
+                    self.error_count,
+                    if self.error_count == 1 { "" } else { "s" }
+                ),
+                theme::RED,
+            )
+        } else if self.logs.is_empty() {
+            (String::new(), theme::TXT3)
+        } else {
+            (self.logs.len().to_string(), theme::TXT3)
+        }
+    }
+
+    /// The whole configuration on one line, for the action bar.
+    ///
+    /// This is the counterweight to showing one section at a time: whatever
+    /// section is open, the settings that the button is about to act on are
+    /// spelled out immediately above it.
+    fn recipe(&self) -> String {
+        let mut parts = vec![format_short(self.output_format, self.bitrate_kbps)];
+
+        parts.push(if self.normalize_volume {
+            format!("{:.1} LUFS", self.target_lufs)
+        } else {
+            "no normalization".to_owned()
+        });
+
+        if self.automixer {
+            let mut modules: Vec<&str> = Vec::new();
+            if self.automixer_dfn3_dereverb {
+                modules.push("dereverb");
+            }
+            if self.automixer_expander {
+                modules.push("expander");
+            }
+            if self.automixer_spectral_gate {
+                modules.push("spectral gate");
+            }
+            if self.automixer_nn_dereverb {
+                modules.push("nnnoiseless");
+            }
+            modules.push("voice EQ");
+            parts.push(format!("clean up: {}", modules.join(", ")));
+        } else {
+            parts.push("no clean-up".to_owned());
+        }
+
+        parts.join("   \u{b7}   ")
+    }
+}
+
+/// A short label for the rail and the recipe line.
+///
+/// [`OutputFormat::label`] is written for the dropdown, where there is room to
+/// explain each option; at 10.5px in a 198px rail there is not.
+fn format_short(format: OutputFormat, bitrate: u32) -> String {
+    match format {
+        OutputFormat::AdpcmWav => "ADPCM".to_owned(),
+        OutputFormat::Pcm16Wav => "PCM 16".to_owned(),
+        OutputFormat::Pcm24Wav => "PCM 24".to_owned(),
+        OutputFormat::Flac => "FLAC".to_owned(),
+        OutputFormat::Mp3 => format!("MP3 {bitrate}k"),
+        OutputFormat::Ogg => format!("OGG {bitrate}k"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Content pane
+// ---------------------------------------------------------------------------
+
+impl AudioBatchApp {
+    /// Title, description, and the section's master switch where it has one.
+    fn ui_pane_header(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(18.0);
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new(self.section.title()).color(theme::TXT));
+
+            let section = self.section;
+            let running = self.is_processing;
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_enabled_ui(!running, |ui| match section {
+                    Section::CleanUp => {
+                        widgets::toggle(ui, &mut self.automixer);
                     }
+                    Section::Loudness => {
+                        widgets::toggle(ui, &mut self.normalize_volume);
+                    }
+                    _ => {}
                 });
+            });
+        });
+
+        ui.add_space(7.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(self.section.description())
+                    .size(12.0)
+                    .color(theme::TXT3),
+            )
+            .wrap(true),
+        );
+        ui.add_space(15.0);
+        widgets::divider(ui);
+        ui.add_space(15.0);
+    }
+
+    // -----------------------------------------------------------------------
+
+    /// Both ends of the pipeline: the folders the batch reads and writes, and
+    /// the format it writes in. Kept in one section because each was two or
+    /// three controls on its own, which left most of the pane empty.
+    fn ui_files(&mut self, ui: &mut egui::Ui) {
+        widgets::card(ui, |ui| {
+            ui.label(RichText::new("Folders").color(theme::TXT));
+            ui.add_space(11.0);
+            path_row(ui, "Source", &mut self.input_dir);
+            ui.add_space(10.0);
+            path_row(ui, "Output", &mut self.output_dir);
+        });
+
+        if !self.input_dir.is_empty() && self.input_dir == self.output_dir {
+            ui.add_space(11.0);
+            widgets::notice(
+                ui,
+                "The output folder is the source folder. Point them at different folders \
+                 \u{2014} writing a file while FFmpeg is reading it can destroy the original.",
+            );
+        }
+
+        ui.add_space(12.0);
+
+        widgets::card(ui, |ui| {
+            ui.label(RichText::new("Output format").color(theme::TXT));
+            ui.add_space(11.0);
+            ui.horizontal(|ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(76.0, 30.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.label(RichText::new("Format").color(theme::TXT2));
+                    },
+                );
+                let w = ui.available_width();
+                egui::ComboBox::from_id_source("output_format")
+                    .width(w - 8.0)
+                    .selected_text(self.output_format.label())
+                    .show_ui(ui, |ui| {
+                        for &fmt in OutputFormat::all() {
+                            ui.selectable_value(&mut self.output_format, fmt, fmt.label());
+                        }
+                    });
+            });
+
             if self.output_format.needs_bitrate() {
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.label("Bitrate:");
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(76.0, 30.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.label(RichText::new("Bitrate").color(theme::TXT2));
+                        },
+                    );
+                    let w = ui.available_width();
                     egui::ComboBox::from_id_source("bitrate_combo")
+                        .width(w - 8.0)
                         .selected_text(format!("{} kbps", self.bitrate_kbps))
                         .show_ui(ui, |ui| {
                             for &b in &[36, 48, 64, 128, 256, 320] {
-                                ui.selectable_value(
-                                    &mut self.bitrate_kbps,
-                                    b,
-                                    format!("{} kbps", b),
-                                );
+                                ui.selectable_value(&mut self.bitrate_kbps, b, format!("{b} kbps"));
                             }
                         });
                 });
-                if self.bitrate_kbps <= 48 {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 200, 80),
-                        "Highest compression, requires a verification for quality.",
-                    );
-                }
             }
+
             if self.output_format == OutputFormat::AdpcmWav {
-                ui.label(
-                    egui::RichText::new("Suggested for video game voice-over")
-                        .small()
-                        .italics(),
-                );
+                ui.add_space(9.0);
+                widgets::hint(ui, "Suggested for video game voice-over");
             }
+        });
+
+        if self.output_format.needs_bitrate() && self.bitrate_kbps <= 48 {
+            ui.add_space(12.0);
+            widgets::notice(
+                ui,
+                "Highest compression, requires a verification for quality.",
+            );
         }
     }
 
-    fn ui_automixer(&mut self, ui: &mut egui::Ui) {
-        {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.automixer, "Automixer");
-                ui.label(
-                    egui::RichText::new(
-                        "(De-esser -> EQ -> Compressor, applied before normalization)",
+    // -----------------------------------------------------------------------
+
+    fn ui_cleanup(&mut self, ui: &mut egui::Ui) {
+        // The master switch lives in the pane header. With it off, the modules
+        // stay visible but inert -- the chain is still worth reading when it is
+        // not going to run.
+        let on = self.automixer;
+        ui.add_enabled_ui(on, |ui| {
+            widgets::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    widgets::check(ui, &mut self.automixer_dfn3_dereverb, "Dereverb");
+                    ui.label(
+                        RichText::new("DeepFilterNet3")
+                            .size(11.5)
+                            .color(theme::TXT3),
+                    );
+                });
+                indented_hint(
+                    ui,
+                    "Removes room reflections. Also reduces broadband noise.",
+                );
+                if self.automixer_dfn3_dereverb {
+                    ui.add_space(11.0);
+                    let readout = format!("{:.0}%", self.automixer_dfn3_mix);
+                    slider_row(
+                        ui,
+                        "Mix",
+                        &mut self.automixer_dfn3_mix,
+                        0.0..=100.0,
+                        &readout,
+                    );
+                    ui.add_space(9.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(27.0);
+                        widgets::check_colored(
+                            ui,
+                            &mut self.automixer_dfn3_postfilter,
+                            "Post-filter (aggressive)",
+                            theme::TXT2,
+                        );
+                    });
+                }
+            });
+
+            ui.add_space(12.0);
+
+            widgets::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    widgets::check(ui, &mut self.automixer_expander, "Downward expander");
+                    ui.label(RichText::new("noise floor").size(11.5).color(theme::TXT3));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        widgets::tag(ui, "compute heavy");
+                    });
+                });
+                indented_hint(
+                    ui,
+                    "Pushes the gaps between words down, without gating them to silence.",
+                );
+                if self.automixer_expander {
+                    ui.add_space(11.0);
+                    let readout = format!("{:.0}%", self.automixer_expander_safety_pct);
+                    slider_row(
+                        ui,
+                        "Safety margin",
+                        &mut self.automixer_expander_safety_pct,
+                        0.0..=100.0,
+                        &readout,
                     )
-                    .weak()
-                    .italics(),
+                    .on_hover_text(
+                        "Higher = safer, touches less material.\n\
+                         50% is a good starting point.\n\
+                         The threshold sits below the detected noise floor\n\
+                         by a margin derived from this setting.",
+                    );
+
+                    ui.add_space(9.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(27.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(100.0, 22.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.label(RichText::new("Reduction").size(12.5).color(theme::TXT2));
+                            },
+                        );
+                        let w = ui.available_width();
+                        egui::ComboBox::from_id_source("reduction_profile")
+                            .width(w - 8.0)
+                            .selected_text(self.automixer_expander_reduction_profile.label())
+                            .show_ui(ui, |ui| {
+                                for &profile in ReductionProfile::all() {
+                                    ui.selectable_value(
+                                        &mut self.automixer_expander_reduction_profile,
+                                        profile,
+                                        profile.label(),
+                                    );
+                                }
+                            });
+                    });
+
+                    if self.automixer_expander_reduction_profile == ReductionProfile::Max {
+                        ui.add_space(10.0);
+                        widgets::notice(
+                            ui,
+                            "MAX (-32 dB) is aggressive \u{2014} can sound like a hard gate on \
+                             RMS-detected material below an already-conservative threshold.",
+                        );
+                    }
+                }
+            });
+
+            ui.add_space(12.0);
+
+            widgets::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Noise reduction").color(theme::TXT));
+                    ui.label(RichText::new("pick one").size(11.5).color(theme::TXT3));
+                });
+                indented_hint_flush(
+                    ui,
+                    "Two algorithms competing for the same slot in the chain.",
+                );
+                ui.add_space(11.0);
+
+                // The two flags are stored separately but only one may be set.
+                // As a segmented control the exclusivity is structural: there
+                // is no state the widget can produce that violates it.
+                let selected = if self.automixer_spectral_gate {
+                    1
+                } else if self.automixer_nn_dereverb {
+                    2
+                } else {
+                    0
+                };
+                if let Some(i) =
+                    widgets::segmented(ui, selected, &["Off", "Spectral gate", "nnnoiseless"])
+                {
+                    self.automixer_spectral_gate = i == 1;
+                    self.automixer_nn_dereverb = i == 2;
+                }
+            });
+
+            ui.add_space(12.0);
+
+            widgets::card(ui, |ui| {
+                ui.label(RichText::new("Always on").color(theme::TXT2));
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(
+                            "Voice EQ at 50% strength \u{b7} de-esser \u{b7} post EQ and \
+                             compressor with make-up gain.\nStereo sources are downmixed to mono.",
+                        )
+                        .size(11.5)
+                        .color(theme::TXT3),
+                    )
+                    .wrap(true),
                 );
             });
 
-            // Sub-options fully collapse when automixer is off (not just
-            // grayed out), so the settings area stays compact by default.
-            if self.automixer {
-                ui.indent("automixer_opts", |ui| {
-                                    // SG and NN are mutually exclusive (both live in the "noise" slot).
-                                    // DFN3 is independent — it's proper dereverb, runs before the others.
-                                    let sg_disabled = self.automixer_nn_dereverb;
-                                    let nn_disabled = self.automixer_spectral_gate;
+            ui.add_space(12.0);
+            widgets::notice(
+                ui,
+                "Attention! There is no way to create a universal mixing tool. This is the \
+                 closest I can think of to a universal mixing chain without doing proper mixing, \
+                 but the results may drastically vary based on the provided material. Use with \
+                 caution!",
+            );
+        });
+    }
 
-                                    ui.add_enabled_ui(!sg_disabled, |ui| {
-                                        if ui
-                                            .checkbox(
-                                                &mut self.automixer_spectral_gate,
-                                                "Intelligent noise removal (Spectral Gate)",
-                                            )
-                                            .changed()
-                                            && self.automixer_spectral_gate
-                                        {
-                                            self.automixer_nn_dereverb = false;
-                                        }
-                                    });
+    // -----------------------------------------------------------------------
 
-                                    ui.add_enabled_ui(!nn_disabled, |ui| {
-                                        if ui
-                                            .checkbox(
-                                                &mut self.automixer_nn_dereverb,
-                                                "Noise reduction (nnnoiseless)",
-                                            )
-                                            .changed()
-                                            && self.automixer_nn_dereverb
-                                        {
-                                            self.automixer_spectral_gate = false;
-                                        }
-                                    });
+    fn ui_loudness(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Measure a folder").color(theme::TXT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // The enclosing pane is already disabled while
+                    // `is_processing`; guarding `is_analyzing` here as well
+                    // stops a second click starting a re-entrant analysis while
+                    // one is in flight -- both share cancel_flag, logs and
+                    // progress state.
+                    ui.add_enabled_ui(!self.is_analyzing, |ui| {
+                        if widgets::small_button(ui, "Analyze folder loudness\u{2026}")
+                            .on_hover_text("Select a folder to check its average loudness level")
+                            .clicked()
+                        {
+                            self.start_analysis(ctx.clone());
+                        }
+                    });
+                });
+            });
+            indented_hint_flush(
+                ui,
+                "Checks the average level of the files you already have, so you can pick a \
+                 target that is not a guess.",
+            );
 
-                                    ui.separator();
-                                    ui.checkbox(
-                                        &mut self.automixer_dfn3_dereverb,
-                                        "Dereverb (DeepFilterNet3)",
-                                    );
-                                    if self.automixer_dfn3_dereverb {
-                                        ui.add(
-                                            egui::Slider::new(&mut self.automixer_dfn3_mix, 0.0..=100.0)
-                                                .text("Dereverb mix")
-                                                .suffix("%")
-                                                .fixed_decimals(0),
-                                        );
-                                        ui.checkbox(
-                                            &mut self.automixer_dfn3_postfilter,
-                                            "Post-filter (aggressive)",
-                                        );
-                                    }
+            if let Some(avg) = self.average_lufs {
+                ui.add_space(11.0);
+                egui::Frame::none()
+                    .fill(theme::INPUT)
+                    .stroke(egui::Stroke::new(1.0, theme::LINE))
+                    .rounding(egui::Rounding::same(theme::R_CTRL))
+                    .inner_margin(egui::Margin::symmetric(11.0, 9.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Average level of your files")
+                                    .size(12.5)
+                                    .color(theme::TXT2),
+                            );
+                            ui.label(
+                                RichText::new(format!("{avg:.2} LUFS"))
+                                    .monospace()
+                                    .strong()
+                                    .color(theme::AMBER),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if widgets::small_button(ui, "Set as target").clicked() {
+                                    self.target_lufs = avg.round();
+                                }
+                            });
+                        });
+                    });
+            }
+        });
 
-                                    ui.separator();
-                                    // Module 5: Downward Expander
-                                    ui.horizontal(|ui| {
-                                        ui.checkbox(
-                                            &mut self.automixer_expander,
-                                            "Downward Expander (noise floor)",
-                                        );
-                                        ui.label(
-                                            egui::RichText::new("Compute heavy!")
-                                                .small()
-                                                .weak()
-                                                .italics(),
-                                        );
-                                    });
-                                    if self.automixer_expander {
-                                        ui.add(
-                                            egui::Slider::new(
-                                                &mut self.automixer_expander_safety_pct,
-                                                0.0..=100.0,
-                                            )
-                                            .text("Safety Margin")
-                                            .suffix("%")
-                                            .fixed_decimals(0),
-                                        )
-                                        .on_hover_text(
-                                            "Higher = safer, touches less material.\n\
-                                             50% is a good starting point.\n\
-                                             The threshold sits below the detected noise floor\n\
-                                             by a margin derived from this setting.",
-                                        );
+        ui.add_space(12.0);
 
-                                        egui::ComboBox::from_label("Reduction profile")
-                                            .selected_text(
-                                                self.automixer_expander_reduction_profile.label(),
-                                            )
-                                            .show_ui(ui, |ui| {
-                                                for &profile in ReductionProfile::all() {
-                                                    ui.selectable_value(
-                                                        &mut self.automixer_expander_reduction_profile,
-                                                        profile,
-                                                        profile.label(),
-                                                    );
-                                                }
-                                            });
+        let on = self.normalize_volume;
+        ui.add_enabled_ui(on, |ui| {
+            widgets::card(ui, |ui| {
+                let readout = format!("{:.1}", self.target_lufs);
+                slider_row(
+                    ui,
+                    "Target LUFS-I",
+                    &mut self.target_lufs,
+                    -23.0..=-6.0,
+                    &readout,
+                );
+                indented_hint(
+                    ui,
+                    "EBU R128 integrated \u{b7} padded measurement below 3 s",
+                );
 
-                                        if self.automixer_expander_reduction_profile
-                                            == ReductionProfile::Max
-                                        {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(255, 200, 80),
-                                                "\u{26a0} MAX (-32 dB) is aggressive \u{2014} can sound \
-                                                 like a hard gate on RMS-detected material below an \
-                                                 already-conservative threshold.",
-                                            );
-                                        }
-                                    }
+                ui.add_space(13.0);
 
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Voice EQ works automatically (50% strength)",
-                                        )
-                                        .small()
-                                        .italics(),
-                                    );
-                                    // The Rust DSP stages all run on a single
-                                    // mono channel, so enabling Automixer
-                                    // downmixes stereo sources. Documented in
-                                    // the README, but the UI is where someone
-                                    // about to run a batch will look.
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Stereo sources are downmixed to mono",
-                                        )
-                                        .small()
-                                        .italics(),
-                                    );
-                                });
+                let readout = format!("{:.1}", self.target_peak_dbfs);
+                slider_row(
+                    ui,
+                    "Target peak",
+                    &mut self.target_peak_dbfs,
+                    -12.0..=-1.0,
+                    &readout,
+                )
+                .on_hover_text(
+                    "Peak normalization fallback, used only when EBU R128 loudness \
+                     measurement (standard or padded) fails -- typically for silent \
+                     or near-silent samples.\n\
+                     Recommended: -3 dBFS (safe headroom for 4-bit ADPCM).",
+                );
+                indented_hint(
+                    ui,
+                    "dBFS fallback \u{b7} used only when the R128 measurement fails",
+                );
+            });
+        });
+    }
 
-                ui.add_space(4.0);
-                let warning =
-                                    "\u{26a0}  Attention! There is no way to create a universal mixing \
-                                    tool. This is the closest I can think of to a universal mixing chain \
-                                    without doing proper mixing, but the results may drastically vary based \
-                                    on the provided material. Use with caution!";
-                ui.colored_label(egui::Color32::from_rgb(255, 200, 80), warning);
+    // -----------------------------------------------------------------------
+
+    fn ui_logs(&mut self, ui: &mut egui::Ui) {
+        if self.logs.is_empty() {
+            widgets::card(ui, |ui| {
+                ui.add_space(6.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("Nothing yet \u{2014} the log fills as files are processed.")
+                            .size(12.0)
+                            .color(theme::TXT3),
+                    );
+                });
+                ui.add_space(6.0);
+            });
+            return;
+        }
+
+        egui::Frame::none()
+            .fill(theme::INPUT)
+            .stroke(egui::Stroke::new(1.0, theme::LINE))
+            .rounding(egui::Rounding::same(theme::R_CARD))
+            .inner_margin(egui::Margin::symmetric(4.0, 8.0))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .id_source("log_scroll")
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        for log in &self.logs {
+                            log_line(ui, log);
+                        }
+                    });
+            });
+    }
+
+    // -----------------------------------------------------------------------
+    // Action bar
+    // -----------------------------------------------------------------------
+
+    fn ui_action_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.is_processing || self.is_analyzing {
+            let label = if self.is_analyzing {
+                "Analyzing"
+            } else {
+                "Processing"
+            };
+            let progress = if self.total_files > 0 {
+                self.current_progress as f32 / self.total_files as f32
+            } else {
+                0.0
+            };
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(label).strong().color(theme::TXT));
+                ui.label(
+                    RichText::new(format!(
+                        "{} / {} files",
+                        self.current_progress, self.total_files
+                    ))
+                    .monospace()
+                    .color(theme::TXT2),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{:.0}%", progress * 100.0))
+                            .monospace()
+                            .strong()
+                            .color(theme::AMBER),
+                    );
+                });
+            });
+
+            ui.add_space(9.0);
+            ui.add(
+                egui::ProgressBar::new(progress)
+                    .desired_height(8.0)
+                    .rounding(egui::Rounding::same(4.0))
+                    .fill(theme::AMBER),
+            );
+            ui.add_space(11.0);
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if widgets::stop_button(ui)
+                    .on_hover_text(
+                        "Stops now: the files still in flight are cancelled \
+                         mid-conversion and their partial output is discarded",
+                    )
+                    .clicked()
+                {
+                    self.cancel_flag.store(true, Ordering::Relaxed);
+                    // Terminating the running children is what makes Stop take
+                    // effect *now*: the worker threads are parked in `wait()`
+                    // and cannot see the flag until their subprocess returns,
+                    // which for a long file with DeepFilterNet3 is minutes away.
+                    crate::proc::terminate_all();
+                    self.push_log("Stop requested \u{2014} finishing up...".into());
+                }
+            });
+            return;
+        }
+
+        // The recipe line. Whatever section is open, this is what the button
+        // below is about to do.
+        ui.add(
+            egui::Label::new(RichText::new(self.recipe()).size(11.5).color(theme::TXT3)).wrap(true),
+        );
+        ui.add_space(10.0);
+
+        let can_start = !self.input_dir.is_empty() && !self.output_dir.is_empty();
+        let response = widgets::go_button(ui, "START PROCESSING", can_start);
+        if response.clicked() {
+            self.start_processing(ctx.clone());
+        }
+        if !can_start {
+            // A disabled button with no stated reason is the thing people file
+            // bugs about. The rail already flags Source in amber; this says the
+            // same thing at the point of the click.
+            response.on_hover_text("Choose a source folder and an output folder first");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small shared pieces
+// ---------------------------------------------------------------------------
+
+/// A folder row: fixed-width label, field, Browse.
+///
+/// The label column is a fixed width rather than a plain `ui.label`, which is
+/// what used to leave the two Browse buttons out of line with each other --
+/// "Source: " and "Output: " are not the same number of pixels wide.
+fn path_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            Vec2::new(58.0, theme::CTRL_H),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.label(RichText::new(label).color(theme::TXT2));
+            },
+        );
+
+        let browse_w = 78.0;
+        let field_w = (ui.available_width() - browse_w - ui.spacing().item_spacing.x).max(120.0);
+        // `add_sized` stretches the field to CTRL_H, but a TextEdit's margin
+        // is what positions the text area inside it -- and with a zero
+        // vertical margin that area starts at the top edge. `vertical_align`
+        // is not enough on its own: egui paints the *hint* text at the text
+        // area's top-left corner and ignores alignment entirely, so an empty
+        // field showed "Not selected" riding above the label beside it.
+        // Centring the area itself fixes the placeholder and the typed path
+        // together. Derived from the font rather than hard-coded, so it
+        // survives a change to CTRL_H or to the monospace size.
+        let row_h = ui.fonts(|f| f.row_height(&TextStyle::Monospace.resolve(ui.style())));
+        let pad_y = ((theme::CTRL_H - row_h) / 2.0).max(0.0);
+        ui.add_sized(
+            [field_w, theme::CTRL_H],
+            egui::TextEdit::singleline(value)
+                .font(TextStyle::Monospace)
+                .margin(Vec2::new(10.0, pad_y))
+                .hint_text("Not selected"),
+        );
+
+        if widgets::small_button(ui, "Browse").clicked() {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                *value = path.display().to_string();
             }
         }
+    });
+}
+
+/// A slider laid out as `label | track | value`, indented under its module.
+///
+/// egui's own `Slider::text` puts the label after the track and the number
+/// before it, which reads backwards once there is more than one slider on
+/// screen: the numbers end up in a ragged column in the middle of the card.
+fn slider_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    readout: &str,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.add_space(27.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(100.0, 22.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.label(RichText::new(label).size(12.5).color(theme::TXT2));
+            },
+        );
+
+        let chip_w = 56.0;
+        let track_w = (ui.available_width() - chip_w - ui.spacing().item_spacing.x * 2.0).max(80.0);
+        ui.spacing_mut().slider_width = track_w;
+        let response = ui.add(egui::Slider::new(value, range).show_value(false));
+        widgets::chip(ui, readout, chip_w);
+        response
+    })
+    .inner
+}
+
+/// A hint indented to line up under a module's checkbox label.
+fn indented_hint(ui: &mut egui::Ui, text: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(27.0);
+        ui.add(egui::Label::new(RichText::new(text).size(11.5).color(theme::TXT3)).wrap(true));
+    });
+}
+
+/// A hint with no indent, for cards whose heading is a plain label.
+fn indented_hint_flush(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(5.0);
+    ui.add(egui::Label::new(RichText::new(text).size(11.5).color(theme::TXT3)).wrap(true));
+}
+
+/// One log line: the folder dimmed, the filename bright, errors on a red wash.
+///
+/// The lines are full paths, and in a batch every one of them shares the same
+/// long prefix. Dimming it puts the part that differs -- the filename -- in
+/// front of the eye without shortening or hiding anything.
+fn log_line(ui: &mut egui::Ui, text: &str) {
+    let is_err = text.starts_with("[ERROR]");
+    let body = |ui: &mut egui::Ui| {
+        let bright = if is_err { theme::RED } else { theme::TXT2 };
+        let dim = if is_err {
+            theme::RED.gamma_multiply(0.62)
+        } else {
+            theme::TXT3
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            match text.rfind(['\\', '/']) {
+                Some(cut) => {
+                    ui.label(RichText::new(&text[..=cut]).monospace().color(dim));
+                    ui.label(RichText::new(&text[cut + 1..]).monospace().color(bright));
+                }
+                None => {
+                    ui.label(RichText::new(text).monospace().color(bright));
+                }
+            }
+        });
+    };
+
+    if is_err {
+        egui::Frame::none()
+            .fill(theme::RED_WASH)
+            .rounding(egui::Rounding::same(4.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+            .show(ui, body);
+    } else {
+        egui::Frame::none()
+            .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+            .show(ui, body);
     }
 }
 

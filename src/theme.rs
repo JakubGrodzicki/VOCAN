@@ -85,8 +85,8 @@ pub const R_CTRL: f32 = 8.0;
 /// A named font family for the semibold face used by headings.
 ///
 /// Referencing a [`FontFamily::Name`] that was never registered panics on the
-/// first render, so [`apply`] falls back to `Proportional` when the file is
-/// missing -- which is every non-Windows platform.
+/// first render, so [`apply`] falls back to `Proportional` when no semibold
+/// face could be found -- which is any platform not covered by `SANS_BOLD`.
 const HEADING: &str = "heading";
 
 /// Returns the family to use for headings, given whether the semibold face
@@ -113,64 +113,115 @@ pub fn apply(ctx: &egui::Context) -> bool {
     heading_loaded
 }
 
-/// Registers Segoe UI (body), Segoe UI Semibold (headings) and a monospace
-/// face for numerics.
+/// Registers a body face, a semibold face for headings and a monospace face
+/// for numerics, picking whichever candidate the host actually has.
 ///
 /// Every load is best-effort: a missing file leaves egui's bundled default in
 /// place rather than failing to start.
 fn install_fonts(ctx: &egui::Context) -> bool {
     let mut fonts = FontDefinitions::default();
 
-    if let Ok(data) = std::fs::read("C:/Windows/Fonts/segoeui.ttf") {
-        fonts
-            .font_data
-            .insert("segoe_ui".to_owned(), FontData::from_owned(data));
-        fonts
-            .families
-            .entry(FontFamily::Proportional)
-            .or_default()
-            .insert(0, "segoe_ui".to_owned());
-    }
-
-    let heading_loaded = if let Ok(data) = std::fs::read("C:/Windows/Fonts/seguisb.ttf") {
-        fonts
-            .font_data
-            .insert("segoe_ui_sb".to_owned(), FontData::from_owned(data));
-        fonts
-            .families
-            .entry(FontFamily::Name(HEADING.into()))
-            .or_default()
-            .insert(0, "segoe_ui_sb".to_owned());
-        true
-    } else {
-        false
-    };
+    load_first(&mut fonts, "ui_sans", FontFamily::Proportional, SANS);
 
     // Every number in this app -- LUFS, dB, percentages, file counts, paths --
     // is drawn in the monospace family, so that digits line up in a column and
-    // a value stops shifting sideways while a slider is dragged. Cascadia Mono
-    // ships with Windows 11; Consolas covers every older Windows.
-    for candidate in [
-        "C:/Windows/Fonts/CascadiaMono.ttf",
-        "C:/Windows/Fonts/CascadiaCode.ttf",
-        "C:/Windows/Fonts/consola.ttf",
-    ] {
-        if let Ok(data) = std::fs::read(candidate) {
-            fonts
-                .font_data
-                .insert("num".to_owned(), FontData::from_owned(data));
-            fonts
-                .families
-                .entry(FontFamily::Monospace)
-                .or_default()
-                .insert(0, "num".to_owned());
-            break;
-        }
-    }
+    // a value stops shifting sideways while a slider is dragged.
+    load_first(&mut fonts, "ui_mono", FontFamily::Monospace, MONO);
+
+    // The only family whose absence is actually visible: with no semibold face
+    // the section headings fall back to the body weight and stop reading as
+    // headings at all. `install_style` handles that through `heading_family`.
+    let heading_loaded = load_first(
+        &mut fonts,
+        "ui_sans_bold",
+        FontFamily::Name(HEADING.into()),
+        SANS_BOLD,
+    );
 
     ctx.set_fonts(fonts);
     heading_loaded
 }
+
+/// Registers the first readable file in `candidates` at the front of `family`.
+///
+/// Best-effort by design: when nothing matches, egui's own bundled faces
+/// (Ubuntu-Light and Hack, both compiled into the binary) stay in place, so a
+/// platform we have no path for still renders every glyph. Inserting at the
+/// front rather than replacing keeps those bundled faces as the fallback for
+/// characters our pick happens to lack.
+fn load_first(
+    fonts: &mut FontDefinitions,
+    name: &str,
+    family: FontFamily,
+    candidates: &[&str],
+) -> bool {
+    for path in candidates {
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
+        // `.ttc` collections parse as long as a face index is given, and face
+        // 0 is the regular one in every collection listed below.
+        fonts
+            .font_data
+            .insert(name.to_owned(), FontData::from_owned(data));
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, name.to_owned());
+        return true;
+    }
+    false
+}
+
+// Font candidates, most-preferred first, Windows then macOS then Linux. Only
+// paths that exist on a stock install are listed -- this runs on every start,
+// and a miss costs one failed `read`.
+//
+// macOS keeps Helvetica and Menlo in `.ttc` collections; SF Pro is variable-
+// weight, so there is no static semibold file to point at, and macOS falls
+// back to Arial Bold for headings.
+
+/// Body and UI text.
+const SANS: &[&str] = &[
+    "C:/Windows/Fonts/segoeui.ttf",
+    "/System/Library/Fonts/SFNS.ttf",
+    "/System/Library/Fonts/SFNSText.ttf",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+];
+
+/// Section headings.
+const SANS_BOLD: &[&str] = &[
+    "C:/Windows/Fonts/seguisb.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/Library/Fonts/Arial Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/liberation-sans/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+];
+
+/// Numeric read-outs and paths.
+const MONO: &[&str] = &[
+    "C:/Windows/Fonts/CascadiaMono.ttf",
+    "C:/Windows/Fonts/CascadiaCode.ttf",
+    "C:/Windows/Fonts/consola.ttf",
+    "/System/Library/Fonts/SFNSMono.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+];
 
 /// Installs the text scale, spacing and [`Visuals`].
 fn install_style(ctx: &egui::Context, heading_loaded: bool) {
@@ -264,4 +315,57 @@ fn install_style(ctx: &egui::Context, heading_loaded: bool) {
 
     style.visuals = v;
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_first_reports_failure_and_changes_nothing_when_no_candidate_exists() {
+        let mut fonts = FontDefinitions::default();
+        let before = fonts.families.get(&FontFamily::Proportional).cloned();
+
+        let loaded = load_first(
+            &mut fonts,
+            "nope",
+            FontFamily::Proportional,
+            &["/definitely/not/a/real/font.ttf"],
+        );
+
+        assert!(!loaded);
+        assert!(!fonts.font_data.contains_key("nope"));
+        assert_eq!(
+            fonts.families.get(&FontFamily::Proportional).cloned(),
+            before,
+            "a failed load must leave egui's bundled fallback chain untouched"
+        );
+    }
+
+    #[test]
+    fn heading_family_falls_back_to_proportional_when_no_bold_face_loaded() {
+        // Referencing a `FontFamily::Name` that was never registered panics on
+        // the first render. On any host without one of the `SANS_BOLD`
+        // candidates this fallback is the only thing keeping the app starting
+        // at all, so it is worth a test of its own.
+        assert_eq!(heading_family(false), FontFamily::Proportional);
+        assert_eq!(heading_family(true), FontFamily::Name(HEADING.into()));
+    }
+
+    #[test]
+    fn every_font_candidate_is_an_absolute_path() {
+        // A relative path would resolve against the working directory, which
+        // for a GUI launched from a shortcut is wherever the shell happened to
+        // be -- so it would load a font, or not, depending on how it was
+        // started.
+        for (name, list) in [("SANS", SANS), ("SANS_BOLD", SANS_BOLD), ("MONO", MONO)] {
+            assert!(!list.is_empty(), "{name} lists no candidates");
+            for path in list {
+                assert!(
+                    path.starts_with('/') || path.contains(":/"),
+                    "{name} candidate {path:?} is not absolute"
+                );
+            }
+        }
+    }
 }

@@ -202,7 +202,17 @@ if ($SkipTests) {
     Step "Skipping tests (-SkipTests given)"
 } else {
     Step "Running fast tests (no ffmpeg required)"
+    # NOTE: cargo writes normal progress (e.g. "Compiling", "Finished") to stderr.
+    # Under Windows PowerShell 5.1, capturing a native command's stderr via 2>&1
+    # wraps each line in an ErrorRecord; with $ErrorActionPreference = "Stop"
+    # (set at the top of this script) that terminates the whole script on the
+    # very first such line, before we ever get to check $LASTEXITCODE. Relax
+    # it just for these two calls, where we intentionally inspect the exit
+    # code ourselves instead of letting PowerShell treat stderr as fatal.
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     $fastOutput = & cargo test 2>&1
+    $ErrorActionPreference = $prevEap
     $fastOutput | ForEach-Object { Write-Host $_ }
     $FastTestsOk = ($LASTEXITCODE -eq 0)
     $FastPassed, $FastFailed = ParseTestCounts $fastOutput
@@ -213,7 +223,10 @@ if ($SkipTests) {
     }
 
     Step "Running full tests (ffmpeg-dependent)"
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     $fullOutput = & cargo test -- --ignored 2>&1
+    $ErrorActionPreference = $prevEap
     $fullOutput | ForEach-Object { Write-Host $_ }
     $FullTestsOk = ($LASTEXITCODE -eq 0)
     $FullPassed, $FullFailed = ParseTestCounts $fullOutput

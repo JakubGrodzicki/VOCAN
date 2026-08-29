@@ -1103,9 +1103,14 @@ impl AudioBatchApp {
         widgets::card(ui, |ui| {
             ui.label(RichText::new("Folders").color(theme::TXT));
             ui.add_space(11.0);
-            path_row(ui, "Source", &mut self.input_dir);
+            let w = label_col(
+                ui,
+                &["Source", "Output"],
+                TextStyle::Body.resolve(ui.style()),
+            );
+            path_row(ui, "Source", w, &mut self.input_dir);
             ui.add_space(10.0);
-            path_row(ui, "Output", &mut self.output_dir);
+            path_row(ui, "Output", w, &mut self.output_dir);
         });
 
         if !self.input_dir.is_empty() && self.input_dir == self.output_dir {
@@ -1122,17 +1127,22 @@ impl AudioBatchApp {
         widgets::card(ui, |ui| {
             ui.label(RichText::new("Output format").color(theme::TXT));
             ui.add_space(11.0);
+            let w = label_col(
+                ui,
+                &["Format", "Bitrate"],
+                TextStyle::Body.resolve(ui.style()),
+            );
             ui.horizontal(|ui| {
                 ui.allocate_ui_with_layout(
-                    Vec2::new(76.0, 30.0),
+                    Vec2::new(w, 30.0),
                     Layout::left_to_right(Align::Center),
                     |ui| {
                         ui.label(RichText::new("Format").color(theme::TXT2));
                     },
                 );
-                let w = ui.available_width();
+                let combo_w = ui.available_width();
                 egui::ComboBox::from_id_source("output_format")
-                    .width(w - 8.0)
+                    .width(combo_w - 8.0)
                     .selected_text(self.output_format.label())
                     .show_ui(ui, |ui| {
                         for &fmt in OutputFormat::all() {
@@ -1145,15 +1155,15 @@ impl AudioBatchApp {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.allocate_ui_with_layout(
-                        Vec2::new(76.0, 30.0),
+                        Vec2::new(w, 30.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
                             ui.label(RichText::new("Bitrate").color(theme::TXT2));
                         },
                     );
-                    let w = ui.available_width();
+                    let combo_w = ui.available_width();
                     egui::ComboBox::from_id_source("bitrate_combo")
-                        .width(w - 8.0)
+                        .width(combo_w - 8.0)
                         .selected_text(format!("{} kbps", self.bitrate_kbps))
                         .show_ui(ui, |ui| {
                             for &b in &[36, 48, 64, 128, 256, 320] {
@@ -1181,6 +1191,13 @@ impl AudioBatchApp {
     // -----------------------------------------------------------------------
 
     fn ui_cleanup(&mut self, ui: &mut egui::Ui) {
+        // One column shared by every row in the section, so the sliders and the
+        // dropdown line up across separate cards.
+        let w = label_col(
+            ui,
+            &["Mix", "Safety margin", "Reduction"],
+            egui::FontId::new(12.5, egui::FontFamily::Proportional),
+        );
         // The master switch lives in the pane header. With it off, the modules
         // stay visible but inert -- the chain is still worth reading when it is
         // not going to run.
@@ -1205,6 +1222,7 @@ impl AudioBatchApp {
                     slider_row(
                         ui,
                         "Mix",
+                        w,
                         &mut self.automixer_dfn3_mix,
                         0.0..=100.0,
                         &readout,
@@ -1242,6 +1260,7 @@ impl AudioBatchApp {
                     slider_row(
                         ui,
                         "Safety margin",
+                        w,
                         &mut self.automixer_expander_safety_pct,
                         0.0..=100.0,
                         &readout,
@@ -1257,15 +1276,15 @@ impl AudioBatchApp {
                     ui.horizontal(|ui| {
                         ui.add_space(27.0);
                         ui.allocate_ui_with_layout(
-                            Vec2::new(100.0, 22.0),
+                            Vec2::new(w, 22.0),
                             Layout::left_to_right(Align::Center),
                             |ui| {
                                 ui.label(RichText::new("Reduction").size(12.5).color(theme::TXT2));
                             },
                         );
-                        let w = ui.available_width();
+                        let combo_w = ui.available_width();
                         egui::ComboBox::from_id_source("reduction_profile")
-                            .width(w - 8.0)
+                            .width(combo_w - 8.0)
                             .selected_text(self.automixer_expander_reduction_profile.label())
                             .show_ui(ui, |ui| {
                                 for &profile in ReductionProfile::all() {
@@ -1412,10 +1431,16 @@ impl AudioBatchApp {
         let on = self.normalize_volume;
         ui.add_enabled_ui(on, |ui| {
             widgets::card(ui, |ui| {
+                let w = label_col(
+                    ui,
+                    &["Target LUFS-I", "Target peak"],
+                    egui::FontId::new(12.5, egui::FontFamily::Proportional),
+                );
                 let readout = format!("{:.1}", self.target_lufs);
                 slider_row(
                     ui,
                     "Target LUFS-I",
+                    w,
                     &mut self.target_lufs,
                     -23.0..=-6.0,
                     &readout,
@@ -1431,6 +1456,7 @@ impl AudioBatchApp {
                 slider_row(
                     ui,
                     "Target peak",
+                    w,
                     &mut self.target_peak_dbfs,
                     -12.0..=-1.0,
                     &readout,
@@ -1577,15 +1603,36 @@ impl AudioBatchApp {
 // Small shared pieces
 // ---------------------------------------------------------------------------
 
-/// A folder row: fixed-width label, field, Browse.
+/// Width of a label column, measured from the widest label that will sit in it.
+///
+/// These were hard-coded numbers picked to fit Segoe UI. That silently ties the
+/// layout to one font: on Linux and macOS none of the Windows faces load and
+/// egui falls back to its bundled Ubuntu-Light, which is wider at the same
+/// size, so the longest labels ("Target LUFS-I", "Safety margin") would have
+/// run into the control beside them -- a label in a horizontal layout does not
+/// wrap, it overlaps. Measuring costs one text layout per row and cannot drift.
+fn label_col(ui: &egui::Ui, labels: &[&str], font: egui::FontId) -> f32 {
+    labels
+        .iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap((*label).to_owned(), font.clone(), theme::TXT2)
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max)
+        + 12.0
+}
+
+/// A folder row: label column, field, Browse.
 ///
 /// The label column is a fixed width rather than a plain `ui.label`, which is
 /// what used to leave the two Browse buttons out of line with each other --
 /// "Source: " and "Output: " are not the same number of pixels wide.
-fn path_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
+fn path_row(ui: &mut egui::Ui, label: &str, label_w: f32, value: &mut String) {
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(
-            Vec2::new(58.0, theme::CTRL_H),
+            Vec2::new(label_w, theme::CTRL_H),
             Layout::left_to_right(Align::Center),
             |ui| {
                 ui.label(RichText::new(label).color(theme::TXT2));
@@ -1629,6 +1676,7 @@ fn path_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
 fn slider_row(
     ui: &mut egui::Ui,
     label: &str,
+    label_w: f32,
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
     readout: &str,
@@ -1636,7 +1684,7 @@ fn slider_row(
     ui.horizontal(|ui| {
         ui.add_space(27.0);
         ui.allocate_ui_with_layout(
-            Vec2::new(100.0, 22.0),
+            Vec2::new(label_w, 22.0),
             Layout::left_to_right(Align::Center),
             |ui| {
                 ui.label(RichText::new(label).size(12.5).color(theme::TXT2));

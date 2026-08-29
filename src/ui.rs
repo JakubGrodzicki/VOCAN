@@ -234,9 +234,19 @@ pub fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
         });
 }
 
-/// A value read-out: monospace, boxed, fixed width so the box does not resize
-/// as the number changes.
-pub fn chip(ui: &mut Ui, text: &str, width: f32) {
+/// A value read-out: monospace, boxed.
+///
+/// `min_width` keeps a column of chips the same width as their values change
+/// ("80%" next to "100%"); a value too wide for it grows the chip rather than
+/// spilling out of it, which is what a font with wider digits would do.
+pub fn chip(ui: &mut Ui, text: &str, min_width: f32) {
+    let font = TextStyle::Monospace.resolve(ui.style());
+    let text_w = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font.clone(), theme::TXT)
+        .size()
+        .x;
+    let width = min_width.max(text_w + 16.0);
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::hover());
     let enabled = ui.is_enabled();
     ui.painter()
@@ -250,7 +260,7 @@ pub fn chip(ui: &mut Ui, text: &str, width: f32) {
         rect.center(),
         Align2::CENTER_CENTER,
         text,
-        TextStyle::Monospace.resolve(ui.style()),
+        font,
         if enabled {
             theme::TXT
         } else {

@@ -117,3 +117,55 @@ fn skipping_normalization_removes_the_measurement_pass_only() {
     };
     assert_eq!(spawns_for(automixer, 5.0), 3);
 }
+
+#[test]
+#[ignore]
+fn trimming_silence_costs_no_extra_process_in_either_pipeline() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    // The design of the whole option, asserted. `silenceremove` is spliced into
+    // a filter chain that was going to run anyway -- the encode's own `-af` in
+    // the plain path, the de-esser pass in the Automixer path -- so the counts
+    // here are the untrimmed counts, unchanged.
+    //
+    // Giving the trim a pass of its own is the easiest way to write this
+    // feature and the reason this test exists: it would cost one extra process
+    // and one extra full read of the file, per file, on every batch, and
+    // nothing else in the suite would notice.
+    let plain = ProcessingOptions {
+        target_lufs: Some(-16.0),
+        trim_silence: true,
+        output_format: OutputFormat::Pcm24Wav,
+        ..Default::default()
+    };
+    assert_eq!(spawns_for(plain, 5.0), 3, "plain conversion with trim");
+
+    let automixer = ProcessingOptions {
+        target_lufs: Some(-16.0),
+        automixer: true,
+        automixer_spectral_gate: true,
+        trim_silence: true,
+        output_format: OutputFormat::Pcm24Wav,
+        ..Default::default()
+    };
+    assert_eq!(spawns_for(automixer, 5.0), 4, "automixer with trim");
+}
+
+#[test]
+#[ignore]
+fn trimming_silence_without_normalization_still_costs_one_process() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    // The trim is the only thing in `-af` here, with no normalization pass to
+    // hang it off -- the case where a separate trim pass would have been the
+    // path of least resistance.
+    let opts = ProcessingOptions {
+        target_lufs: None,
+        trim_silence: true,
+        output_format: OutputFormat::Pcm24Wav,
+        ..Default::default()
+    };
+    assert_eq!(spawns_for(opts, 5.0), 1, "encode only");
+}

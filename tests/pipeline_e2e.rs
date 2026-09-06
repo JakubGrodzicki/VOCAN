@@ -13,6 +13,7 @@ mod common;
 
 use common::{
     ffmpeg_has_encoder, ffmpeg_path, read_wav_samples_f32, skip_if_no_ffmpeg, write_sine_wav,
+    write_take_with_pause_wav,
 };
 use vocan::processing::process_single_file;
 use vocan::types::{OutputFormat, ProcessingOptions};
@@ -299,4 +300,155 @@ fn automixer_toggle_combinations_do_not_error() {
         )
         .unwrap_or_else(|e| panic!("combo sg={sg} nn={nn} exp={exp} failed: {e}"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Silence trim
+// ---------------------------------------------------------------------------
+
+/// Runs one fixture through the pipeline and returns the output's length in
+/// seconds, measured from the samples actually written.
+fn processed_secs(opts: &ProcessingOptions, name: &str, sample_rate: u32) -> f32 {
+    let dir = tempfile::tempdir().unwrap();
+    let input_base = dir.path().join("in");
+    let output_base = dir.path().join("out");
+    std::fs::create_dir_all(&input_base).unwrap();
+    let input_path = input_base.join(format!("{name}.wav"));
+
+    // 1.0s lead, 0.5s of line, a 0.5s beat, 0.5s of line, 1.0s tail = 3.5s.
+    write_take_with_pause_wav(&input_path, 1.0, 0.5, 0.5, 1.0, sample_rate, 440.0, 0.5);
+
+    process_single_file(&input_path, &input_base, &output_base, opts, &ffmpeg_path())
+        .unwrap_or_else(|e| panic!("{name} failed: {e}"));
+
+    let out = output_base
+        .join(format!("{name}.wav"))
+        .with_extension(opts.output_format.extension());
+    read_wav_samples_f32(&out).len() as f32 / sample_rate as f32
+}
+
+#[test]
+#[ignore]
+fn trim_silence_cuts_the_ends_and_keeps_the_pause_inside_the_line() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    // This is the test the feature exists for. The obvious one-filter
+    // `silenceremove` recipe (start_periods=1 + a positive stop_periods) passes
+    // a "did it get shorter?" check and fails this one: on this exact fixture
+    // it returns ~0.8s, having cut the take at the 0.5s beat and discarded the
+    // second half of the line. The answer has to be ~1.5s -- both words and the
+    // beat between them -- not 3.5s and not 1.0s.
+    let mut opts = base_opts();
+    opts.target_lufs = None; // isolate the trim; loudnorm cannot change length
+    opts.trim_silence = true;
+
+    let trimmed = processed_secs(&opts, "trimmed", 48000);
+    assert!(
+        (trimmed - 1.5).abs() < 0.12,
+        "expected ~1.5s (0.5 + 0.5 pause + 0.5), got {trimmed:.3}s --          under ~1.1s the pause inside the line was cut out, or the take was          truncated at it"
+    );
+
+    opts.trim_silence = false;
+    let untouched = processed_secs(&opts, "untouched", 48000);
+    assert!(
+        (untouched - 3.5).abs() < 0.05,
+        "with the trim off nothing should be removed, got {untouched:.3}s"
+    );
+}
+
+#[test]
+#[ignore]
+fn trim_silence_works_the_same_through_the_automixer_pipeline() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    // The two pipelines splice the trim into different chains -- the encode's
+    // own `-af` on one side, the de-esser pass on the other -- so "independent
+    // of everything else" is only true if both land in the same place.
+    let mut opts = base_opts();
+    opts.target_lufs = None;
+    opts.trim_silence = true;
+    opts.automixer = true;
+    opts.automixer_spectral_gate = true;
+
+    let trimmed = processed_secs(&opts, "automixer_trimmed", 48000);
+    assert!(
+        (trimmed - 1.5).abs() < 0.12,
+        "expected ~1.5s through the Automixer path, got {trimmed:.3}s"
+    );
+}
+
+#[test]
+#[ignore]
+fn trim_silence_leaves_a_take_with_no_dead_air_alone() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    // A trim that quietly shaves the onset off every clean take would never
+    // show up in the tests above, and would be audible on plosives.
+    let dir = tempfile::tempdir().unwrap();
+    let input_base = dir.path().join("in");
+    let output_base = dir.path().join("out");
+    std::fs::create_dir_all(&input_base).unwrap();
+    let input_path = input_base.join("tone.wav");
+    write_sine_wav(&input_path, 2.0, 48000, 440.0, 0.5);
+
+    let mut opts = base_opts();
+    opts.target_lufs = None;
+    opts.trim_silence = true;
+
+    process_single_file(
+        &input_path,
+        &input_base,
+        &output_base,
+        &opts,
+        &ffmpeg_path(),
+    )
+    .expect("processing should succeed");
+
+    let out = output_base.join("tone.wav");
+    let secs = read_wav_samples_f32(&out).len() as f32 / 48000.0;
+    assert!(
+        (secs - 2.0).abs() < 0.02,
+        "a take with no silence at either end must come back whole, got {secs:.3}s"
+    );
+}
+
+#[test]
+#[ignore]
+fn trim_silence_reports_a_fully_silent_file_instead_of_writing_an_empty_one() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    // Everything below the threshold means nothing survives the trim. Writing
+    // a valid, empty audio file would look exactly like a successful
+    // conversion until someone played it.
+    let dir = tempfile::tempdir().unwrap();
+    let input_base = dir.path().join("in");
+    let output_base = dir.path().join("out");
+    std::fs::create_dir_all(&input_base).unwrap();
+    let input_path = input_base.join("silent.wav");
+    common::write_silence_wav(&input_path, 2.0, 48000);
+
+    let mut opts = base_opts();
+    opts.target_lufs = None;
+    opts.trim_silence = true;
+    opts.automixer = true;
+    opts.automixer_spectral_gate = true;
+
+    let err = process_single_file(
+        &input_path,
+        &input_base,
+        &output_base,
+        &opts,
+        &ffmpeg_path(),
+    )
+    .expect_err("a file that trims down to nothing must be reported, not published");
+    let msg = err.to_string();
+    assert!(msg.contains("no audio"), "unhelpful message: {msg}");
+    assert!(
+        !output_base.join("silent.wav").exists(),
+        "nothing should have been written"
+    );
 }

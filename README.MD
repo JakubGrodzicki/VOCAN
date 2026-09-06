@@ -29,6 +29,18 @@ VOCAN can normalize the loudness of each file. VOCAN uses this method:
 
 A loudness measurement fails when the file is silent or has very little signal.
 
+### Silence trimming (optional)
+
+VOCAN can cut the dead air off the front and the back of every take. Select the **Trim silence** checkbox, in the **Files** section. The threshold is −45 dB.
+
+This option is independent of everything else. It does not belong to the Automixer chain and the Automixer master switch does not control it. You can use it on its own, with only the format conversion.
+
+VOCAN never touches the pauses **inside** a line. A dramatic pause, a breath, or a gap between sentences comes through untouched. VOCAN only removes silence that runs from the very start of the file to the first sound, and from the last sound to the very end.
+
+Trimming costs no extra work. VOCAN adds the filter to a chain that FFmpeg was going to run anyway, so a trimmed run launches exactly as many processes and reads each file exactly as many times as an untrimmed one. With the Automixer on, trimming makes the run *faster*: every step behind the trim, including DeepFilterNet3, works on a shorter signal.
+
+If a file is silent from end to end, nothing survives the trim. VOCAN reports the file as an error and writes no output for it, rather than publishing an empty audio file that looks like a successful conversion.
+
 ### Automixer chain (optional)
 
 The Automixer applies these processes, in this order:
@@ -150,13 +162,14 @@ Do these steps to process a folder of audio files:
 3. To measure the average loudness of the source files, click **Analyze folder loudness...**. To apply this value as the target, click **Set as target**.
 4. To enable loudness normalization, select the **Normalize volume** checkbox. Set the target LUFS value and the target peak dBFS value. VOCAN uses the target peak value only as a fallback, when the LUFS measurement fails.
 5. Select an output format. If you select MP3 or OGG, also set the bitrate.
-6. To enable the Automixer, select the **Automixer** checkbox. Then set the Automixer options:
+6. To cut the silence off the start and the end of every take, select the **Trim silence** checkbox. This option sits in the **Files** section, with the other settings that apply to every file. It works on its own — you do not need to enable the Automixer for it.
+7. To enable the Automixer, select the **Automixer** checkbox. Then set the Automixer options:
    - **Intelligent noise removal (Spectral Gate)**: select only this option, or only the nnnoiseless option, not both.
    - **Noise reduction (nnnoiseless)**: select only this option, or only the spectral gate option, not both.
    - **Dereverb (DeepFilterNet3)**: this step runs before the noise-reduction step and the EQ step. You can set the mix level (0–100%). You can also enable the **Post-filter** option — this applies more aggressive noise suppression in the noisiest parts of the signal. Use post-filter for outdoor or field recordings; leave it off for clean studio recordings to preserve naturalness.
    - **Downward Expander (noise floor)**: this option estimates the noise floor from the signal before the dereverb step. The option then applies bounded downward expansion. Set the **Safety Margin** slider, from 0% to 100%. This value sets the distance between the noise floor and the expansion threshold. Select a **Reduction profile** (also called "depth"): Safe, Recommended, Hard, or Max. Each profile defines the maximum attenuation depth — how much the signal gets reduced when below the threshold. Higher profiles (Hard, Max) are more aggressive but can sound less natural.
    - When Automixer is on, VOCAN always applies the Voice EQ, at 50% strength.
-7. Click **START PROCESSING**. VOCAN shows the progress and the log messages in the lower pane.
+8. Click **START PROCESSING**. VOCAN shows the progress and the log messages in the lower pane.
 
 To stop a run, click **Stop**. VOCAN finishes the files that are in progress, then skips the remaining files.
 
@@ -190,7 +203,7 @@ When Automixer is on, each file goes through a pipeline of Rust steps and FFmpeg
 
 VOCAN runs the Rust chain at the **source sample rate**. Two steps are the exception: nnnoiseless and DeepFilterNet3 are models trained at 48 kHz and require it. When you enable either one, VOCAN converts the whole Rust chain to 48 kHz instead. VOCAN restores the original sample rate at the final encoding step in every case. This means a 44.1 kHz file with neither of those two steps enabled is never resampled at all.
 
-1. **De-esser**: the FFmpeg `deesser` filter (`i=0.4:m=0.5:f=0.5:s=o`) processes the file. FFmpeg sends the output to Rust, as mono f32le audio at the pipeline rate described above.
+1. **Silence trim** (only when **Trim silence** is on) followed by the **de-esser**: both run in the same FFmpeg pass. The trim comes first, so the de-esser and every step after it work on the shortened signal. The de-esser is the FFmpeg `deesser` filter (`i=0.4:m=0.5:f=0.5:s=o`). FFmpeg sends the output to Rust, as mono f32le audio at the pipeline rate described above. If nothing comes back at all — the file was silent from end to end, and the trim removed all of it — VOCAN fails that file with an error instead of writing an empty output.
 2. **Noise floor estimation**: this step runs only when the expander is on. VOCAN measures the windowed RMS level of the signal. The window is 25 ms long, with 50% overlap and a Hann shape. VOCAN normalizes the windowed energy by the sum of squares of the window itself, so the result is a true RMS level. VOCAN takes the 12th percentile of the result. This step runs on the signal after the de-esser step and before the dereverb step. This order stops the dereverb step from changing the noise floor estimate. If the file is too short or too quiet, VOCAN skips the expander step for that file.
 3. **DeepFilterNet3**: this step runs only when dereverb is on. The model removes noise and reverb at the same time, at 48 kHz mono. The `-D` flag aligns the output with the input, sample for sample. VOCAN reads and writes the WAV data with the `hound` library. This step does not need an extra FFmpeg process. VOCAN mixes the output with the dry signal, at the ratio that you set. The default attenuation limit is 30 dB. You can enable an optional **post-filter** (`--pf`), which applies more aggressive suppression to highly noisy regions — this is useful for outdoor or field recordings but may reduce naturalness in clean recordings.
 4. **Downward Expander**: this step runs only when the expander is on. The level detector uses an RMS window of about 3 ms. The expander has a soft knee, attack and release smoothing, and a mandatory hold time. The hold time stops the expander from opening and closing too fast. The threshold is the noise floor minus the margin. The Safety Margin slider sets the margin, from 2 dB to 8 dB. The reduction profile (also called "depth") sets the maximum attenuation — this is how much the signal gets reduced below the threshold. The attenuation never reaches −∞ dB; instead, each profile applies a bounded reduction.
@@ -214,9 +227,39 @@ VOCAN runs the Rust chain at the **source sample rate**. Two steps are the excep
 8. **Normalization**: VOCAN uses the two-pass linear EBU R128 method, with padding for short files, or peak normalization. See "Loudness normalization fallback" below. VOCAN measures the pass-1 stats on the processed temporary WAV file. This method keeps the pass-1 measurement and the pass-2 normalization on the same signal.
 9. **Encoding**: VOCAN writes the file in the format that you selected. VOCAN restores the original sample rate.
 
+### Silence trimming
+
+VOCAN builds this filter chain, and gives it to FFmpeg as part of a chain that already runs:
+
+```
+silenceremove=start_periods=1:start_duration=0.05:start_threshold=-45dB:start_silence=0.05,
+areverse,
+silenceremove=start_periods=1:start_duration=0.05:start_threshold=-45dB:start_silence=0.05,
+areverse
+```
+
+**Why it is built this way.** The recipe that circulates for this job is a single `silenceremove` with a start section and a stop section:
+
+```
+silenceremove=start_periods=1:start_duration=0.05:start_threshold=-45dB:
+              stop_periods=1:stop_duration=0.35:stop_threshold=-45dB
+```
+
+That recipe does not trim the end of a file. A positive `stop_periods` does not mean "trim the tail" — it means "stop copying at the Nth silence", and FFmpeg then discards everything after that point. Measured on a 3.5-second test file (1 s of silence, 0.5 s of tone, a 0.5 s pause, 0.5 s of tone, 1 s of silence), that recipe returns **0.82 seconds**: it cut the file at the pause and threw the second half away. A negative `stop_periods` is no better — it deletes the pauses inside the line as well. Any voice-over take with a beat in the middle of it comes back mutilated, and nothing in the output says so.
+
+VOCAN therefore trims the tail the same way it trims the head: it reverses the stream, runs the same head trim again, and reverses back. Both ends get identical treatment, and neither pass ever looks past the first sound it finds, so pauses inside the line survive by construction. The same 3.5-second test file returns **1.5 seconds** — both bursts and the beat between them.
+
+**Why `start_silence`.** `start_duration=0.05` is the detection window: 50 ms of sound has to arrive before the filter accepts that the take has begun, so a single click above the threshold cannot anchor the trim. Without `start_silence`, FFmpeg *consumes* the audio it used to make that decision, and every take loses the first 50 ms of its own onset — on a plosive, that is the whole plosive. `start_silence=0.05` hands that window back. A file with no silence at either end comes through the trim sample for sample.
+
+**Where it runs.** With the Automixer off, the trim is the whole `-af` chain, and it is passed to the loudness measurement pass as well as to the encode — so the signal that is measured is the signal that is normalized. With the Automixer on, the trim rides at the head of the de-esser pass, before any Rust DSP step. That placement is deliberate: everything behind it (DeepFilterNet3, the expander, the spectral gate, the EQ, the temporary WAV file, and the two FFmpeg passes that read it back) then works on a shorter signal.
+
+`areverse` buffers the whole stream inside FFmpeg. For voice-over takes this costs nothing. It is worth knowing before pointing VOCAN at hour-long files with this option on.
+
+**Two notes on the interaction with other steps.** The noise floor estimate that feeds the expander is taken after the trim, so it describes the room tone between words rather than the dead air around the take. And the 3-second threshold that picks the first loudness measurement is read from the untrimmed length, because that is all a probe can report without an extra process; it only decides which measurement is tried first, and the padded pass behind it catches any file that turns out to be too short.
+
 ### Non-Automixer mode
 
-When Automixer is off, FFmpeg processes the file directly. FFmpeg applies only the loudness step or the peak-normalization step, then encodes the file. VOCAN does not run the Rust DSP modules. VOCAN does not create temporary files.
+When Automixer is off, FFmpeg processes the file directly. FFmpeg applies the silence trim, if it is on, and then only the loudness step or the peak-normalization step, then encodes the file. VOCAN does not run the Rust DSP modules. VOCAN does not create temporary files.
 
 ### Spectral Gate
 

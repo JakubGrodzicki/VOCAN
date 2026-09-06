@@ -39,6 +39,70 @@ fn post_deesser_filters() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Silence trimming
+// ---------------------------------------------------------------------------
+
+/// One `silenceremove`, configured to trim silence off the **head** of
+/// whatever stream reaches it. [`trim_silence_chain`] gets the tail by running
+/// it a second time over a reversed stream.
+///
+/// `start_duration=0.05` is the detection window: 50 ms of sound has to arrive
+/// before the filter accepts that the take has begun, so a single click above
+/// the threshold does not anchor the trim. `start_silence=0.05` is what hands
+/// that window back -- without it the filter *consumes* the audio it used to
+/// make the decision, and every take loses the first 50 ms of its own onset,
+/// which on a plosive is the whole plosive.
+const TRIM_HEAD_FILTER: &str =
+    "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-45dB:start_silence=0.05";
+
+/// Trims the silence in front of a take and behind it, and nothing in between.
+///
+/// The obvious way to write this is one `silenceremove` with both a start and a
+/// stop section -- the recipe that circulates for exactly this job:
+///
+/// ```text
+/// silenceremove=start_periods=1:start_duration=0.05:start_threshold=-45dB:
+///               stop_periods=1:stop_duration=0.35:stop_threshold=-45dB
+/// ```
+///
+/// It does not do this job. A positive `stop_periods` does not mean "trim the
+/// tail"; it means "stop copying at the Nth silence", and FFmpeg then drops
+/// everything after it. Measured on a 3.5 s fixture -- 1 s lead, 0.5 s tone,
+/// a 0.5 s pause, 0.5 s tone, 1 s tail -- that recipe returns 0.82 s: it cut
+/// the take at the pause and threw the second half away. Any voice-over line
+/// with a beat in the middle of it comes back mutilated, and nothing in the
+/// output says so.
+///
+/// So the tail is trimmed the way the head is, on a reversed stream, and
+/// reversed back. Both ends get identical treatment, pauses inside the line are
+/// untouched by construction (neither pass ever looks past the first sound it
+/// finds), and the same 3.5 s fixture returns 1.5 s -- the two words and the
+/// beat between them.
+///
+/// `areverse` buffers the whole stream inside FFmpeg, which is the cost of
+/// doing this in one pass instead of two. For the takes this tool batches that
+/// is nothing; it is worth knowing before pointing VOCAN at hour-long files.
+fn trim_silence_chain() -> String {
+    format!("{TRIM_HEAD_FILTER},areverse,{TRIM_HEAD_FILTER},areverse")
+}
+
+/// Splices the silence trim onto the front of an FFmpeg filter chain, when it
+/// is switched on.
+///
+/// This is the whole implementation strategy of the option: the trim is never a
+/// pass of its own. It is spliced into the head of a chain that some other
+/// stage was going to build and run anyway, so switching it on costs no
+/// additional ffmpeg process and no additional read of the file --
+/// `tests/spawn_budget.rs` holds that to account.
+fn with_trim(trim: bool, chain: &str) -> String {
+    if trim {
+        format!("{},{}", trim_silence_chain(), chain)
+    } else {
+        chain.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Loudness normalization decision logic
 // ---------------------------------------------------------------------------
 
@@ -421,6 +485,10 @@ fn process_with_rust_dsp(
     // exists for the collective case -- `cores - 1` files that each fit but
     // together do not -- where the alternative is a failed allocation, which in
     // Rust aborts the process and loses the entire run.
+    //
+    // `probed_duration` is the untrimmed length even when the silence trim is
+    // on, so the request is an overestimate for trimmed files -- which is the
+    // direction a reservation is allowed to be wrong in.
     let memory_permit = memory::gate().acquire(
         memory::estimated_dsp_bytes(probed_duration, dsp_sr, opts.automixer_dfn3_dereverb),
         |msg| {
@@ -431,10 +499,20 @@ fn process_with_rust_dsp(
     );
 
     // 2+3. FFmpeg de-esser → stdout (f32le) → memory (no temp file)
+    //
+    // The silence trim rides at the head of this chain rather than at the end
+    // of the pipeline, for two reasons. It costs nothing here -- the pass
+    // already exists -- and everything downstream of it (the de-esser itself,
+    // DeepFilterNet3, the expander, the spectral gate, the EQ, the temp WAV,
+    // and the two ffmpeg passes that read it back) then runs over a shorter
+    // signal. A take that is one third leader and tail is one third cheaper to
+    // clean up. It also puts the trim on the same audio the non-Automixer path
+    // trims, so the option means one thing regardless of what else is on.
+    let first_pass_filter = with_trim(opts.trim_silence, &deesser_only_filter());
     let mut child = ffmpeg_cmd(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
-        .args(["-vn", "-af", &deesser_only_filter()])
+        .args(["-vn", "-af", &first_pass_filter])
         .args(["-ac", "1", "-ar", &dsp_sr.to_string()])
         .args(["-f", "f32le", "pipe:1"])
         .stdout(Stdio::piped())
@@ -476,6 +554,23 @@ fn process_with_rust_dsp(
     let status = status.context("FFmpeg de-esser wait failed")?;
     if !status.success() {
         return Err(anyhow!("FFmpeg de-esser pass failed: {}", stderr_text));
+    }
+
+    // Nothing came back. Every stage below tolerates an empty buffer, so
+    // without this the run would succeed and publish a valid, entirely empty
+    // audio file -- indistinguishable from a real conversion until something
+    // downstream plays it. Failing the file instead puts the reason in the log
+    // and leaves the destination untouched, which is the same bargain
+    // `run_encode` strikes with its scratch file.
+    if samples.is_empty() {
+        return Err(anyhow!(
+            "the file decoded to no audio at all{}",
+            if opts.trim_silence {
+                " -- with Trim silence on, this means every part of it sat below                  the -45 dB threshold"
+            } else {
+                ""
+            }
+        ));
     }
 
     // 4. Rust DSP
@@ -676,22 +771,46 @@ pub fn process_single_file(
     let mut cmd = ffmpeg_cmd(ffmpeg);
     cmd.args(["-y", "-hide_banner", "-i"]).arg(input).arg("-vn");
 
+    // This path builds no filter chain of its own, so the trim simply *is* the
+    // prefix -- the one every measurement pass and the encode already take.
+    // Passing it there rather than bolting it onto the encode alone is what
+    // keeps pass 1 and pass 2 looking at the same signal: measure the trimmed
+    // take, normalize the trimmed take.
+    let trim_chain = if opts.trim_silence {
+        Some(trim_silence_chain())
+    } else {
+        None
+    };
+    let trim_prefix = trim_chain.as_deref();
+
     let norm_result = if let Some(lufs) = opts.target_lufs {
         // One probe process yields both values; they come from the same stderr.
         let (probed_sr, probed_duration) = probe_input(input, ffmpeg);
         let source_sr = probed_sr.unwrap_or(44100);
+        // The *untrimmed* duration, which is all a probe can report without a
+        // process of its own. It only picks which measurement is attempted
+        // first, and it errs the safe way: a take that falls under 3s once
+        // trimmed still gets the standard pass tried on it, and if that pass
+        // comes back -inf or unparseable -- which is exactly what too-short
+        // material produces -- the padded pass behind it catches the file.
         let duration = probed_duration.unwrap_or(0.0);
         let decision = measure_and_decide_normalization(
             input,
             ffmpeg,
             lufs,
             duration,
-            None,
+            trim_prefix,
             opts.target_peak_dbfs,
             opts.log.as_ref(),
         );
-        apply_norm_decision(&mut cmd, &decision, lufs, source_sr, None)
+        apply_norm_decision(&mut cmd, &decision, lufs, source_sr, trim_prefix)
     } else {
+        // No normalization to hang the filter off, so the trim is the only
+        // thing in `-af`. Still no `-ar`: this path never resampled, so there
+        // is no source rate to restore.
+        if let Some(trim) = trim_prefix {
+            cmd.args(["-af", trim]);
+        }
         NormResult::Skipped
     };
 
@@ -873,6 +992,97 @@ mod tests {
         );
         assert_eq!(result, NormResult::Skipped);
         assert_eq!(args_of(&cmd), vec!["-af", "highpass=f=70", "-ar", "44100"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Silence trim
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn trim_chain_never_uses_stop_periods() {
+        // The reason this feature is a reversed pair of head trims rather than
+        // the one-filter recipe everybody reaches for. A positive
+        // `stop_periods` truncates the take at its first internal pause; a
+        // negative one deletes the pauses. Neither is "trim the ends", and
+        // both destroy a voice-over line's timing. If this assertion ever
+        // starts failing, the chain has been rewritten into one of them.
+        let chain = trim_silence_chain();
+        assert!(!chain.contains("stop_periods"), "{chain}");
+    }
+
+    #[test]
+    fn trim_chain_trims_both_ends_symmetrically() {
+        // Two head trims around a reversal, then reversed back: the tail is
+        // trimmed by exactly the code path that trims the head, so the two
+        // ends cannot drift apart in behaviour.
+        let chain = trim_silence_chain();
+        assert_eq!(chain.matches(TRIM_HEAD_FILTER).count(), 2, "{chain}");
+        assert_eq!(chain.matches("areverse").count(), 2, "{chain}");
+        assert_eq!(
+            chain,
+            format!("{TRIM_HEAD_FILTER},areverse,{TRIM_HEAD_FILTER},areverse")
+        );
+    }
+
+    #[test]
+    fn trim_chain_hands_back_the_audio_its_detection_window_consumed() {
+        // `start_duration` without a matching `start_silence` eats the first
+        // 50 ms of every take -- the onset of the first word.
+        assert!(TRIM_HEAD_FILTER.contains("start_duration=0.05"));
+        assert!(TRIM_HEAD_FILTER.contains("start_silence=0.05"));
+        assert!(TRIM_HEAD_FILTER.contains("start_threshold=-45dB"));
+    }
+
+    #[test]
+    fn trim_chain_is_a_single_ffmpeg_argument() {
+        // It is handed to ffmpeg as one `-af` value and spliced into
+        // comma-joined chains. A newline surviving from the line continuation
+        // in the constant would make ffmpeg reject the whole chain.
+        let chain = trim_silence_chain();
+        assert!(!chain.chars().any(char::is_whitespace), "{chain}");
+    }
+
+    #[test]
+    fn with_trim_puts_the_trim_ahead_of_the_chain_it_joins() {
+        // Order is the optimization: everything after the trim -- the de-esser
+        // here, and every Rust DSP stage behind it -- processes the shortened
+        // signal.
+        assert_eq!(
+            with_trim(true, "deesser=i=0.4"),
+            format!("{},deesser=i=0.4", trim_silence_chain())
+        );
+    }
+
+    #[test]
+    fn with_trim_leaves_the_chain_byte_identical_when_off() {
+        // Off has to mean "not in the command line at all", not "a no-op
+        // filter": the default configuration must produce exactly the ffmpeg
+        // invocation it produced before this option existed.
+        assert_eq!(with_trim(false, "deesser=i=0.4"), "deesser=i=0.4");
+    }
+
+    #[test]
+    fn trim_reaches_the_encode_in_front_of_the_normalization_filter() {
+        // The trim travels as the `prefix` that pass 1 and pass 2 both take,
+        // so the signal that was measured is the signal that gets normalized.
+        let chain = trim_silence_chain();
+        let mut cmd = Command::new("ffmpeg");
+        apply_norm_decision(
+            &mut cmd,
+            &NormDecision::Peak { gain_db: 2.0 },
+            -16.0,
+            44100,
+            Some(&chain),
+        );
+        assert_eq!(
+            args_of(&cmd),
+            vec![
+                "-af".to_string(),
+                format!("{chain},volume=2.0000dB"),
+                "-ar".to_string(),
+                "44100".to_string(),
+            ]
+        );
     }
 
     // -----------------------------------------------------------------------

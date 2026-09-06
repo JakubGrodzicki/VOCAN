@@ -49,6 +49,104 @@ impl ReductionProfile {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Silence Trim Presets
+// ---------------------------------------------------------------------------
+
+/// What counts as silence when trimming the ends of a take.
+///
+/// There is no free-form dB entry here, for the same reason the expander has
+/// none: the number is only meaningful relative to a given recording's own
+/// noise floor, which nobody can read off a waveform by eye. Set it too low and
+/// the trim silently does nothing; too high and it eats the first word. Four
+/// presets, ordered by how much they risk, is a question a user can answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SilenceThreshold {
+    /// -60.0 dB — only silence close to digital zero. On a real room
+    /// recording this often trims nothing at all, which is the safe way to be
+    /// wrong.
+    Safe,
+    /// -45.0 dB — balanced default, right for clean studio material.
+    #[default]
+    Recommended,
+    /// -32.0 dB — copes with an untreated room; can eat a quiet breath.
+    Hard,
+    /// -21.0 dB — outlier; cuts quiet consonants and the tails of words.
+    Max,
+}
+
+impl SilenceThreshold {
+    /// Returns the threshold in dB below which audio is treated as silence.
+    pub fn db(self) -> f32 {
+        match self {
+            Self::Safe => -60.0,
+            Self::Recommended => -45.0,
+            Self::Hard => -32.0,
+            Self::Max => -21.0,
+        }
+    }
+
+    /// Human-readable label for the UI dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Safe => "Safe (-60 dB)",
+            Self::Recommended => "Recommended (-45 dB)",
+            Self::Hard => "Hard (-32 dB)",
+            Self::Max => "MAX (-21 dB)",
+        }
+    }
+
+    /// All variants in dropdown order.
+    pub fn all() -> &'static [SilenceThreshold] {
+        &[Self::Safe, Self::Recommended, Self::Hard, Self::Max]
+    }
+}
+
+/// How much of the original silence to leave at each end of a trimmed take.
+///
+/// A ceiling, not a target. The filter keeps *up to* this much of the silence
+/// that was already in the file and never manufactures any, so a take carrying
+/// 0.3 s of lead-in keeps 0.3 s even on [`Self::Long`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SilencePad {
+    /// 0 ms — cut at the first and last sample above the threshold.
+    #[default]
+    Tight,
+    /// 0.25 s.
+    Short,
+    /// 0.5 s.
+    Medium,
+    /// 1 s.
+    Long,
+}
+
+impl SilencePad {
+    /// Returns the amount of silence kept at each end, in seconds.
+    pub fn secs(self) -> f32 {
+        match self {
+            Self::Tight => 0.0,
+            Self::Short => 0.25,
+            Self::Medium => 0.5,
+            Self::Long => 1.0,
+        }
+    }
+
+    /// Human-readable label for the UI dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tight => "Tight (0 ms)",
+            Self::Short => "Short (0.25 s)",
+            Self::Medium => "Medium (0.5 s)",
+            Self::Long => "Long (1 s)",
+        }
+    }
+
+    /// All variants in dropdown order.
+    pub fn all() -> &'static [SilencePad] {
+        &[Self::Tight, Self::Short, Self::Medium, Self::Long]
+    }
+}
+
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct LoudnormStats {
     pub input_i: String,
@@ -196,6 +294,11 @@ pub struct ProcessingOptions {
     /// extra pass, and it works with the automixer on or off. See
     /// `crate::processing::trim_silence_chain`.
     pub trim_silence: bool,
+    /// What counts as silence for the trim. Ignored when `trim_silence` is off.
+    pub trim_silence_threshold: SilenceThreshold,
+    /// How much of the original silence the trim leaves at each end. Ignored
+    /// when `trim_silence` is off.
+    pub trim_silence_pad: SilencePad,
     pub output_format: OutputFormat,
     /// Bitrate in kbps for lossy formats (MP3, OGG). Ignored for lossless.
     pub bitrate_kbps: u32,
@@ -230,6 +333,8 @@ impl Default for ProcessingOptions {
             automixer_expander_safety_pct: 50.0,
             automixer_expander_reduction_profile: ReductionProfile::Recommended,
             trim_silence: false,
+            trim_silence_threshold: SilenceThreshold::Recommended,
+            trim_silence_pad: SilencePad::Tight,
             output_format: OutputFormat::AdpcmWav,
             bitrate_kbps: 128,
             log: None,
@@ -267,6 +372,71 @@ mod tests {
     #[test]
     fn reduction_profile_default_is_recommended() {
         assert_eq!(ReductionProfile::default(), ReductionProfile::Recommended);
+    }
+
+    #[test]
+    fn silence_threshold_db_matches_documented_values() {
+        assert_eq!(SilenceThreshold::Safe.db(), -60.0);
+        assert_eq!(SilenceThreshold::Recommended.db(), -45.0);
+        assert_eq!(SilenceThreshold::Hard.db(), -32.0);
+        assert_eq!(SilenceThreshold::Max.db(), -21.0);
+    }
+
+    #[test]
+    fn silence_threshold_is_ordered_from_least_to_most_aggressive() {
+        // The dropdown is a risk ladder, and the UI warns on the last rung.
+        // A variant reordered into the wrong slot would put the warning on the
+        // wrong preset without breaking anything else.
+        let dbs: Vec<f32> = SilenceThreshold::all().iter().map(|t| t.db()).collect();
+        assert!(dbs.windows(2).all(|w| w[0] < w[1]), "{dbs:?}");
+        assert_eq!(SilenceThreshold::all().last(), Some(&SilenceThreshold::Max));
+    }
+
+    #[test]
+    fn silence_threshold_all_lists_every_variant_once() {
+        assert_eq!(
+            SilenceThreshold::all(),
+            &[
+                SilenceThreshold::Safe,
+                SilenceThreshold::Recommended,
+                SilenceThreshold::Hard,
+                SilenceThreshold::Max,
+            ]
+        );
+    }
+
+    #[test]
+    fn silence_threshold_default_is_recommended() {
+        assert_eq!(SilenceThreshold::default(), SilenceThreshold::Recommended);
+    }
+
+    #[test]
+    fn silence_pad_secs_matches_documented_values() {
+        assert_eq!(SilencePad::Tight.secs(), 0.0);
+        assert_eq!(SilencePad::Short.secs(), 0.25);
+        assert_eq!(SilencePad::Medium.secs(), 0.5);
+        assert_eq!(SilencePad::Long.secs(), 1.0);
+    }
+
+    #[test]
+    fn silence_pad_all_lists_every_variant_once() {
+        assert_eq!(
+            SilencePad::all(),
+            &[
+                SilencePad::Tight,
+                SilencePad::Short,
+                SilencePad::Medium,
+                SilencePad::Long,
+            ]
+        );
+    }
+
+    #[test]
+    fn silence_pad_default_is_tight() {
+        // Tight reproduces the behaviour that shipped before the presets
+        // existed, so the default cannot silently change anyone's output.
+        assert_eq!(SilencePad::default(), SilencePad::Tight);
+        assert_eq!(SilencePad::default().secs(), 0.0);
     }
 
     #[test]

@@ -10,7 +10,10 @@ use crate::ffmpeg::{
 };
 use crate::memory;
 use crate::proc::{self, output_supervised};
-use crate::types::{AppMsg, LoudnormStats, NormResult, OutputFormat, ProcessingOptions};
+use crate::types::{
+    AppMsg, LoudnormStats, NormResult, OutputFormat, ProcessingOptions, SilencePad,
+    SilenceThreshold,
+};
 
 // ---------------------------------------------------------------------------
 // Automixer filter chains
@@ -48,12 +51,28 @@ fn post_deesser_filters() -> String {
 ///
 /// `start_duration=0.05` is the detection window: 50 ms of sound has to arrive
 /// before the filter accepts that the take has begun, so a single click above
-/// the threshold does not anchor the trim. `start_silence=0.05` is what hands
-/// that window back -- without it the filter *consumes* the audio it used to
-/// make the decision, and every take loses the first 50 ms of its own onset,
-/// which on a plosive is the whole plosive.
-const TRIM_HEAD_FILTER: &str =
-    "silenceremove=start_periods=1:start_duration=0.05:start_threshold=-45dB:start_silence=0.05";
+/// the threshold does not anchor the trim. `start_silence` is what hands that
+/// window back -- without it the filter *consumes* the audio it used to make
+/// the decision, and every take loses the first 50 ms of its own onset, which
+/// on a plosive is the whole plosive. So the floor is 0.05, matching the
+/// detection window; whatever [`SilencePad`] asks for is kept on top of it, and
+/// `SilencePad::Tight` (0.0) is therefore an exact cut rather than a 50 ms bite.
+fn trim_head_filter(threshold: SilenceThreshold, pad: SilencePad) -> String {
+    // One literal on one line, deliberately: a `\` line continuation here is
+    // one careless reformat away from becoming real whitespace in the middle
+    // of the filter string, which ffmpeg rejects. `trim_chain_is_a_single_
+    // ffmpeg_argument` catches that, and this is the shape that never trips it.
+    format!(
+        "silenceremove=start_periods=1:start_duration={:.2}:start_threshold={:.0}dB:start_silence={:.2}",
+        DETECTION_WINDOW_SECS,
+        threshold.db(),
+        DETECTION_WINDOW_SECS + pad.secs(),
+    )
+}
+
+/// The `start_duration` above, in seconds, and so also the `start_silence`
+/// floor that cancels it out.
+const DETECTION_WINDOW_SECS: f32 = 0.05;
 
 /// Trims the silence in front of a take and behind it, and nothing in between.
 ///
@@ -82,24 +101,19 @@ const TRIM_HEAD_FILTER: &str =
 /// `areverse` buffers the whole stream inside FFmpeg, which is the cost of
 /// doing this in one pass instead of two. For the takes this tool batches that
 /// is nothing; it is worth knowing before pointing VOCAN at hour-long files.
-fn trim_silence_chain() -> String {
-    format!("{TRIM_HEAD_FILTER},areverse,{TRIM_HEAD_FILTER},areverse")
+fn trim_silence_chain(threshold: SilenceThreshold, pad: SilencePad) -> String {
+    let head = trim_head_filter(threshold, pad);
+    format!("{head},areverse,{head},areverse")
 }
 
-/// Splices the silence trim onto the front of an FFmpeg filter chain, when it
-/// is switched on.
+/// The trim chain for these options, or `None` when the option is off.
 ///
-/// This is the whole implementation strategy of the option: the trim is never a
-/// pass of its own. It is spliced into the head of a chain that some other
-/// stage was going to build and run anyway, so switching it on costs no
-/// additional ffmpeg process and no additional read of the file --
-/// `tests/spawn_budget.rs` holds that to account.
-fn with_trim(trim: bool, chain: &str) -> String {
-    if trim {
-        format!("{},{}", trim_silence_chain(), chain)
-    } else {
-        chain.to_string()
-    }
+/// `None` has to mean "not in the command line at all" rather than "a no-op
+/// filter": with the trim switched off, VOCAN must produce exactly the ffmpeg
+/// invocation it produced before this option existed.
+fn trim_chain_for(opts: &ProcessingOptions) -> Option<String> {
+    opts.trim_silence
+        .then(|| trim_silence_chain(opts.trim_silence_threshold, opts.trim_silence_pad))
 }
 
 // ---------------------------------------------------------------------------
@@ -500,19 +514,17 @@ fn process_with_rust_dsp(
 
     // 2+3. FFmpeg de-esser → stdout (f32le) → memory (no temp file)
     //
-    // The silence trim rides at the head of this chain rather than at the end
-    // of the pipeline, for two reasons. It costs nothing here -- the pass
-    // already exists -- and everything downstream of it (the de-esser itself,
-    // DeepFilterNet3, the expander, the spectral gate, the EQ, the temp WAV,
-    // and the two ffmpeg passes that read it back) then runs over a shorter
-    // signal. A take that is one third leader and tail is one third cheaper to
-    // clean up. It also puts the trim on the same audio the non-Automixer path
-    // trims, so the option means one thing regardless of what else is on.
-    let first_pass_filter = with_trim(opts.trim_silence, &deesser_only_filter());
+    // No silence trim here: with the Automixer on, the trim runs at the *end*
+    // of the chain instead (see step 6). Trimming first would be cheaper --
+    // every stage below would see a shorter signal -- but it would ask the
+    // threshold to tell speech from silence on the noisiest version of the
+    // audio that exists, before dereverb, the expander and the gate have taken
+    // the noise out. On an untreated room that is exactly when the trim finds
+    // no silence at all and does nothing.
     let mut child = ffmpeg_cmd(ffmpeg)
         .args(["-y", "-hide_banner", "-i"])
         .arg(input)
-        .args(["-vn", "-af", &first_pass_filter])
+        .args(["-vn", "-af", &deesser_only_filter()])
         .args(["-ac", "1", "-ar", &dsp_sr.to_string()])
         .args(["-f", "f32le", "pipe:1"])
         .stdout(Stdio::piped())
@@ -563,14 +575,7 @@ fn process_with_rust_dsp(
     // and leaves the destination untouched, which is the same bargain
     // `run_encode` strikes with its scratch file.
     if samples.is_empty() {
-        return Err(anyhow!(
-            "the file decoded to no audio at all{}",
-            if opts.trim_silence {
-                " -- with Trim silence on, this means every part of it sat below                  the -45 dB threshold"
-            } else {
-                ""
-            }
-        ));
+        return Err(anyhow!("the file decoded to no audio at all"));
     }
 
     // 4. Rust DSP
@@ -652,6 +657,43 @@ fn process_with_rust_dsp(
     // Voice EQ always at 50% strength — LAST in the chain (in-place)
     audio_effects::apply_voice_eq_inplace(&mut processed, dsp_sr, 1, 0.5)?;
 
+    // The trim runs in step 6, downstream of this buffer, so a take that is
+    // entirely below the threshold would be cut down to nothing there -- and a
+    // valid, empty audio file at the destination looks exactly like a
+    // successful conversion until somebody plays it. The buffer is still in
+    // memory and already hot, so one more O(n) pass over it costs nothing next
+    // to the DSP that just ran, and it is the last point at which we can see
+    // the signal at all.
+    //
+    // The check is deliberately one-sided. `post_deesser_filters()` sits
+    // between this buffer and the trim and can only make a low-level signal
+    // louder -- `acompressor` makeup is +4 dB, the 1350 Hz band +1.4 dB, the
+    // 8 kHz shelf +1 dB -- so the margin below covers all of it and then some.
+    // Being wrong in the other direction would reject a file that had a
+    // perfectly good take in it, which is far worse than writing an empty one.
+    if let Some(threshold) = opts.trim_silence.then(|| opts.trim_silence_threshold.db()) {
+        /// Headroom for everything `post_deesser_filters()` can add.
+        const POST_FILTER_GAIN_MARGIN_DB: f32 = 8.0;
+
+        let peak = processed.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let peak_db = if peak > 0.0 {
+            20.0 * peak.log10()
+        } else {
+            f32::NEG_INFINITY
+        };
+        if peak_db + POST_FILTER_GAIN_MARGIN_DB < threshold {
+            return Err(anyhow!(
+                "nothing in this file reaches the Trim silence threshold ({:.0} dB),                  so trimming would leave an empty file. Its loudest moment is {}.                  Lower the threshold, or check the take.",
+                threshold,
+                if peak_db.is_finite() {
+                    format!("{peak_db:.1} dB")
+                } else {
+                    "digital silence".to_string()
+                }
+            ));
+        }
+    }
+
     // 5. Write processed samples to a temp WAV file using hound.
     //    This file is used for BOTH loudnorm pass-1 measurement AND as the
     //    input to the final FFmpeg encoding pass, ensuring the signal measured
@@ -694,13 +736,25 @@ fn process_with_rust_dsp(
         .arg(&temp_wav_path)
         .arg("-vn");
 
-    let post_filters = post_deesser_filters();
+    // The silence trim goes last, behind the whole clean-up chain, so the
+    // threshold judges the signal after dereverb, the expander and the gate
+    // have taken the noise out of it -- the version where quiet actually means
+    // quiet. Appending it to `post_filters` rather than to any one command is
+    // what keeps that honest: this one string is what the pass-1 measurement
+    // reads, what pass 2 encodes, and what the un-normalized branch below
+    // uses, so all three see the same trimmed audio by construction.
+    let post_filters = match trim_chain_for(opts) {
+        Some(trim) => format!("{},{}", post_deesser_filters(), trim),
+        None => post_deesser_filters(),
+    };
 
     // Normalization and encoding — stats measured on the PROCESSED temp WAV.
     let norm_result = if let Some(lufs) = opts.target_lufs {
         // We wrote this WAV ourselves one step above, so its duration is known
         // exactly -- shelling out to FFmpeg just to re-measure it would be a
-        // whole extra process per file.
+        // whole extra process per file. It is the length *before* the trim,
+        // which only picks which measurement is attempted first; see the same
+        // note on the non-Automixer path for why that errs safely.
         let duration = processed_len as f32 / dsp_sr as f32;
         let decision = measure_and_decide_normalization(
             &temp_wav_path,
@@ -776,11 +830,12 @@ pub fn process_single_file(
     // Passing it there rather than bolting it onto the encode alone is what
     // keeps pass 1 and pass 2 looking at the same signal: measure the trimmed
     // take, normalize the trimmed take.
-    let trim_chain = if opts.trim_silence {
-        Some(trim_silence_chain())
-    } else {
-        None
-    };
+    //
+    // There is no clean-up chain here for the trim to sit behind, so the
+    // threshold meets the raw recording. That is the case the presets exist
+    // for: on an untreated room, Recommended can find no silence at all and
+    // Hard is the answer.
+    let trim_chain = trim_chain_for(opts);
     let trim_prefix = trim_chain.as_deref();
 
     let norm_result = if let Some(lufs) = opts.target_lufs {
@@ -998,6 +1053,10 @@ mod tests {
     // Silence trim
     // -----------------------------------------------------------------------
 
+    fn default_chain() -> String {
+        trim_silence_chain(SilenceThreshold::Recommended, SilencePad::Tight)
+    }
+
     #[test]
     fn trim_chain_never_uses_stop_periods() {
         // The reason this feature is a reversed pair of head trims rather than
@@ -1006,8 +1065,12 @@ mod tests {
         // negative one deletes the pauses. Neither is "trim the ends", and
         // both destroy a voice-over line's timing. If this assertion ever
         // starts failing, the chain has been rewritten into one of them.
-        let chain = trim_silence_chain();
-        assert!(!chain.contains("stop_periods"), "{chain}");
+        for &t in SilenceThreshold::all() {
+            for &p in SilencePad::all() {
+                let chain = trim_silence_chain(t, p);
+                assert!(!chain.contains("stop_periods"), "{t:?}/{p:?}: {chain}");
+            }
+        }
     }
 
     #[test]
@@ -1015,57 +1078,106 @@ mod tests {
         // Two head trims around a reversal, then reversed back: the tail is
         // trimmed by exactly the code path that trims the head, so the two
         // ends cannot drift apart in behaviour.
-        let chain = trim_silence_chain();
-        assert_eq!(chain.matches(TRIM_HEAD_FILTER).count(), 2, "{chain}");
+        let head = trim_head_filter(SilenceThreshold::Recommended, SilencePad::Tight);
+        let chain = default_chain();
+        assert_eq!(chain.matches(head.as_str()).count(), 2, "{chain}");
         assert_eq!(chain.matches("areverse").count(), 2, "{chain}");
-        assert_eq!(
-            chain,
-            format!("{TRIM_HEAD_FILTER},areverse,{TRIM_HEAD_FILTER},areverse")
-        );
+        assert_eq!(chain, format!("{head},areverse,{head},areverse"));
     }
 
     #[test]
-    fn trim_chain_hands_back_the_audio_its_detection_window_consumed() {
-        // `start_duration` without a matching `start_silence` eats the first
-        // 50 ms of every take -- the onset of the first word.
-        assert!(TRIM_HEAD_FILTER.contains("start_duration=0.05"));
-        assert!(TRIM_HEAD_FILTER.contains("start_silence=0.05"));
-        assert!(TRIM_HEAD_FILTER.contains("start_threshold=-45dB"));
+    fn every_threshold_preset_reaches_the_filter() {
+        let cases = [
+            (SilenceThreshold::Safe, "start_threshold=-60dB"),
+            (SilenceThreshold::Recommended, "start_threshold=-45dB"),
+            (SilenceThreshold::Hard, "start_threshold=-32dB"),
+            (SilenceThreshold::Max, "start_threshold=-21dB"),
+        ];
+        for (threshold, expected) in cases {
+            let filter = trim_head_filter(threshold, SilencePad::Tight);
+            assert!(filter.contains(expected), "{threshold:?}: {filter}");
+        }
+    }
+
+    #[test]
+    fn every_pad_preset_lands_on_top_of_the_detection_window() {
+        // `start_silence` is the detection window plus whatever the preset
+        // asks to keep. Tight is therefore 0.05 and not 0.0: it cancels the
+        // window out to an exact cut, rather than biting 50 ms off the onset.
+        let cases = [
+            (SilencePad::Tight, "start_silence=0.05"),
+            (SilencePad::Short, "start_silence=0.30"),
+            (SilencePad::Medium, "start_silence=0.55"),
+            (SilencePad::Long, "start_silence=1.05"),
+        ];
+        for (pad, expected) in cases {
+            let filter = trim_head_filter(SilenceThreshold::Recommended, pad);
+            assert!(filter.contains(expected), "{pad:?}: {filter}");
+        }
     }
 
     #[test]
     fn trim_chain_is_a_single_ffmpeg_argument() {
         // It is handed to ffmpeg as one `-af` value and spliced into
         // comma-joined chains. A newline surviving from the line continuation
-        // in the constant would make ffmpeg reject the whole chain.
-        let chain = trim_silence_chain();
-        assert!(!chain.chars().any(char::is_whitespace), "{chain}");
+        // in the builder would make ffmpeg reject the whole chain.
+        for &t in SilenceThreshold::all() {
+            for &p in SilencePad::all() {
+                let chain = trim_silence_chain(t, p);
+                assert!(!chain.chars().any(char::is_whitespace), "{chain}");
+            }
+        }
     }
 
     #[test]
-    fn with_trim_puts_the_trim_ahead_of_the_chain_it_joins() {
-        // Order is the optimization: everything after the trim -- the de-esser
-        // here, and every Rust DSP stage behind it -- processes the shortened
-        // signal.
+    fn trim_chain_is_absent_entirely_when_the_option_is_off() {
+        // Off has to mean "not in the command line at all", not "a no-op
+        // filter": the default configuration must produce exactly the ffmpeg
+        // invocation it produced before this option existed.
+        let opts = ProcessingOptions::default();
+        assert!(!opts.trim_silence);
+        assert_eq!(trim_chain_for(&opts), None);
+    }
+
+    #[test]
+    fn trim_chain_is_built_from_the_options_when_the_option_is_on() {
+        let opts = ProcessingOptions {
+            trim_silence: true,
+            trim_silence_threshold: SilenceThreshold::Hard,
+            trim_silence_pad: SilencePad::Medium,
+            ..Default::default()
+        };
         assert_eq!(
-            with_trim(true, "deesser=i=0.4"),
-            format!("{},deesser=i=0.4", trim_silence_chain())
+            trim_chain_for(&opts).as_deref(),
+            Some(trim_silence_chain(SilenceThreshold::Hard, SilencePad::Medium).as_str())
         );
     }
 
     #[test]
-    fn with_trim_leaves_the_chain_byte_identical_when_off() {
-        // Off has to mean "not in the command line at all", not "a no-op
-        // filter": the default configuration must produce exactly the ffmpeg
-        // invocation it produced before this option existed.
-        assert_eq!(with_trim(false, "deesser=i=0.4"), "deesser=i=0.4");
+    fn the_automixer_chain_puts_the_trim_behind_the_whole_clean_up() {
+        // The point of the whole arrangement: with Clean up on, the threshold
+        // judges the signal *after* dereverb, the expander and the gate have
+        // taken the noise out. Composed here the way `process_with_rust_dsp`
+        // composes it, so this fails if that order is ever flipped.
+        let opts = ProcessingOptions {
+            trim_silence: true,
+            ..Default::default()
+        };
+        let trim = trim_chain_for(&opts).unwrap();
+        let chain = format!("{},{}", post_deesser_filters(), trim);
+
+        let post_at = chain.find(&post_deesser_filters()).unwrap();
+        let trim_at = chain.find(&trim).unwrap();
+        assert!(post_at < trim_at, "the trim must come last: {chain}");
+        assert!(chain.ends_with(&trim));
     }
 
     #[test]
     fn trim_reaches_the_encode_in_front_of_the_normalization_filter() {
         // The trim travels as the `prefix` that pass 1 and pass 2 both take,
         // so the signal that was measured is the signal that gets normalized.
-        let chain = trim_silence_chain();
+        // Whatever else is in the prefix, loudnorm goes after all of it.
+        let chain = default_chain();
         let mut cmd = Command::new("ffmpeg");
         apply_norm_decision(
             &mut cmd,

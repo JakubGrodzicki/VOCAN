@@ -29,6 +29,93 @@ pub fn write_sine_wav(
     writer.finalize().expect("finalize wav");
 }
 
+/// Deterministic white-ish noise in [-1, 1), from a xorshift PRNG.
+///
+/// Seeded rather than random so a failing test fails the same way twice. The
+/// same generator the `audio_effects` unit tests use.
+#[allow(dead_code)]
+fn xorshift_noise(n: usize, amplitude: f32, seed: u32) -> Vec<f32> {
+    let mut state = seed.max(1);
+    (0..n)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            // Map to [-1, 1) before scaling.
+            ((state as f32 / u32::MAX as f32) * 2.0 - 1.0) * amplitude
+        })
+        .collect()
+}
+
+/// The same shape as [`write_take_with_pause_wav`], but the "silence" is a
+/// real noise floor at `noise_rms_dbfs` rather than digital zero.
+///
+/// Required to test the silence threshold at all: on digital silence every
+/// preset behaves identically, because every preset is above it. A floor at,
+/// say, -40 dBFS sits above the Recommended threshold (-45 dB) and below Hard
+/// (-32 dB), which is exactly the case the presets exist to handle.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn write_take_with_noise_floor_wav(
+    path: &Path,
+    lead: f32,
+    tone: f32,
+    gap: f32,
+    tail: f32,
+    sample_rate: u32,
+    freq_hz: f32,
+    amplitude: f32,
+    noise_rms_dbfs: f32,
+) {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+
+    let samples = |secs: f32| (sample_rate as f32 * secs) as usize;
+    let total = samples(lead) + samples(tone) * 2 + samples(gap) + samples(tail);
+    // One noise stream laid under the whole take, so the floor is continuous
+    // across the boundaries rather than restarting at each section.
+    // The floor is specified as RMS because that is what `silenceremove`
+    // measures. Uniform noise in [-A, A] has RMS A/sqrt(3), so the peak
+    // amplitude handed to the generator is the requested RMS scaled back up.
+    let noise = xorshift_noise(
+        total,
+        10f32.powf(noise_rms_dbfs / 20.0) * 3f32.sqrt(),
+        0x5EED,
+    );
+
+    let mut i = 0usize;
+    let mut phase = 0.0f32;
+    let step = 2.0 * std::f32::consts::PI * freq_hz / sample_rate as f32;
+    let write = |writer: &mut hound::WavWriter<_>,
+                 secs: f32,
+                 voiced: bool,
+                 i: &mut usize,
+                 phase: &mut f32| {
+        for _ in 0..samples(secs) {
+            let tone = if voiced {
+                *phase += step;
+                amplitude * phase.sin()
+            } else {
+                0.0
+            };
+            writer.write_sample(tone + noise[*i]).expect("write sample");
+            *i += 1;
+        }
+    };
+
+    write(&mut writer, lead, false, &mut i, &mut phase);
+    write(&mut writer, tone, true, &mut i, &mut phase);
+    write(&mut writer, gap, false, &mut i, &mut phase);
+    write(&mut writer, tone, true, &mut i, &mut phase);
+    write(&mut writer, tail, false, &mut i, &mut phase);
+    writer.finalize().expect("finalize wav");
+}
+
 /// Writes `lead` seconds of silence, then a tone, then a `gap` of silence,
 /// then the tone again, then `tail` seconds of silence.
 ///

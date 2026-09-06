@@ -29,6 +29,59 @@ pub fn write_sine_wav(
     writer.finalize().expect("finalize wav");
 }
 
+/// Writes `lead` seconds of silence, then a tone, then a `gap` of silence,
+/// then the tone again, then `tail` seconds of silence.
+///
+/// The shape of a real voice-over take: dead air either side of the line, and
+/// a beat in the middle of it that has to survive. A fixture with silence only
+/// at the ends cannot tell a head/tail trim apart from one that truncates the
+/// take at its first pause.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn write_take_with_pause_wav(
+    path: &Path,
+    lead: f32,
+    tone: f32,
+    gap: f32,
+    tail: f32,
+    sample_rate: u32,
+    freq_hz: f32,
+    amplitude: f32,
+) {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+    let samples = |secs: f32| (sample_rate as f32 * secs) as usize;
+    let write_silence = |writer: &mut hound::WavWriter<_>, secs: f32| {
+        for _ in 0..samples(secs) {
+            writer.write_sample(0.0f32).expect("write sample");
+        }
+    };
+    // Phase runs continuously across both tone bursts so neither starts or ends
+    // on a discontinuity that a level detector could read as a transient.
+    let mut phase = 0.0f32;
+    let write_tone = |writer: &mut hound::WavWriter<_>, secs: f32, phase: &mut f32| {
+        let step = 2.0 * std::f32::consts::PI * freq_hz / sample_rate as f32;
+        for _ in 0..samples(secs) {
+            writer
+                .write_sample(amplitude * phase.sin())
+                .expect("write sample");
+            *phase += step;
+        }
+    };
+
+    write_silence(&mut writer, lead);
+    write_tone(&mut writer, tone, &mut phase);
+    write_silence(&mut writer, gap);
+    write_tone(&mut writer, tone, &mut phase);
+    write_silence(&mut writer, tail);
+    writer.finalize().expect("finalize wav");
+}
+
 #[allow(dead_code)]
 pub fn write_silence_wav(path: &Path, duration_secs: f32, sample_rate: u32) {
     let spec = hound::WavSpec {

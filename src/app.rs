@@ -48,6 +48,13 @@ pub struct AudioBatchApp {
     automixer_expander_safety_pct: f32,
     /// Preset reduction depth (Safe/Recommended/Hard/Max).
     automixer_expander_reduction_profile: ReductionProfile,
+    /// Trims leading and trailing silence from every take.
+    ///
+    /// Not one of the automixer modules above and not gated by
+    /// [`Self::automixer`]: it is a single FFmpeg filter folded into a chain
+    /// the pipeline already runs, so it works on its own and the only thing
+    /// VOCAN insists on around it is the format conversion.
+    trim_silence: bool,
     /// Output format selector (ADPCM, PCM, FLAC, MP3, OGG).
     output_format: OutputFormat,
     /// Bitrate for lossy formats (MP3, OGG).
@@ -119,7 +126,8 @@ impl Section {
         match self {
             Self::Files => {
                 "Every audio file under the source folder is processed, and the folder tree is \
-                 recreated inside the output folder in the format chosen here."
+                 recreated inside the output folder in the format chosen here. Trimming the \
+                 silence off each take is here too \u{2014} it needs nothing from Clean up."
             }
             Self::CleanUp => {
                 "De-ess \u{2192} dereverb \u{2192} expand \u{2192} denoise \u{2192} voice EQ \
@@ -301,6 +309,7 @@ impl AudioBatchApp {
             automixer_expander: false,
             automixer_expander_safety_pct: 50.0,
             automixer_expander_reduction_profile: ReductionProfile::Recommended,
+            trim_silence: false,
             output_format: OutputFormat::default(),
             bitrate_kbps: 128,
             is_processing: false,
@@ -664,6 +673,7 @@ impl AudioBatchApp {
             automixer_expander: self.automixer_expander,
             automixer_expander_safety_pct: self.automixer_expander_safety_pct,
             automixer_expander_reduction_profile: self.automixer_expander_reduction_profile,
+            trim_silence: self.trim_silence,
             output_format: self.output_format,
             bitrate_kbps: self.bitrate_kbps,
             log: Some(self.sender.clone()),
@@ -956,10 +966,15 @@ impl AudioBatchApp {
         if self.input_dir.is_empty() || self.output_dir.is_empty() {
             return ("not set".to_owned(), theme::AMBER);
         }
-        (
-            format_short(self.output_format, self.bitrate_kbps),
-            theme::TXT3,
-        )
+        let format = format_short(self.output_format, self.bitrate_kbps);
+        if self.trim_silence {
+            // The summary is clipped from the left when it outruns the gap
+            // beside the label, so the trim goes last: "Files" is a short
+            // label and leaves room, but if anything is ever lost here it
+            // should be the format, which the pane also states in full.
+            return (format!("{format} + trim"), theme::TXT3);
+        }
+        (format, theme::TXT3)
     }
 
     fn summary_cleanup(&self) -> (String, egui::Color32) {
@@ -1014,6 +1029,10 @@ impl AudioBatchApp {
         } else {
             "no normalization".to_owned()
         });
+
+        if self.trim_silence {
+            parts.push("trim silence".to_owned());
+        }
 
         if self.automixer {
             let mut modules: Vec<&str> = Vec::new();
@@ -1186,6 +1205,27 @@ impl AudioBatchApp {
                 "Highest compression, requires a verification for quality.",
             );
         }
+
+        ui.add_space(12.0);
+
+        // The trim lives here rather than in Clean up because it is not part of
+        // that chain and is not governed by that section's master switch --
+        // parked under a toggle it ignores, it would read as one more module
+        // that goes quiet when the toggle is off. Here it sits with the other
+        // things VOCAN does to every file no matter what else is configured.
+        //
+        // In the pipeline it still runs first, ahead of everything in Clean up.
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                widgets::check(ui, &mut self.trim_silence, "Trim silence");
+                ui.label(RichText::new("start and end").size(11.5).color(theme::TXT3));
+            });
+            indented_hint(
+                ui,
+                "Cuts the lead-in and the tail off every take at \u{2212}45 dB. Pauses inside \
+                 the line are kept. Needs nothing from Clean up.",
+            );
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -2131,6 +2171,7 @@ mod tests {
             automixer_expander,
             automixer_expander_safety_pct,
             automixer_expander_reduction_profile,
+            trim_silence,
             output_format,
             bitrate_kbps,
             log: _, // wired to the live UI channel, deliberately None by default
@@ -2154,6 +2195,7 @@ mod tests {
             automixer_expander_reduction_profile,
             d.automixer_expander_reduction_profile
         );
+        assert_eq!(trim_silence, d.trim_silence);
         assert_eq!(output_format, d.output_format);
         assert_eq!(bitrate_kbps, d.bitrate_kbps);
         assert!(ProcessingOptions::default().log.is_none());
@@ -2164,6 +2206,7 @@ mod tests {
         let app = test_app();
         assert!(!app.normalize_volume);
         assert!(!app.automixer);
+        assert!(!app.trim_silence);
         assert!(!app.is_processing);
         assert!(!app.is_analyzing);
         assert_eq!(app.average_lufs, None);

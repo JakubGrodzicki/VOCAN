@@ -188,6 +188,14 @@ pub struct ProcessingOptions {
     pub automixer_expander_safety_pct: f32,
     /// Preset reduction depth (Safe/Recommended/Hard/Max).
     pub automixer_expander_reduction_profile: ReductionProfile,
+    /// Trims leading and trailing silence from every file, via FFmpeg's
+    /// `silenceremove`.
+    ///
+    /// Deliberately **not** an automixer module: it is a filter folded into a
+    /// chain the pipeline already builds, so it costs no extra process and no
+    /// extra pass, and it works with the automixer on or off. See
+    /// `crate::processing::trim_silence_chain`.
+    pub trim_silence: bool,
     pub output_format: OutputFormat,
     /// Bitrate in kbps for lossy formats (MP3, OGG). Ignored for lossless.
     pub bitrate_kbps: u32,
@@ -221,6 +229,7 @@ impl Default for ProcessingOptions {
             automixer_expander: false,
             automixer_expander_safety_pct: 50.0,
             automixer_expander_reduction_profile: ReductionProfile::Recommended,
+            trim_silence: false,
             output_format: OutputFormat::AdpcmWav,
             bitrate_kbps: 128,
             log: None,

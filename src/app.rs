@@ -17,7 +17,10 @@ use crate::theme;
 // Aliased: every UI function here already has a local binding called `ui`, and
 // `widgets::card(ui, ..)` reads better than the (legal, but confusing)
 // `ui::card(ui, ..)`.
-use crate::types::{AppMsg, NormResult, OutputFormat, ProcessingOptions, ReductionProfile};
+use crate::types::{
+    AppMsg, NormResult, OutputFormat, ProcessingOptions, ReductionProfile, SilencePad,
+    SilenceThreshold,
+};
 use crate::ui as widgets;
 
 // ---------------------------------------------------------------------------
@@ -55,6 +58,10 @@ pub struct AudioBatchApp {
     /// the pipeline already runs, so it works on its own and the only thing
     /// VOCAN insists on around it is the format conversion.
     trim_silence: bool,
+    /// What counts as silence for the trim.
+    trim_silence_threshold: SilenceThreshold,
+    /// How much of the original silence the trim leaves at each end.
+    trim_silence_pad: SilencePad,
     /// Output format selector (ADPCM, PCM, FLAC, MP3, OGG).
     output_format: OutputFormat,
     /// Bitrate for lossy formats (MP3, OGG).
@@ -310,6 +317,8 @@ impl AudioBatchApp {
             automixer_expander_safety_pct: 50.0,
             automixer_expander_reduction_profile: ReductionProfile::Recommended,
             trim_silence: false,
+            trim_silence_threshold: SilenceThreshold::Recommended,
+            trim_silence_pad: SilencePad::Tight,
             output_format: OutputFormat::default(),
             bitrate_kbps: 128,
             is_processing: false,
@@ -674,6 +683,8 @@ impl AudioBatchApp {
             automixer_expander_safety_pct: self.automixer_expander_safety_pct,
             automixer_expander_reduction_profile: self.automixer_expander_reduction_profile,
             trim_silence: self.trim_silence,
+            trim_silence_threshold: self.trim_silence_threshold,
+            trim_silence_pad: self.trim_silence_pad,
             output_format: self.output_format,
             bitrate_kbps: self.bitrate_kbps,
             log: Some(self.sender.clone()),
@@ -1215,6 +1226,11 @@ impl AudioBatchApp {
         // things VOCAN does to every file no matter what else is configured.
         //
         // In the pipeline it still runs first, ahead of everything in Clean up.
+        let trim_w = label_col(
+            ui,
+            &["Silence below", "Keep"],
+            egui::FontId::new(12.5, egui::FontFamily::Proportional),
+        );
         widgets::card(ui, |ui| {
             ui.horizontal(|ui| {
                 widgets::check(ui, &mut self.trim_silence, "Trim silence");
@@ -1222,9 +1238,70 @@ impl AudioBatchApp {
             });
             indented_hint(
                 ui,
-                "Cuts the lead-in and the tail off every take at \u{2212}45 dB. Pauses inside \
-                 the line are kept. Needs nothing from Clean up.",
+                "Cuts the lead-in and the tail off every take. Pauses inside the line are \
+                 kept. Needs nothing from Clean up.",
             );
+
+            if !self.trim_silence {
+                return;
+            }
+
+            ui.add_space(11.0);
+            let selected = self.trim_silence_threshold.label();
+            combo_row(
+                ui,
+                "Silence below",
+                trim_w,
+                "trim_threshold",
+                selected,
+                |ui| {
+                    for &t in SilenceThreshold::all() {
+                        ui.selectable_value(&mut self.trim_silence_threshold, t, t.label());
+                    }
+                },
+            )
+            .on_hover_text(
+                "Anything quieter than this counts as silence.\n\
+                 Too low and a noisy room hides the silence entirely, so nothing is\n\
+                 trimmed; too high and quiet consonants go with it.\n\
+                 With Clean up on, the trim runs last, on the denoised signal.",
+            );
+
+            // The threshold's own risk warning. Mirrors the expander's notice
+            // on `ReductionProfile::Max` -- same shape, same reason.
+            if self.trim_silence_threshold == SilenceThreshold::Max {
+                ui.add_space(10.0);
+                widgets::notice(
+                    ui,
+                    "MAX (-21 dB) counts anything below a raised voice as silence \u{2014} it \
+                     will cut quiet consonants and the tails of words, not just the dead air.",
+                );
+            }
+
+            ui.add_space(11.0);
+            let selected = self.trim_silence_pad.label();
+            combo_row(ui, "Keep", trim_w, "trim_pad", selected, |ui| {
+                for &p in SilencePad::all() {
+                    ui.selectable_value(&mut self.trim_silence_pad, p, p.label());
+                }
+            })
+            .on_hover_text(
+                "How much of the original silence to leave at each end.\n\
+                 A ceiling, not a target: VOCAN keeps up to this much of the silence\n\
+                 that was already there and never adds any, so a take with 0.3 s of\n\
+                 lead-in keeps 0.3 s even on Long.",
+            );
+
+            if self.trim_silence_pad == SilencePad::Tight {
+                ui.add_space(10.0);
+                widgets::notice(
+                    ui,
+                    "Tight (0 ms) cuts at the first and last sample above the threshold, \
+                     leaving no breathing room at all. A plosive can sound clipped, and \
+                     some engines click on a file that starts mid-waveform. Pick 0.25 s \
+                     if you are not editing the results afterwards.",
+                );
+            }
         });
     }
 
@@ -1313,28 +1390,15 @@ impl AudioBatchApp {
                     );
 
                     ui.add_space(9.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(27.0);
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(w, 22.0),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.label(RichText::new("Reduction").size(12.5).color(theme::TXT2));
-                            },
-                        );
-                        let combo_w = ui.available_width();
-                        egui::ComboBox::from_id_source("reduction_profile")
-                            .width(combo_w - 8.0)
-                            .selected_text(self.automixer_expander_reduction_profile.label())
-                            .show_ui(ui, |ui| {
-                                for &profile in ReductionProfile::all() {
-                                    ui.selectable_value(
-                                        &mut self.automixer_expander_reduction_profile,
-                                        profile,
-                                        profile.label(),
-                                    );
-                                }
-                            });
+                    let selected = self.automixer_expander_reduction_profile.label();
+                    combo_row(ui, "Reduction", w, "reduction_profile", selected, |ui| {
+                        for &profile in ReductionProfile::all() {
+                            ui.selectable_value(
+                                &mut self.automixer_expander_reduction_profile,
+                                profile,
+                                profile.label(),
+                            );
+                        }
                     });
 
                     if self.automixer_expander_reduction_profile == ReductionProfile::Max {
@@ -1713,6 +1777,38 @@ fn path_row(ui: &mut egui::Ui, label: &str, label_w: f32, value: &mut String) {
 /// egui's own `Slider::text` puts the label after the track and the number
 /// before it, which reads backwards once there is more than one slider on
 /// screen: the numbers end up in a ragged column in the middle of the card.
+/// A labelled dropdown, indented and column-aligned to match [`slider_row`].
+///
+/// Three cards lay a `ComboBox` out this way -- the expander's reduction
+/// profile and both silence-trim presets -- and each was a dozen lines of
+/// `allocate_ui_with_layout` boilerplate wrapped around the two lines inside
+/// `show_ui` that actually differ.
+fn combo_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    label_w: f32,
+    id: &str,
+    selected: &str,
+    options: impl FnOnce(&mut egui::Ui),
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.add_space(27.0);
+        ui.allocate_ui_with_layout(
+            Vec2::new(label_w, 22.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.label(RichText::new(label).size(12.5).color(theme::TXT2));
+            },
+        );
+        let combo_w = ui.available_width();
+        egui::ComboBox::from_id_source(id)
+            .width(combo_w - 8.0)
+            .selected_text(selected)
+            .show_ui(ui, options);
+    })
+    .response
+}
+
 fn slider_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -2172,6 +2268,8 @@ mod tests {
             automixer_expander_safety_pct,
             automixer_expander_reduction_profile,
             trim_silence,
+            trim_silence_threshold,
+            trim_silence_pad,
             output_format,
             bitrate_kbps,
             log: _, // wired to the live UI channel, deliberately None by default
@@ -2196,6 +2294,8 @@ mod tests {
             d.automixer_expander_reduction_profile
         );
         assert_eq!(trim_silence, d.trim_silence);
+        assert_eq!(trim_silence_threshold, d.trim_silence_threshold);
+        assert_eq!(trim_silence_pad, d.trim_silence_pad);
         assert_eq!(output_format, d.output_format);
         assert_eq!(bitrate_kbps, d.bitrate_kbps);
         assert!(ProcessingOptions::default().log.is_none());

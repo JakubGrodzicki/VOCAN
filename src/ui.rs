@@ -8,8 +8,11 @@
 //! Everything in this module is drawing plus click handling. No widget here
 //! knows what the value it toggles means.
 
+use std::ops::RangeInclusive;
+
 use eframe::egui::{
-    self, Align2, Color32, FontId, Rect, Response, Rounding, Sense, Stroke, TextStyle, Ui, Vec2,
+    self, Align, Align2, Color32, FontId, Rect, Response, Rounding, Sense, Stroke, TextStyle, Ui,
+    Vec2,
 };
 
 use crate::theme;
@@ -234,39 +237,126 @@ pub fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
         });
 }
 
-/// A value read-out: monospace, boxed.
+/// A value read-out that can also be typed into: monospace, boxed.
 ///
-/// `min_width` keeps a column of chips the same width as their values change
-/// ("80%" next to "100%"); a value too wide for it grows the chip rather than
+/// Visually the box a slider's number sits in; functionally a text field, so a
+/// value that is awkward to land on by dragging -- -14.7 LUFS on a 17 dB
+/// track -- can simply be entered. `decimals` and `suffix` are how the number
+/// is rendered when the field is idle, so the caller no longer formats the
+/// read-out itself.
+///
+/// `min_width` keeps a column of fields the same width as their values change
+/// ("80%" next to "100%"); a value too wide for it grows the field rather than
 /// spilling out of it, which is what a font with wider digits would do.
-pub fn chip(ui: &mut Ui, text: &str, min_width: f32) {
+pub fn value_field(
+    ui: &mut Ui,
+    id_source: &str,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    decimals: usize,
+    suffix: &str,
+    min_width: f32,
+) -> Response {
+    let id = ui.make_persistent_id(id_source);
     let font = TextStyle::Monospace.resolve(ui.style());
+
+    // The edit buffer exists only while the field has focus. Re-deriving the
+    // text from `value` on a focused field would fight every keystroke -- "-1"
+    // rewritten to "-1.0" before the "4" of -14 is typed -- and on an unfocused
+    // one `value` is the only truth, so a slider drag needs nothing kept in
+    // step here.
+    let mut text = ui
+        .data_mut(|d| d.get_temp::<String>(id))
+        .unwrap_or_else(|| format!("{value:.decimals$}{suffix}"));
+
     let text_w = ui
         .painter()
-        .layout_no_wrap(text.to_owned(), font.clone(), theme::TXT)
+        .layout_no_wrap(text.clone(), font.clone(), theme::TXT)
         .size()
         .x;
     let width = min_width.max(text_w + 16.0);
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::hover());
+    let row_h = ui.fonts(|f| f.row_height(&font));
+    let pad_y = ((22.0 - row_h) / 2.0).max(0.0);
+
+    // Reserved up front so the box paints *behind* the text. Its outline says
+    // whether the field has focus, and that is only known once the TextEdit
+    // has run -- hence a placeholder now and the real shape after.
+    let box_shape = ui.painter().add(egui::Shape::Noop);
+
     let enabled = ui.is_enabled();
-    ui.painter()
-        .rect_filled(rect, Rounding::same(6.0), theme::INPUT);
-    ui.painter().rect_stroke(
-        rect,
-        Rounding::same(6.0),
-        Stroke::new(1.0, Color32::from_rgb(0x27, 0x2D, 0x33)),
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut text)
+            .id(id)
+            .font(TextStyle::Monospace)
+            .frame(false)
+            .margin(Vec2::new(4.0, pad_y))
+            .desired_width(width - 8.0)
+            .horizontal_align(Align::Center)
+            .vertical_align(Align::Center)
+            // Long enough for "-100.0", short enough that the field cannot
+            // grow far past the column the sliders were laid out around.
+            .char_limit(7)
+            .text_color(if enabled {
+                theme::TXT
+            } else {
+                theme::TXT.gamma_multiply(0.45)
+            }),
     );
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        text,
-        font,
-        if enabled {
-            theme::TXT
-        } else {
-            theme::TXT.gamma_multiply(0.45)
-        },
+
+    let focused = response.has_focus();
+    ui.painter().set(
+        box_shape,
+        egui::Shape::Vec(vec![
+            egui::Shape::rect_filled(response.rect, Rounding::same(6.0), theme::INPUT),
+            egui::Shape::rect_stroke(
+                response.rect,
+                Rounding::same(6.0),
+                Stroke::new(
+                    1.0,
+                    if focused {
+                        theme::AMBER
+                    } else {
+                        Color32::from_rgb(0x27, 0x2D, 0x33)
+                    },
+                ),
+            ),
+        ]),
     );
+
+    // Applied on every keystroke that parses, so the slider tracks the field
+    // as it is typed. Text that is not a number *yet* -- an empty field, a
+    // lone "-" -- is left alone to become one, rather than snapping the value
+    // to zero and dragging the slider to its floor mid-edit.
+    if response.changed() {
+        if let Some(parsed) = parse_number(&text) {
+            *value = parsed.clamp(*range.start(), *range.end());
+        }
+    }
+
+    if focused {
+        ui.data_mut(|d| d.insert_temp(id, text));
+    } else {
+        // Dropping the buffer is what re-formats the field: with nothing
+        // stored, next frame's text comes from `value` again -- rounded,
+        // clamped and with its unit back on.
+        ui.data_mut(|d| d.remove::<String>(id));
+    }
+
+    response
+}
+
+/// Reads a number out of whatever is in a [`value_field`], ignoring the unit.
+///
+/// The field shows its unit ("50%"), and select-all-then-retype is not the
+/// only way people edit: typing "5" in front of an existing "0%" has to keep
+/// working. Everything that is not part of a number is dropped, which also
+/// makes a pasted "-14.7 LUFS" land as -14.7.
+fn parse_number(text: &str) -> Option<f32> {
+    let digits: String = text
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+        .collect();
+    digits.parse().ok()
 }
 
 /// A small all-caps tag, for metadata like "compute heavy".
@@ -714,4 +804,32 @@ pub fn rail_group(ui: &mut Ui, text: &str) {
         FontId::new(10.0, egui::FontFamily::Proportional),
         Color32::from_rgb(0x56, 0x5F, 0x66),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_number_reads_a_value_through_its_unit() {
+        // What a `value_field` actually contains: the number plus whatever
+        // suffix the caller renders it with, and a pasted measurement from the
+        // loudness readout above it.
+        assert_eq!(parse_number("50%"), Some(50.0));
+        assert_eq!(parse_number("-3.0"), Some(-3.0));
+        assert_eq!(parse_number("-14.7 LUFS"), Some(-14.7));
+        assert_eq!(parse_number("  100  "), Some(100.0));
+    }
+
+    #[test]
+    fn parse_number_rejects_text_that_is_not_a_number_yet() {
+        // These are the states a field passes through mid-edit. Returning
+        // `Some(0.0)` for any of them would drag the slider to its floor
+        // between two keystrokes, which is why the caller needs `None`.
+        assert_eq!(parse_number(""), None);
+        assert_eq!(parse_number("-"), None);
+        assert_eq!(parse_number("%"), None);
+        assert_eq!(parse_number("."), None);
+        assert_eq!(parse_number("abc"), None);
+    }
 }

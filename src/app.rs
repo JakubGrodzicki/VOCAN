@@ -1335,14 +1335,14 @@ impl AudioBatchApp {
                 );
                 if self.automixer_dfn3_dereverb {
                     ui.add_space(11.0);
-                    let readout = format!("{:.0}%", self.automixer_dfn3_mix);
                     slider_row(
                         ui,
                         "Mix",
                         w,
                         &mut self.automixer_dfn3_mix,
                         0.0..=100.0,
-                        &readout,
+                        0,
+                        "%",
                     );
                     ui.add_space(9.0);
                     ui.horizontal(|ui| {
@@ -1373,14 +1373,14 @@ impl AudioBatchApp {
                 );
                 if self.automixer_expander {
                     ui.add_space(11.0);
-                    let readout = format!("{:.0}%", self.automixer_expander_safety_pct);
                     slider_row(
                         ui,
                         "Safety margin",
                         w,
                         &mut self.automixer_expander_safety_pct,
                         0.0..=100.0,
-                        &readout,
+                        0,
+                        "%",
                     )
                     .on_hover_text(
                         "Higher = safer, touches less material.\n\
@@ -1540,14 +1540,14 @@ impl AudioBatchApp {
                     &["Target LUFS-I", "Target peak"],
                     egui::FontId::new(12.5, egui::FontFamily::Proportional),
                 );
-                let readout = format!("{:.1}", self.target_lufs);
                 slider_row(
                     ui,
                     "Target LUFS-I",
                     w,
                     &mut self.target_lufs,
                     -23.0..=-6.0,
-                    &readout,
+                    1,
+                    "",
                 );
                 indented_hint(
                     ui,
@@ -1556,14 +1556,14 @@ impl AudioBatchApp {
 
                 ui.add_space(13.0);
 
-                let readout = format!("{:.1}", self.target_peak_dbfs);
                 slider_row(
                     ui,
                     "Target peak",
                     w,
                     &mut self.target_peak_dbfs,
-                    -12.0..=-1.0,
-                    &readout,
+                    -12.0..=0.0,
+                    1,
+                    "",
                 )
                 .on_hover_text(
                     "Peak normalization fallback, used only when EBU R128 loudness \
@@ -1575,6 +1575,17 @@ impl AudioBatchApp {
                     ui,
                     "dBFS fallback \u{b7} used only when the R128 measurement fails",
                 );
+
+                if self.target_peak_dbfs > -1.0 {
+                    ui.add_space(10.0);
+                    widgets::notice(
+                        ui,
+                        "Above -1 dBFS there is no headroom left. The sample peak lands \
+                         where you asked, but a lossy encoder or a resampler reconstructs \
+                         a waveform whose true peak sits higher, and that clips. 0 dBFS \
+                         is the top of the scale, not a safe target.",
+                    );
+                }
             });
         });
     }
@@ -1809,13 +1820,17 @@ fn combo_row(
     .response
 }
 
+/// The number is a [`widgets::value_field`] rather than a read-out, so the
+/// row can be driven from either end: drag the track, or type into the box.
+/// `decimals` and `suffix` describe how the value is written there.
 fn slider_row(
     ui: &mut egui::Ui,
     label: &str,
     label_w: f32,
     value: &mut f32,
     range: std::ops::RangeInclusive<f32>,
-    readout: &str,
+    decimals: usize,
+    suffix: &str,
 ) -> egui::Response {
     ui.horizontal(|ui| {
         ui.add_space(27.0);
@@ -1827,11 +1842,14 @@ fn slider_row(
             },
         );
 
-        let chip_w = 56.0;
-        let track_w = (ui.available_width() - chip_w - ui.spacing().item_spacing.x * 2.0).max(80.0);
+        let field_w = 56.0;
+        let track_w =
+            (ui.available_width() - field_w - ui.spacing().item_spacing.x * 2.0).max(80.0);
         ui.spacing_mut().slider_width = track_w;
-        let response = ui.add(egui::Slider::new(value, range).show_value(false));
-        widgets::chip(ui, readout, chip_w);
+        let response = ui.add(egui::Slider::new(value, range.clone()).show_value(false));
+        // The label is the row's identity: two sliders in one pane never share
+        // one, and the id only has to be unique within the enclosing card.
+        widgets::value_field(ui, label, value, range, decimals, suffix, field_w);
         response
     })
     .inner

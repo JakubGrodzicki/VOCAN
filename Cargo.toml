@@ -44,6 +44,22 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Silero VAD (src/vad.rs) runs on ONNX Runtime. The `download-binaries` feature
+# makes ort's build script fetch a prebuilt, statically linked ONNX Runtime
+# from cdn.pyke.io (verified by hash), so nothing but the model file has to be
+# installed next to the executable. TLS for that download is the platform's own
+# (schannel / Security.framework / OpenSSL), which keeps ring and aws-lc out of
+# the graph. Pinned exactly because 2.0 is still a release candidate.
+#
+# Intel macOS is excluded: ort ships no prebuilt runtime for it. `vad::engine`
+# has a stub for that target, so the crate still builds there.
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "tls-native",
+] }
+
 # The DSP stages are tight per-sample/per-bin loops calling small functions
 # across crate boundaries (biquad, rustfft), so cross-crate inlining matters.
 #

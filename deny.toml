@@ -36,6 +36,16 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# `ort-sys`'s build script downloads ONNX Runtime over TLS, and its HTTP client
+# (`ureq`) brings the Mozilla root certificate bundle. The bundle is data under
+# a permissive licence that is not in the list above. Allowed for this one crate
+# rather than for everyone, so any other crate arriving under it still gets the
+# human look the list exists for. Build-time only: the bundle is not linked into
+# the VOCAN executable.
+exceptions = [
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs" },
+]
+
 [bans]
 # `windows-sys` alone resolves to six versions through the GUI stack, so
 # duplicates are the normal state of this graph, not a signal.

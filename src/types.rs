@@ -299,6 +299,11 @@ pub struct ProcessingOptions {
     /// How much of the original silence the trim leaves at each end. Ignored
     /// when `trim_silence` is off.
     pub trim_silence_pad: SilencePad,
+    /// Finds the speech with Silero VAD instead of listening for a level.
+    /// Replaces the threshold trim entirely: `trim_silence_threshold` and
+    /// `trim_silence_pad` are ignored while this is on. Ignored when
+    /// `trim_silence` is off. See `crate::vad`.
+    pub trim_silence_vad: bool,
     pub output_format: OutputFormat,
     /// Bitrate in kbps for lossy formats (MP3, OGG). Ignored for lossless.
     pub bitrate_kbps: u32,
@@ -335,6 +340,7 @@ impl Default for ProcessingOptions {
             trim_silence: false,
             trim_silence_threshold: SilenceThreshold::Recommended,
             trim_silence_pad: SilencePad::Tight,
+            trim_silence_vad: false,
             output_format: OutputFormat::AdpcmWav,
             bitrate_kbps: 128,
             log: None,

@@ -22,6 +22,7 @@ use crate::types::{
     SilenceThreshold,
 };
 use crate::ui as widgets;
+use crate::vad;
 
 // ---------------------------------------------------------------------------
 // Application State
@@ -62,6 +63,13 @@ pub struct AudioBatchApp {
     trim_silence_threshold: SilenceThreshold,
     /// How much of the original silence the trim leaves at each end.
     trim_silence_pad: SilencePad,
+    /// Trim by detecting speech with Silero VAD instead of by level. Replaces
+    /// the two settings above while it is on.
+    trim_silence_vad: bool,
+    /// Whether Silero VAD can run here: the platform has an ONNX Runtime and
+    /// the model file was found. Looked up once at startup; the installer is
+    /// what puts the file there, and a restart is what picks it up.
+    vad_available: bool,
     /// Output format selector (ADPCM, PCM, FLAC, MP3, OGG).
     output_format: OutputFormat,
     /// Bitrate for lossy formats (MP3, OGG).
@@ -319,6 +327,8 @@ impl AudioBatchApp {
             trim_silence: false,
             trim_silence_threshold: SilenceThreshold::Recommended,
             trim_silence_pad: SilencePad::Tight,
+            trim_silence_vad: false,
+            vad_available: vad::available(),
             output_format: OutputFormat::default(),
             bitrate_kbps: 128,
             is_processing: false,
@@ -685,6 +695,10 @@ impl AudioBatchApp {
             trim_silence: self.trim_silence,
             trim_silence_threshold: self.trim_silence_threshold,
             trim_silence_pad: self.trim_silence_pad,
+            // A stale `true` cannot reach the pipeline: the checkbox is
+            // disabled when VAD is unavailable, and this keeps it that way
+            // even if the state were ever set by other means.
+            trim_silence_vad: self.trim_silence_vad && self.vad_available,
             output_format: self.output_format,
             bitrate_kbps: self.bitrate_kbps,
             log: Some(self.sender.clone()),
@@ -983,7 +997,12 @@ impl AudioBatchApp {
             // beside the label, so the trim goes last: "Files" is a short
             // label and leaves room, but if anything is ever lost here it
             // should be the format, which the pane also states in full.
-            return (format!("{format} + trim"), theme::TXT3);
+            let trim = if self.trim_silence_vad && self.vad_available {
+                "trim (VAD)"
+            } else {
+                "trim"
+            };
+            return (format!("{format} + {trim}"), theme::TXT3);
         }
         (format, theme::TXT3)
     }
@@ -1042,7 +1061,11 @@ impl AudioBatchApp {
         });
 
         if self.trim_silence {
-            parts.push("trim silence".to_owned());
+            parts.push(if self.trim_silence_vad && self.vad_available {
+                "trim silence (VAD)".to_owned()
+            } else {
+                "trim silence".to_owned()
+            });
         }
 
         if self.automixer {
@@ -1243,6 +1266,48 @@ impl AudioBatchApp {
             );
 
             if !self.trim_silence {
+                return;
+            }
+
+            // Speech detection replaces the level-based trim wholesale, so when
+            // it is on the two level rows below have nothing to say and are not
+            // shown. It is only offered when it can run: the model file has to
+            // be there, and the platform has to have an ONNX Runtime.
+            ui.add_space(11.0);
+            let vad_ready = self.vad_available;
+            ui.add_enabled_ui(vad_ready, |ui| {
+                ui.horizontal(|ui| {
+                    widgets::check(
+                        ui,
+                        &mut self.trim_silence_vad,
+                        "Detect speech with Silero VAD",
+                    );
+                    ui.label(
+                        RichText::new("neural network")
+                            .size(11.5)
+                            .color(theme::TXT3),
+                    );
+                });
+            })
+            .response
+            .on_hover_text(
+                "Finds where the speech is instead of listening for a level, so room\n\
+                 noise and breaths no longer decide where the take starts.",
+            );
+            if vad_ready {
+                indented_hint(
+                    ui,
+                    "Keeps 150 ms before the first word and 150 ms after the last, with a \
+                     75 ms fade at each end, and cuts the rest. Pauses inside the line are \
+                     kept. A file with no speech in it is left as it is. Costs one extra \
+                     decode of each file.",
+                );
+            } else {
+                ui.add_space(6.0);
+                widgets::notice(ui, &vad::unavailable_reason());
+            }
+
+            if self.trim_silence_vad && vad_ready {
                 return;
             }
 
@@ -2288,6 +2353,7 @@ mod tests {
             trim_silence,
             trim_silence_threshold,
             trim_silence_pad,
+            trim_silence_vad,
             output_format,
             bitrate_kbps,
             log: _, // wired to the live UI channel, deliberately None by default
@@ -2314,9 +2380,52 @@ mod tests {
         assert_eq!(trim_silence, d.trim_silence);
         assert_eq!(trim_silence_threshold, d.trim_silence_threshold);
         assert_eq!(trim_silence_pad, d.trim_silence_pad);
+        assert_eq!(trim_silence_vad, d.trim_silence_vad);
         assert_eq!(output_format, d.output_format);
         assert_eq!(bitrate_kbps, d.bitrate_kbps);
         assert!(ProcessingOptions::default().log.is_none());
+    }
+
+    #[test]
+    fn silero_vad_reaches_the_pipeline_only_when_it_can_run() {
+        let mut app = test_app();
+        app.trim_silence = true;
+        app.trim_silence_vad = true;
+
+        app.vad_available = false;
+        assert!(
+            !app.processing_options().trim_silence_vad,
+            "a checked box must not select VAD when the model is missing"
+        );
+
+        app.vad_available = true;
+        assert!(app.processing_options().trim_silence_vad);
+
+        app.trim_silence_vad = false;
+        assert!(!app.processing_options().trim_silence_vad);
+    }
+
+    #[test]
+    fn the_summaries_name_the_trim_mode() {
+        let mut app = test_app();
+        app.input_dir = "in".into();
+        app.output_dir = "out".into();
+        app.trim_silence = true;
+        app.vad_available = true;
+
+        assert!(app.summary_files().0.ends_with("+ trim"));
+        assert!(app.recipe().contains("trim silence"));
+        assert!(!app.recipe().contains("VAD"));
+
+        app.trim_silence_vad = true;
+        assert!(app.summary_files().0.ends_with("+ trim (VAD)"));
+        assert!(app.recipe().contains("trim silence (VAD)"));
+
+        app.vad_available = false;
+        assert!(
+            !app.recipe().contains("VAD"),
+            "the recipe must match what runs"
+        );
     }
 
     #[test]

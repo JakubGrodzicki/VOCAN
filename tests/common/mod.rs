@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+#[allow(dead_code)]
 pub fn write_sine_wav(
     path: &Path,
     duration_secs: f32,
@@ -183,6 +184,98 @@ pub fn write_silence_wav(path: &Path, duration_secs: f32, sample_rate: u32) {
         writer.write_sample(0.0f32).expect("write sample");
     }
     writer.finalize().expect("finalize wav");
+}
+
+/// Writes `samples` as a mono 32-bit float WAV.
+#[allow(dead_code)]
+pub fn write_f32_wav(path: &Path, samples: &[f32], sample_rate: u32) {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+    for &s in samples {
+        writer.write_sample(s).expect("write sample");
+    }
+    writer.finalize().expect("finalize wav");
+}
+
+/// Seeded noise at `rms_dbfs` (white noise from a xorshift PRNG is uniform, so
+/// its RMS is `amplitude / sqrt(3)`; the scaling below accounts for that).
+#[allow(dead_code)]
+pub fn noise_at_dbfs(n: usize, rms_dbfs: f32, seed: u32) -> Vec<f32> {
+    let rms = 10f32.powf(rms_dbfs / 20.0);
+    xorshift_noise(n, rms * 3f32.sqrt(), seed)
+}
+
+/// Duration in seconds of a WAV file, from its header.
+#[allow(dead_code)]
+pub fn wav_secs(path: &Path) -> f64 {
+    let reader = hound::WavReader::open(path).expect("open wav");
+    reader.duration() as f64 / reader.spec().sample_rate as f64
+}
+
+/// RMS of `samples`, in linear units.
+#[allow(dead_code)]
+pub fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// The Silero model, if one is configured (`VOCAN_SILERO_MODEL`, set by CI and
+/// by anyone who has run the installer from the repo).
+#[allow(dead_code)]
+pub fn silero_model() -> Option<std::path::PathBuf> {
+    vocan::vad::model_path()
+}
+
+/// 60 s of 16 kHz mono speech (`tests/data/test.wav` from the Silero repo, MIT),
+/// downloaded by CI and located through `VOCAN_VAD_FIXTURE`. Not checked in:
+/// this repo does not carry binary assets.
+#[allow(dead_code)]
+pub fn speech_fixture() -> Option<std::path::PathBuf> {
+    std::env::var_os("VOCAN_VAD_FIXTURE")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+}
+
+/// The speech fixture's samples as f32, first `secs` seconds only.
+#[allow(dead_code)]
+pub fn speech_samples(path: &Path, secs: f32) -> Vec<f32> {
+    let mut reader = hound::WavReader::open(path).expect("open speech fixture");
+    let spec = reader.spec();
+    assert_eq!(
+        (spec.channels, spec.sample_rate, spec.bits_per_sample),
+        (1, 16_000, 16),
+        "the speech fixture is expected to be 16 kHz mono 16-bit"
+    );
+    reader
+        .samples::<i16>()
+        .take((secs * 16_000.0) as usize)
+        .map(|s| s.expect("read sample") as f32 / 32768.0)
+        .collect()
+}
+
+/// `true` (after printing why) when a VAD test cannot run: no ffmpeg, no model,
+/// or no speech fixture. Same convention as [`skip_if_no_ffmpeg`].
+#[allow(dead_code)]
+pub fn skip_if_no_vad() -> bool {
+    if skip_if_no_ffmpeg() {
+        return true;
+    }
+    if !vocan::vad::ENGINE_AVAILABLE {
+        eprintln!("SKIP: no ONNX Runtime on this platform");
+        return true;
+    }
+    if silero_model().is_none() {
+        eprintln!("SKIP: Silero model not found (set VOCAN_SILERO_MODEL)");
+        return true;
+    }
+    false
 }
 
 /// Resolves ffmpeg the same way the app does at runtime: PATH first.

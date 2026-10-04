@@ -154,6 +154,43 @@ fn trimming_silence_costs_no_extra_process_in_either_pipeline() {
 
 #[test]
 #[ignore]
+fn silero_vad_costs_exactly_one_extra_process_in_either_pipeline() {
+    if common::skip_if_no_vad() {
+        return;
+    }
+    // Unlike the threshold trim, speech detection cannot ride on a pass that was
+    // running anyway: it decodes the file to 16 kHz on its own. That is one
+    // process per file, and this pins it at one. A second probe, a second
+    // decode, or an ffmpeg per frame would show up here and nowhere else.
+    //
+    // The input is a sine wave. The model finds no speech in it, so no trim
+    // filter results and the downstream counts are the untrimmed ones -- which
+    // isolates the detection pass from anything the trim itself might add.
+    let plain = ProcessingOptions {
+        target_lufs: Some(-16.0),
+        trim_silence: true,
+        trim_silence_vad: true,
+        output_format: OutputFormat::Pcm24Wav,
+        ..Default::default()
+    };
+    assert_eq!(spawns_for(plain, 5.0), 3 + 1, "plain conversion with VAD");
+
+    let automixer = ProcessingOptions {
+        target_lufs: Some(-16.0),
+        automixer: true,
+        // The Automixer's voice EQ needs a source rate above 16 kHz; the 44.1
+        // kHz sine in `spawns_for` is fine.
+        automixer_spectral_gate: true,
+        trim_silence: true,
+        trim_silence_vad: true,
+        output_format: OutputFormat::Pcm24Wav,
+        ..Default::default()
+    };
+    assert_eq!(spawns_for(automixer, 5.0), 4 + 1, "automixer with VAD");
+}
+
+#[test]
+#[ignore]
 fn trimming_silence_without_normalization_still_costs_one_process() {
     if skip_if_no_ffmpeg() {
         return;

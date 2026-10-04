@@ -52,7 +52,7 @@ If a preset is too low for your material, the silence in your files is louder th
 
 Keep is a **ceiling, not a target**. VOCAN keeps up to this much of the silence that was already in the file and never adds any. A take with 0.3 s of lead-in keeps 0.3 s even on Long.
 
-**Cost.** The threshold trim launches no extra processes. VOCAN adds the filter to a chain that FFmpeg was going to run anyway, so a trimmed run launches exactly as many processes and reads each file exactly as many times as an untrimmed one. The optional speech detection described below launches one extra FFmpeg process per file.
+**Cost.** The threshold trim launches no extra processes. VOCAN adds the filter to a chain that FFmpeg was going to run anyway, so a trimmed run launches exactly as many processes and reads each file exactly as many times as an untrimmed one. The optional speech detection described below launches one extra FFmpeg process per file, and a second one for a file that is very quiet.
 
 If nothing in a file reaches the threshold, nothing would survive the trim. With the Automixer on, VOCAN reports the file as an error and writes no output for it, rather than publishing an empty audio file that looks like a successful conversion. Without the Automixer, VOCAN cannot see the signal in memory and so cannot make that check without spending another FFmpeg process on every file in the batch; such a file is written out empty.
 
@@ -71,7 +71,7 @@ Pauses inside the line stay, the same as with the threshold trim. If VOCAN finds
 
 The **Silence below** and **Keep** settings do not apply in this mode. The threshold trim is not used. The mode works with the Automixer on and with the Automixer off.
 
-The mode needs the model file `silero_vad.onnx`, which the setup scripts download. If the file is missing, the checkbox is disabled and a hint tells you to run the setup script again. It also costs one extra FFmpeg process per file. See "Silero VAD speech detection" in Technical Details.
+The mode needs the model file `silero_vad.onnx`, which the setup scripts download. If the file is missing, the checkbox is disabled and a hint tells you to run the setup script again. It also costs one extra FFmpeg process per file (two for a very quiet file). See "Silero VAD speech detection" in Technical Details.
 
 ### Automixer chain (optional)
 
@@ -119,6 +119,8 @@ DeepFilterNet3 is optional. VOCAN needs DeepFilterNet3 only when you enable the 
 The Silero VAD model is optional. VOCAN needs it only for the **Detect speech with Silero VAD** checkbox. The model is one file, `silero_vad.onnx` (about 2.3 MB), and it must sit in a `models` folder next to the VOCAN executable file: `models/silero_vad.onnx`. As a fallback, VOCAN also accepts the file directly next to the executable. To use a file in another place, set the environment variable `VOCAN_SILERO_MODEL` to its full path. This variable takes priority over both folders. This model file is the only extra download. ONNX Runtime, which runs the model, is built into the VOCAN executable file, so you do not install it.
 
 Silero VAD is not available on Intel Macs, because ONNX Runtime has no build for them. On an Intel Mac, VOCAN works as usual but the checkbox stays disabled.
+
+On Windows, the VOCAN executable file now links ONNX Runtime, and so needs Windows 10 version 1903 or newer (it uses DirectML.dll, d3d12.dll and dxgi.dll, which come with Windows) and the Microsoft Visual C++ Redistributable 2015-2022 (x64). This holds for the whole program, whether or not you use Silero VAD.
 
 The setup script in the next section can install all these requirements for you.
 
@@ -344,14 +346,16 @@ In both cases the trim is part of the filter chain that the loudness measurement
 This is the second mode of **Trim silence**. It replaces the threshold filter chain above. VOCAN never uses both in one run.
 
 1. **Detection.** VOCAN starts one extra FFmpeg process per file. It decodes the file to 16 kHz mono and streams the samples to VOCAN. VOCAN feeds them, frame by frame, to the Silero VAD model, which runs in ONNX Runtime. The model returns a speech probability for each frame.
-2. **Hysteresis.** Speech starts when the probability reaches 0.5. Speech ends only after the probability has stayed below 0.35 for at least 96 ms (three frames). The two limits and the minimum pause stop a single weak frame, such as a stop consonant, from chopping a word in half.
+2. **Hysteresis.** Speech starts when the probability reaches 0.5. Speech ends only after the probability has stayed below 0.35 for at least four frames (128 ms). The two limits and the minimum pause stop a single weak frame, such as a stop consonant, from chopping a word in half.
 3. **Short bursts are ignored.** A speech burst shorter than 250 ms does not count. A click, a cough, or a chair creak cannot anchor the trim.
 4. **One span.** VOCAN takes the start of the first speech burst and the end of the last one. Pauses between them stay, so a breath or a dramatic pause inside a line comes through untouched.
-5. **Margins and fades.** VOCAN keeps 150 ms before the span and 150 ms after it. It applies a fixed 75 ms fade-in at the start and a fixed 75 ms fade-out at the end. Both fades sit inside the margins, so they never fall on speech.
+5. **Margins and fades.** VOCAN keeps 150 ms before the span and 150 ms after it. It applies a 75 ms fade-in at the start and a 75 ms fade-out at the end. Both fades sit inside the margins, so they never fall on speech. If the speech starts or ends closer than 75 ms to the edge of the file, that fade is only as long as the room that is there. Speech at the very first sample gets no fade-in.
 6. **No speech, no change.** If the model finds no speech, VOCAN does not trim or fade the file. Everything else you switched on, such as normalization or the Automixer, still applies. A take shorter than 250 ms counts as no speech. Stereo is mixed to mono for the detection, so a file whose channels cancel each other (opposite phase) also counts as no speech.
 7. **Final chain.** VOCAN adds `atrim` and `afade` to the FFmpeg chain that already writes the output. This works the same with the Automixer on and with the Automixer off. The rest of the audio is not changed.
 
-**Cost.** One extra FFmpeg process per file, for the detection decode. VOCAN keeps only the per-frame probabilities, not the audio, so memory stays flat, even on a long file.
+**Cost.** One extra FFmpeg process per file, for the detection decode. VOCAN keeps only the per-frame probabilities, not the audio, so memory use grows by about half a megabyte per hour of audio.
+
+**Quiet files.** The model judges speech partly by level, and a take recorded very quietly can be detected late, which would cut the start of the first word. So if the loudest sample of a file is below -34 dBFS, VOCAN decodes it a second time with a gain that brings its peak to -12 dBFS (at most +40 dB). Speech and pauses are raised together, so the model sees the same relation between them. This applies to the detection only. The audio that is written is never changed by it. A very quiet file therefore costs two extra FFmpeg processes instead of one.
 
 **Model location.** VOCAN looks for the model in this order:
 

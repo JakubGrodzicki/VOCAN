@@ -193,6 +193,83 @@ fn the_boundaries_do_not_depend_on_the_source_sample_rate() {
 
 #[test]
 #[ignore]
+fn quiet_speech_is_found_where_it_starts() {
+    if skip_if_no_vad_fixture() {
+        return;
+    }
+    // Speech 40 dB under the fixture, over a room floor 60 dB under it. Without
+    // the level evening in the detection decode the model finds the start
+    // 0.27 s late here, which eats the first word; with it, the start lands on
+    // the pinned reference like any other take.
+    let dir = tempfile::tempdir().unwrap();
+    let take = dir.path().join("quiet.wav");
+    let gain = 10f32.powf(-40.0 / 20.0);
+    let mut samples = noise_at_dbfs(16_000 * 2, -75.0, 13);
+    samples.extend(
+        speech_samples(&fixture(), 8.0)
+            .into_iter()
+            .map(|s| s * gain),
+    );
+    samples.extend(noise_at_dbfs(16_000 * 2, -75.0, 17));
+    write_f32_wav(&take, &samples, 16_000);
+
+    let d = vad::detect_speech(&take, &common::ffmpeg_path(), &model()).unwrap();
+    let span = d.span.expect("quiet speech is still speech");
+    assert!(
+        (span.start - 2.032).abs() <= TOLERANCE,
+        "quiet speech starts at 2.032 s, found at {} s",
+        span.start
+    );
+    assert!(
+        (span.end - 8.848).abs() <= TOLERANCE,
+        "quiet speech ends at 8.848 s, found at {} s",
+        span.end
+    );
+}
+
+#[test]
+#[ignore]
+fn a_stereo_source_is_heard_as_mono() {
+    if skip_if_no_vad_fixture() {
+        return;
+    }
+    // Without the downmix the decode would hand the model interleaved L/R
+    // samples: the same speech at half speed with a doubled pitch. The span
+    // would not be wrong by a frame, it would be wrong by seconds.
+    let dir = tempfile::tempdir().unwrap();
+    let take = dir.path().join("stereo.wav");
+    let mut mono = noise_at_dbfs(16_000 * 2, ROOM_DBFS, 7);
+    mono.extend(speech_samples(&fixture(), 8.0));
+    mono.extend(noise_at_dbfs(16_000 * 2, ROOM_DBFS, 11));
+
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: 16_000,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(&take, spec).unwrap();
+    for &s in &mono {
+        w.write_sample(s).unwrap();
+        w.write_sample(s * 0.5).unwrap();
+    }
+    w.finalize().unwrap();
+
+    let d = vad::detect_speech(&take, &common::ffmpeg_path(), &model()).unwrap();
+    let span = d.span.expect("speech");
+    assert!(
+        (d.total_secs - 12.0).abs() < 0.01,
+        "length {}",
+        d.total_secs
+    );
+    assert!(
+        (span.start - 2.032).abs() <= TOLERANCE && (span.end - 8.848).abs() <= TOLERANCE,
+        "stereo take: {span:?}"
+    );
+}
+
+#[test]
+#[ignore]
 fn finds_no_speech_in_noise_or_silence() {
     if skip_if_no_vad() {
         return;

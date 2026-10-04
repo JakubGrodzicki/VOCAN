@@ -70,20 +70,120 @@ fn both_installers_can_skip_the_download() {
     assert!(read("installMacLinux.sh").contains("--no-vad"));
 }
 
+/// The script with comment lines dropped and runs of spaces collapsed, so an
+/// assertion about a line of code cannot be satisfied by a comment that
+/// mentions it, or broken by realigning an `=`.
+fn code_of(file: &str) -> String {
+    read(file)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_code_has(file: &str, code: &str, needle: &str, why: &str) {
+    assert!(
+        code.contains(needle),
+        "{file}: expected this line of code:\n    {needle}\nbecause {why}"
+    );
+}
+
 #[test]
-fn both_installers_package_the_models_folder_next_to_the_executable() {
-    // vad::model_path looks in `<exe dir>/models/`. An installer that downloads
-    // the model into target/ but forgets to copy it into VOCAN-App leaves a
-    // feature that works for the developer and is disabled for the user.
-    for file in ["installWindows.ps1", "installMacLinux.sh"] {
-        let text = read(file);
-        assert!(
-            text.contains("models"),
-            "{file} never mentions the models folder"
-        );
-        assert!(
-            text.contains("VOCAN-App"),
-            "{file} no longer packages into VOCAN-App"
-        );
-    }
+fn the_windows_installer_puts_the_model_where_the_app_looks() {
+    // vad::model_path looks in `<exe dir>/models/silero_vad.onnx`. These are the
+    // lines that decide where the file lands, whether it is trusted, and
+    // whether it reaches the folder the user runs VOCAN from. Mutating any of
+    // them leaves a build that works for the developer and a disabled checkbox
+    // for everyone else.
+    let f = "installWindows.ps1";
+    let c = code_of(f);
+    assert_code_has(
+        f,
+        &c,
+        r#"$ModelDir = Join-Path $BinDir "models""#,
+        "the folder must be named models",
+    );
+    assert_code_has(
+        f,
+        &c,
+        r#"$ModelDest = Join-Path $ModelDir "silero_vad.onnx""#,
+        "the file name is fixed by vad::MODEL_FILE",
+    );
+    assert_code_has(
+        f,
+        &c,
+        "if ($gotHash -ine $ModelSha256) {",
+        "a hash that differs must be rejected",
+    );
+    assert_code_has(
+        f,
+        &c,
+        "Remove-Item $ModelDest -Force",
+        "a rejected download must not be left behind",
+    );
+    assert_code_has(
+        f,
+        &c,
+        r#"Copy-Item $ModelDir (Join-Path $AppDir "models") -Recurse"#,
+        "the packaged app needs the models folder next to VOCAN.exe",
+    );
+    assert_code_has(
+        f,
+        &c,
+        "$env:VOCAN_SILERO_MODEL = $ModelDest",
+        "the test run executes from target\\deps, not from the app folder",
+    );
+}
+
+#[test]
+fn the_unix_installer_puts_the_model_where_the_app_looks() {
+    let f = "installMacLinux.sh";
+    let c = code_of(f);
+    assert_code_has(
+        f,
+        &c,
+        r#"MODEL_DIR="$BIN_DIR/models""#,
+        "the folder must be named models",
+    );
+    assert_code_has(
+        f,
+        &c,
+        r#"MODEL_DEST="$MODEL_DIR/silero_vad.onnx""#,
+        "the file name is fixed by vad::MODEL_FILE",
+    );
+    assert_code_has(
+        f,
+        &c,
+        r#"elif [ "$GOT_SHA" != "$MODEL_SHA256" ]; then"#,
+        "a hash that differs must be rejected",
+    );
+    assert_code_has(
+        f,
+        &c,
+        r#"rm -f "$MODEL_DEST""#,
+        "a rejected download must not be left behind",
+    );
+    assert_code_has(
+        f,
+        &c,
+        r#"cp -R "$MODEL_DIR" "$APP_DIR/models""#,
+        "the packaged app needs the models folder next to VOCAN",
+    );
+    assert_code_has(
+        f,
+        &c,
+        r#"export VOCAN_SILERO_MODEL="$MODEL_DEST""#,
+        "the test run executes from target/.../deps, not from the app folder",
+    );
+}
+
+#[test]
+fn model_file_name_matches_what_the_app_looks_for() {
+    assert_eq!(vocan::vad::MODEL_FILE, "silero_vad.onnx");
+    assert!(
+        MODEL_URL.ends_with("/silero_vad.onnx"),
+        "the download is saved under the name the app looks for"
+    );
 }

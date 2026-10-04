@@ -191,6 +191,36 @@ fn silero_vad_costs_exactly_one_extra_process_in_either_pipeline() {
 
 #[test]
 #[ignore]
+fn a_quiet_take_costs_one_more_detection_pass() {
+    if common::skip_if_no_vad() {
+        return;
+    }
+    // A file whose loudest sample is under -34 dBFS is decoded a second time
+    // with a gain, because the model's scores depend on level. Only quiet files
+    // pay for it; `spawns_for` writes a 0.5-amplitude sine, so the test above
+    // is the loud case. This one writes its own file, at 0.005.
+    let dir = tempfile::tempdir().unwrap();
+    let input_base = dir.path().join("in");
+    let output_base = dir.path().join("out");
+    std::fs::create_dir_all(&input_base).unwrap();
+    let input = input_base.join("quiet.wav");
+    common::write_sine_wav(&input, 5.0, 44100, 440.0, 0.005);
+
+    let opts = ProcessingOptions {
+        target_lufs: None,
+        trim_silence: true,
+        trim_silence_vad: true,
+        output_format: OutputFormat::Pcm24Wav,
+        ..Default::default()
+    };
+    reset_spawn_count();
+    process_single_file(&input, &input_base, &output_base, &opts, &ffmpeg_path()).unwrap();
+    // 2 detection passes (the second with a gain) + the encode.
+    assert_eq!(spawn_count(), 3);
+}
+
+#[test]
+#[ignore]
 fn trimming_silence_without_normalization_still_costs_one_process() {
     if skip_if_no_ffmpeg() {
         return;

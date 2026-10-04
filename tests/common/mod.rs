@@ -260,20 +260,34 @@ pub fn speech_samples(path: &Path, secs: f32) -> Vec<f32> {
         .collect()
 }
 
+/// A VAD test that cannot run skips, unless `VOCAN_REQUIRE_VAD` is set: CI sets
+/// it, because a skip is a pass, and a mistyped path to the model would
+/// otherwise turn every real-model test into a green no-op. With the variable
+/// set, the same condition is a failure with the reason in it.
+#[allow(dead_code)]
+fn skip_or_fail(why: &str) -> bool {
+    if std::env::var_os("VOCAN_REQUIRE_VAD").is_some_and(|v| !v.is_empty()) {
+        panic!("VOCAN_REQUIRE_VAD is set, but this test cannot run: {why}");
+    }
+    eprintln!("SKIP: {why}");
+    true
+}
+
 /// `true` (after printing why) when a VAD test cannot run: no ffmpeg, no model,
-/// or no speech fixture. Same convention as [`skip_if_no_ffmpeg`].
+/// or no speech fixture. Same convention as [`skip_if_no_ffmpeg`], except that
+/// `VOCAN_REQUIRE_VAD` turns every skip into a failure (see [`skip_or_fail`]).
 #[allow(dead_code)]
 pub fn skip_if_no_vad() -> bool {
-    if skip_if_no_ffmpeg() {
-        return true;
+    if !ffmpeg_available() {
+        return skip_or_fail("ffmpeg not found on PATH");
     }
     if !vocan::vad::ENGINE_AVAILABLE {
+        // Not a CI configuration error: this target simply has no engine.
         eprintln!("SKIP: no ONNX Runtime on this platform");
         return true;
     }
     if silero_model().is_none() {
-        eprintln!("SKIP: Silero model not found (set VOCAN_SILERO_MODEL)");
-        return true;
+        return skip_or_fail("Silero model not found (set VOCAN_SILERO_MODEL)");
     }
     false
 }
@@ -290,8 +304,7 @@ pub fn skip_if_no_vad_fixture() -> bool {
         return true;
     }
     if speech_fixture().is_none() {
-        eprintln!("SKIP: speech fixture not found (set VOCAN_VAD_FIXTURE)");
-        return true;
+        return skip_or_fail("speech fixture not found (set VOCAN_VAD_FIXTURE)");
     }
     false
 }

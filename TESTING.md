@@ -29,7 +29,9 @@ file and a speech recording. They read both paths from environment variables:
   60 s `test.wav` from the Silero repository)
 
 If the model, the fixture or ffmpeg is missing, each test prints a `SKIP`
-notice and passes, the same as the DFN3 tests. CI downloads both files into
+notice and passes, the same as the DFN3 tests. Set `VOCAN_REQUIRE_VAD=1` to turn
+every such skip into a failure; CI does, so a wrong path cannot turn the
+real-model tests into green no-ops. CI downloads both files into
 the runner's temp folder, checks their SHA-256, and sets both variables
 automatically. The installers set `VOCAN_SILERO_MODEL` for the test run when
 the model download succeeded; the fixture is CI only, so the speech-recording
@@ -65,7 +67,12 @@ tests skip on a normal install.
   ffmpeg (ignored tests, skip when the model, the fixture or ffmpeg is
   missing). Covers detection on the speech fixture and the end-to-end trim
   behaviour: 150 ms margins, 75 ms fades, no change when there is no speech,
-  with the Automixer on and off.
+  with the Automixer on and off. Also covers a stereo source, speech recorded
+  40 dB quieter than the fixture (the gain-and-redecode path for quiet files),
+  a 48 kHz source and a pause inside the line.
+- `tests/vad_stop.rs`: Stop (`proc::terminate_all`) reaches the speech
+  detection decode of a 15-minute file. Its own binary, because terminating
+  children is process-wide and would kill the other tests' ffmpegs.
 - `src/vad.rs` `#[cfg(test)] mod tests`: gate tests for the VAD logic that
   needs no model or ffmpeg (hysteresis, minimum speech burst, minimum pause,
   span and margin arithmetic, model path lookup order). One ignored test

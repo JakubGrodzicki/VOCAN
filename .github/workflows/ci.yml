@@ -71,6 +71,10 @@ jobs:
           fi
           echo "VOCAN_SILERO_MODEL=$dir/silero_vad.onnx" >> "$GITHUB_ENV"
           echo "VOCAN_VAD_FIXTURE=$dir/test.wav" >> "$GITHUB_ENV"
+          # A skipped test is a passing test. With this set, a VAD test that
+          # cannot find its model or fixture fails instead, so a wrong path
+          # here cannot turn the real-model tests into green no-ops.
+          echo "VOCAN_REQUIRE_VAD=1" >> "$GITHUB_ENV"
 
       - name: Check formatting
         run: cargo fmt --check

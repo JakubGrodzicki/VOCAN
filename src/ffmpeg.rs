@@ -86,32 +86,54 @@ pub fn is_audio_file(path: &Path) -> bool {
     )
 }
 
+/// Returns the banner line of `ffmpeg -version`, or `None` if `text` is not what
+/// a real FFmpeg prints.
+///
+/// The probe used to accept any program named `ffmpeg` that exited with 0, so a
+/// stub, a wrapper script or an unrelated tool earlier on PATH was reported as a
+/// working install, and every file then failed at conversion time instead.
+/// FFmpeg's first line is always `ffmpeg version <id> Copyright ...`.
+fn parse_version_banner(text: &str) -> Option<String> {
+    let first = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    const PREFIX: &str = "ffmpeg version";
+    let head = first.get(..PREFIX.len())?;
+    let rest = &first[PREFIX.len()..];
+    (head.eq_ignore_ascii_case(PREFIX) && rest.starts_with(char::is_whitespace))
+        .then(|| first.to_owned())
+}
+
+/// Runs `<bin> -version` and returns FFmpeg's banner line if `bin` really is a
+/// working FFmpeg.
+///
+/// Builds `Command::new` directly rather than through [`ffmpeg_cmd`]: the probe
+/// must not flash a console window on Windows (`CREATE_NO_WINDOW`), and
+/// `ffmpeg_cmd` appends `-nostdin`, which a bare `-version` has no reason to
+/// depend on -- and which would also bump [`spawn_count`] for something that is
+/// not part of a file's process budget.
+pub fn probe_version(bin: &Path) -> Option<String> {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut cmd = Command::new(bin);
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    let output = cmd
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_version_banner(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// Priority:
 ///   1. `ffmpeg` available on PATH (verified by running `ffmpeg -version`)
 ///   2. `ffmpeg.exe` / `ffmpeg` sitting next to the current executable
 pub fn find_ffmpeg() -> Result<PathBuf> {
-    /// A `Command` that will not flash a console window on Windows.
-    ///
-    /// The probes below used to build `Command::new` directly, bypassing
-    /// `ffmpeg_cmd` and therefore missing `CREATE_NO_WINDOW` -- so launching
-    /// VOCAN briefly popped up one or two console windows every single time.
-    /// `ffmpeg_cmd` itself is not reused here because it appends `-nostdin`,
-    /// which a bare `-version` probe has no reason to depend on.
-    fn silent_probe(bin: &Path) -> Command {
-        #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut cmd = Command::new(bin);
-        #[cfg(windows)]
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        cmd
-    }
-
-    let path_probe = silent_probe(Path::new("ffmpeg"))
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    if path_probe.map(|s| s.success()).unwrap_or(false) {
+    if probe_version(Path::new("ffmpeg")).is_some() {
         return Ok(PathBuf::from("ffmpeg"));
     }
 
@@ -122,15 +144,8 @@ pub fn find_ffmpeg() -> Result<PathBuf> {
             } else {
                 "ffmpeg"
             });
-            if candidate.is_file() {
-                let local_probe = silent_probe(&candidate)
-                    .arg("-version")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                if local_probe.map(|s| s.success()).unwrap_or(false) {
-                    return Ok(candidate);
-                }
+            if candidate.is_file() && probe_version(&candidate).is_some() {
+                return Ok(candidate);
             }
         }
     }
@@ -505,6 +520,46 @@ size=N/A time=00:00:05.00 bitrate=N/A speed=  42x
     fn ffmpeg_failed_reports_something_useful_when_stderr_is_empty() {
         let err = ffmpeg_failed("conversion", "   \n").to_string();
         assert!(err.contains("without reporting a reason"), "got: {err}");
+    }
+
+    #[test]
+    fn version_banner_accepts_real_ffmpeg_output() {
+        let gyan = "ffmpeg version 2025-02-13-git-19a2d26177-full_build-www.gyan.dev \
+                    Copyright (c) 2000-2025 the FFmpeg developers\nbuilt with gcc 14.2.0\n";
+        assert!(parse_version_banner(gyan)
+            .unwrap()
+            .starts_with("ffmpeg version 2025"));
+        // Distro builds and CRLF line endings (Windows pipes) must work too.
+        assert!(
+            parse_version_banner("ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright\r\nx\r\n")
+                .is_some()
+        );
+        assert!(parse_version_banner("\n\nFFmpeg version N-1234-gabc Copyright").is_some());
+    }
+
+    #[test]
+    fn version_banner_rejects_things_that_are_not_ffmpeg() {
+        assert!(parse_version_banner("").is_none());
+        assert!(parse_version_banner("   \n  \n").is_none());
+        assert!(parse_version_banner("usage: ffmpeg [options]").is_none());
+        assert!(parse_version_banner("avconv version 12.3 Copyright").is_none());
+        assert!(parse_version_banner("ffmpeg versions are great").is_none());
+        // A cut inside a multi-byte character must not panic.
+        assert!(parse_version_banner("ffmpeg ąąąą").is_none());
+        assert!(parse_version_banner("ąą").is_none());
+    }
+
+    #[test]
+    fn probe_version_rejects_a_missing_binary() {
+        assert!(probe_version(Path::new("definitely-not-an-installed-ffmpeg-xyz")).is_none());
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn probe_version_accepts_the_installed_ffmpeg() {
+        let banner = probe_version(Path::new("ffmpeg")).expect("ffmpeg on PATH");
+        assert!(banner.to_ascii_lowercase().starts_with("ffmpeg version"));
+        assert!(find_ffmpeg().is_ok());
     }
 
     #[test]

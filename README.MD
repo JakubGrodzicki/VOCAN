@@ -120,6 +120,8 @@ The Silero VAD model is optional. VOCAN needs it only for the **Detect speech wi
 
 Silero VAD is not available on Intel Macs, because ONNX Runtime has no build for them. On an Intel Mac, VOCAN works as usual but the checkbox stays disabled.
 
+At the bottom left of the VOCAN window, three status lines show what VOCAN found when it started: **FFmpeg** (green when `ffmpeg -version` runs and identifies itself as FFmpeg, red when it is missing), **DeepFilterNet3** and **Silero VAD** (green when the file is there, amber when it is missing). Hover over an amber or red line to see what is missing. VOCAN checks only at startup, so restart it after you install something. When FFmpeg is found on your PATH, VOCAN looks for `deep-filter` next to the VOCAN executable file. When FFmpeg sits in a folder by itself, VOCAN looks for `deep-filter` in that folder.
+
 On Windows, the VOCAN executable file now links ONNX Runtime, and so needs Windows 10 version 1903 or newer (it uses DirectML.dll, d3d12.dll and dxgi.dll, which come with Windows) and the Microsoft Visual C++ Redistributable 2015-2022 (x64). This holds for the whole program, whether or not you use Silero VAD.
 
 The setup script in the next section can install all these requirements for you.

@@ -11,6 +11,7 @@ use std::sync::{
 use std::thread;
 use walkdir::WalkDir;
 
+use crate::audio_effects;
 use crate::ffmpeg::{is_audio_file, measure_lufs};
 use crate::processing::{output_path_for, process_single_file};
 use crate::theme;
@@ -70,6 +71,9 @@ pub struct AudioBatchApp {
     /// the model file was found. Looked up once at startup; the installer is
     /// what puts the file there, and a restart is what picks it up.
     vad_available: bool,
+    /// Whether the DeepFilterNet3 binary that Dereverb runs is present. Looked
+    /// up once at startup, like `vad_available`.
+    dfn3_available: bool,
     /// Output format selector (ADPCM, PCM, FLAC, MP3, OGG).
     output_format: OutputFormat,
     /// Bitrate for lossy formats (MP3, OGG).
@@ -329,6 +333,7 @@ impl AudioBatchApp {
             trim_silence_pad: SilencePad::Tight,
             trim_silence_vad: false,
             vad_available: vad::available(),
+            dfn3_available: audio_effects::dfn3_available(&ffmpeg_path),
             output_format: OutputFormat::default(),
             bitrate_kbps: 128,
             is_processing: false,
@@ -946,33 +951,39 @@ impl AudioBatchApp {
             self.section = Section::Logs;
         }
 
-        // FFmpeg status sits at the bottom of the rail. It used to be a red
-        // paragraph above the start button, which is both the busiest part of
-        // the window and the last place you look before committing to a run.
+        // Dependency status sits at the bottom of the rail. FFmpeg used to be a
+        // red paragraph above the start button, which is both the busiest part
+        // of the window and the last place you look before committing to a run.
+        //
+        // The layout is bottom-up, so the first row added is the lowest one:
+        // Silero VAD, then DeepFilterNet3, then FFmpeg above them. FFmpeg is
+        // required (red when missing); the two models only switch optional
+        // features off (amber).
         ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
             ui.add_space(2.0);
+            status_dot(
+                ui,
+                self.vad_available,
+                "Silero VAD ready",
+                "Silero VAD missing",
+                theme::AMBER,
+                &vad::unavailable_reason(),
+            );
+            status_dot(
+                ui,
+                self.dfn3_available,
+                "DeepFilterNet3 ready",
+                "DeepFilterNet3 missing",
+                theme::AMBER,
+                &format!(
+                    "{} was not found next to VOCAN, so Dereverb cannot run. Re-run the \
+                     installer to download it, then restart VOCAN.",
+                    audio_effects::DFN3_BINARY
+                ),
+            );
             match &self.ffmpeg_error {
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.add_space(6.0);
-                        let (dot, _) =
-                            ui.allocate_exact_size(Vec2::splat(6.0), egui::Sense::hover());
-                        ui.painter().circle_filled(dot.center(), 3.0, theme::GREEN);
-                        ui.add_space(1.0);
-                        ui.label(RichText::new("FFmpeg ready").size(11.0).color(theme::GREEN));
-                    });
-                }
-                Some(err) => {
-                    ui.horizontal(|ui| {
-                        ui.add_space(6.0);
-                        let (dot, _) =
-                            ui.allocate_exact_size(Vec2::splat(6.0), egui::Sense::hover());
-                        ui.painter().circle_filled(dot.center(), 3.0, theme::RED);
-                        ui.add_space(1.0);
-                        ui.label(RichText::new("FFmpeg missing").size(11.0).color(theme::RED))
-                            .on_hover_text(err);
-                    });
-                }
+                None => status_dot(ui, true, "FFmpeg ready", "", theme::RED, ""),
+                Some(err) => status_dot(ui, false, "", "FFmpeg missing", theme::RED, err),
             }
         });
     }
@@ -1096,6 +1107,34 @@ impl AudioBatchApp {
 ///
 /// [`OutputFormat::label`] is written for the dropdown, where there is room to
 /// explain each option; at 10.5px in a 198px rail there is not.
+/// One row of the dependency status in the navigation rail: a dot and a label,
+/// green when `ok`, otherwise `bad_color` with `hover_bad` as a tooltip that
+/// says what is missing and what to do about it.
+fn status_dot(
+    ui: &mut egui::Ui,
+    ok: bool,
+    ok_label: &str,
+    bad_label: &str,
+    bad_color: egui::Color32,
+    hover_bad: &str,
+) {
+    let (color, label) = if ok {
+        (theme::GREEN, ok_label)
+    } else {
+        (bad_color, bad_label)
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        let (dot, _) = ui.allocate_exact_size(Vec2::splat(6.0), egui::Sense::hover());
+        ui.painter().circle_filled(dot.center(), 3.0, color);
+        ui.add_space(1.0);
+        let response = ui.label(RichText::new(label).size(11.0).color(color));
+        if !ok {
+            response.on_hover_text(hover_bad);
+        }
+    });
+}
+
 fn format_short(format: OutputFormat, bitrate: u32) -> String {
     match format {
         OutputFormat::AdpcmWav => "ADPCM".to_owned(),

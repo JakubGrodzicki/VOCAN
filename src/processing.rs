@@ -678,21 +678,8 @@ fn process_with_rust_dsp(
             post_filter: opts.automixer_dfn3_postfilter,
         };
         // Look for deep-filter binary next to ffmpeg, or next to our exe.
-        let dfn_name = if cfg!(windows) {
-            "deep-filter.exe"
-        } else {
-            "deep-filter"
-        };
-        let dfn_path = ffmpeg
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| p.join(dfn_name))
-            .or_else(|| {
-                std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join(dfn_name)))
-            })
-            .ok_or_else(|| anyhow!("cannot locate {}", dfn_name))?;
+        let dfn_path = audio_effects::dfn3_binary_path(ffmpeg)
+            .ok_or_else(|| anyhow!("cannot locate {}", audio_effects::DFN3_BINARY))?;
         processed = audio_effects::apply_dereverb_dfn3(&processed, &params, &dfn_path, ffmpeg)?;
     }
 

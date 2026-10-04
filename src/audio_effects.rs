@@ -15,7 +15,7 @@
 use std::os::windows::process::CommandExt;
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::types::ReductionProfile;
@@ -458,6 +458,38 @@ fn read_wav_f32(path: &Path) -> Result<Vec<f32>> {
     Ok(mono)
 }
 
+/// File name of the DeepFilterNet3 command-line binary on this platform.
+pub const DFN3_BINARY: &str = if cfg!(windows) {
+    "deep-filter.exe"
+} else {
+    "deep-filter"
+};
+
+/// Where the DeepFilterNet3 binary is expected: next to ffmpeg when ffmpeg was
+/// found by an explicit path, otherwise next to our own executable (an ffmpeg
+/// found on PATH is the bare name `ffmpeg`, whose parent is empty).
+///
+/// Does not check that the file exists. The processing pipeline and the status
+/// indicator in the UI both go through here, so what the indicator reports is
+/// exactly what a run will try to open.
+pub fn dfn3_binary_path(ffmpeg: &Path) -> Option<PathBuf> {
+    ffmpeg
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.join(DFN3_BINARY))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join(DFN3_BINARY)))
+        })
+}
+
+/// Whether the DeepFilterNet3 binary is present where [`dfn3_binary_path`]
+/// looks for it.
+pub fn dfn3_available(ffmpeg: &Path) -> bool {
+    dfn3_binary_path(ffmpeg).is_some_and(|p| p.is_file())
+}
+
 pub fn apply_dereverb_dfn3(
     samples_48k_mono: &[f32],
     params: &DereverbParams,
@@ -866,6 +898,43 @@ pub fn apply_expander_inplace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dfn3_path_is_next_to_an_explicit_ffmpeg() {
+        let ffmpeg = Path::new("some").join("dir").join("ffmpeg.exe");
+        assert_eq!(
+            dfn3_binary_path(&ffmpeg),
+            Some(Path::new("some").join("dir").join(DFN3_BINARY))
+        );
+    }
+
+    #[test]
+    fn dfn3_path_for_ffmpeg_on_path_is_next_to_our_executable() {
+        // A bare `ffmpeg` has an empty parent; joining onto that would look in
+        // the current directory instead of beside VOCAN.
+        let exe_dir = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            dfn3_binary_path(Path::new("ffmpeg")),
+            Some(exe_dir.join(DFN3_BINARY))
+        );
+    }
+
+    #[test]
+    fn dfn3_available_follows_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ffmpeg = dir.path().join("ffmpeg");
+        assert!(!dfn3_available(&ffmpeg));
+        // A directory with the right name is not the binary.
+        std::fs::create_dir(dir.path().join(DFN3_BINARY)).unwrap();
+        assert!(!dfn3_available(&ffmpeg));
+        std::fs::remove_dir(dir.path().join(DFN3_BINARY)).unwrap();
+        std::fs::write(dir.path().join(DFN3_BINARY), b"x").unwrap();
+        assert!(dfn3_available(&ffmpeg));
+    }
 
     // -----------------------------------------------------------------------
     // Synthetic signal helpers (no external `rand` dependency).

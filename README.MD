@@ -67,7 +67,7 @@ In this mode, VOCAN does this to each file:
 3. It drops everything outside that span.
 4. It fades in and out over 75 ms at the two edges. The fades sit inside the 150 ms margins and never touch the speech.
 
-Pauses inside the line stay, the same as with the threshold trim. If VOCAN finds no speech in a file, it leaves the file completely unchanged.
+Pauses inside the line stay, the same as with the threshold trim. If VOCAN finds no speech in a file, it does not trim or fade it.
 
 The **Silence below** and **Keep** settings do not apply in this mode. The threshold trim is not used. The mode works with the Automixer on and with the Automixer off.
 
@@ -233,7 +233,7 @@ Do these steps to process a folder of audio files:
 6. To cut the silence off the start and the end of every take, select the **Trim silence** checkbox. This option sits in the **Files** section, with the other settings that apply to every file. It works on its own — you do not need to enable the Automixer for it. Then set:
    - **Silence below**: what counts as silence. Safe (−60 dB), Recommended (−45 dB), Hard (−32 dB), or MAX (−21 dB). If the trim seems to do nothing, your recordings are noisier than the preset expects — move one step up.
    - **Keep**: how much of the original silence stays at each end. Tight (0 ms), Short (0.25 s), Medium (0.5 s), or Long (1 s).
-   - **Detect speech with Silero VAD**: instead of a volume threshold, find the speech with a model. VOCAN keeps 150 ms before the first speech and 150 ms after the last speech, with 75 ms fades at the edges, and leaves a file with no speech unchanged. This mode replaces **Silence below** and **Keep**. It is disabled, with a hint, when the model file is missing. Run the setup script again to download it.
+   - **Detect speech with Silero VAD**: instead of a volume threshold, find the speech with a model. VOCAN keeps 150 ms before the first speech and 150 ms after the last speech, with 75 ms fades at the edges, and does not trim or fade a file with no speech. This mode replaces **Silence below** and **Keep**. It is disabled, with a hint, when the model file is missing. Run the setup script again to download it.
 7. To enable the Automixer, select the **Automixer** checkbox. Then set the Automixer options:
    - **Intelligent noise removal (Spectral Gate)**: select only this option, or only the nnnoiseless option, not both.
    - **Noise reduction (nnnoiseless)**: select only this option, or only the spectral gate option, not both.
@@ -344,11 +344,11 @@ In both cases the trim is part of the filter chain that the loudness measurement
 This is the second mode of **Trim silence**. It replaces the threshold filter chain above. VOCAN never uses both in one run.
 
 1. **Detection.** VOCAN starts one extra FFmpeg process per file. It decodes the file to 16 kHz mono and streams the samples to VOCAN. VOCAN feeds them, frame by frame, to the Silero VAD model, which runs in ONNX Runtime. The model returns a speech probability for each frame.
-2. **Hysteresis.** Speech starts when the probability reaches 0.5. Speech ends when the probability falls below 0.35. The two limits stop a single noisy frame from chopping a word in half.
+2. **Hysteresis.** Speech starts when the probability reaches 0.5. Speech ends only after the probability has stayed below 0.35 for at least 96 ms (three frames). The two limits and the minimum pause stop a single weak frame, such as a stop consonant, from chopping a word in half.
 3. **Short bursts are ignored.** A speech burst shorter than 250 ms does not count. A click, a cough, or a chair creak cannot anchor the trim.
 4. **One span.** VOCAN takes the start of the first speech burst and the end of the last one. Pauses between them stay, so a breath or a dramatic pause inside a line comes through untouched.
 5. **Margins and fades.** VOCAN keeps 150 ms before the span and 150 ms after it. It applies a fixed 75 ms fade-in at the start and a fixed 75 ms fade-out at the end. Both fades sit inside the margins, so they never fall on speech.
-6. **No speech, no change.** If the model finds no speech, VOCAN leaves the file completely unchanged. It does not trim or fade it.
+6. **No speech, no change.** If the model finds no speech, VOCAN does not trim or fade the file. Everything else you switched on, such as normalization or the Automixer, still applies. A take shorter than 250 ms counts as no speech. Stereo is mixed to mono for the detection, so a file whose channels cancel each other (opposite phase) also counts as no speech.
 7. **Final chain.** VOCAN adds `atrim` and `afade` to the FFmpeg chain that already writes the output. This works the same with the Automixer on and with the Automixer off. The rest of the audio is not changed.
 
 **Cost.** One extra FFmpeg process per file, for the detection decode. VOCAN keeps only the per-frame probabilities, not the audio, so memory stays flat, even on a long file.

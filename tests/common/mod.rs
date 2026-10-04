@@ -278,6 +278,24 @@ pub fn skip_if_no_vad() -> bool {
     false
 }
 
+/// [`skip_if_no_vad`], and also skips when the speech fixture is missing.
+///
+/// For the tests that cut real speech. A normal install has the model (the
+/// installers download it) but not the fixture (CI only), so these must skip
+/// there rather than fail; the tests that need only the model keep using
+/// [`skip_if_no_vad`] and run.
+#[allow(dead_code)]
+pub fn skip_if_no_vad_fixture() -> bool {
+    if skip_if_no_vad() {
+        return true;
+    }
+    if speech_fixture().is_none() {
+        eprintln!("SKIP: speech fixture not found (set VOCAN_VAD_FIXTURE)");
+        return true;
+    }
+    false
+}
+
 /// Resolves ffmpeg the same way the app does at runtime: PATH first.
 ///
 /// `#[allow(dead_code)]` throughout this module: `tests/common/mod.rs` is

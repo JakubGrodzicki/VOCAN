@@ -39,8 +39,8 @@
 mod common;
 
 use common::{
-    noise_at_dbfs, read_wav_samples_f32, rms, skip_if_no_vad, speech_fixture, speech_samples,
-    wav_secs, write_f32_wav,
+    noise_at_dbfs, read_wav_samples_f32, rms, skip_if_no_vad, skip_if_no_vad_fixture,
+    speech_fixture, speech_samples, wav_secs, write_f32_wav,
 };
 use std::path::{Path, PathBuf};
 use vocan::ffmpeg::{reset_spawn_count, spawn_count};
@@ -137,7 +137,7 @@ fn vad_opts() -> ProcessingOptions {
 #[test]
 #[ignore]
 fn detects_the_pinned_speech_boundaries_inside_room_tone() {
-    if skip_if_no_vad() {
+    if skip_if_no_vad_fixture() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -170,7 +170,7 @@ fn detects_the_pinned_speech_boundaries_inside_room_tone() {
 #[test]
 #[ignore]
 fn the_boundaries_do_not_depend_on_the_source_sample_rate() {
-    if skip_if_no_vad() {
+    if skip_if_no_vad_fixture() {
         return;
     }
     // The decode resamples to 16 kHz; the answer in seconds must not move.
@@ -254,7 +254,7 @@ const KEPT_SECS: f64 = (8.848 + 0.150) - (2.032 - 0.150);
 #[test]
 #[ignore]
 fn plain_pipeline_keeps_speech_plus_margins_and_fades_the_edges() {
-    if skip_if_no_vad() {
+    if skip_if_no_vad_fixture() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -272,7 +272,7 @@ fn plain_pipeline_keeps_speech_plus_margins_and_fades_the_edges() {
 #[test]
 #[ignore]
 fn automixer_pipeline_trims_the_same_way() {
-    if skip_if_no_vad() {
+    if skip_if_no_vad_fixture() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -299,7 +299,7 @@ fn automixer_pipeline_trims_the_same_way() {
 #[test]
 #[ignore]
 fn a_48_khz_source_is_trimmed_to_the_same_length() {
-    if skip_if_no_vad() {
+    if skip_if_no_vad_fixture() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -313,7 +313,7 @@ fn a_48_khz_source_is_trimmed_to_the_same_length() {
 #[test]
 #[ignore]
 fn the_kept_speech_is_not_touched() {
-    if skip_if_no_vad() {
+    if skip_if_no_vad_fixture() {
         return;
     }
     // The fades live in the margins. The loudness of the speech itself must be
@@ -371,8 +371,35 @@ fn a_take_without_speech_is_left_exactly_as_it_would_be_with_the_trim_off() {
 
 #[test]
 #[ignore]
-fn pauses_inside_the_line_survive() {
+fn a_very_quiet_take_is_not_rejected_by_the_threshold_guard() {
     if skip_if_no_vad() {
+        return;
+    }
+    // The threshold trim refuses a file whose loudest moment is under its
+    // threshold, because trimming it would leave nothing. That guard has no
+    // business with VAD, which leaves a speechless file alone. Room tone at
+    // -70 dBFS is far below every threshold preset; with VAD on, the Automixer
+    // must process it, not fail with "nothing in this file reaches the Trim
+    // silence threshold".
+    let dir = tempfile::tempdir().unwrap();
+    let take = dir.path().join("whisper.wav");
+    write_f32_wav(&take, &noise_at_dbfs(48_000 * 4, -70.0, 21), 48_000);
+
+    let mut opts = vad_opts();
+    opts.automixer = true;
+    opts.automixer_spectral_gate = true;
+    let (out, logs) = run(&take, opts);
+    assert!(
+        (wav_secs(&out) - 4.0).abs() < 0.05,
+        "a file with no speech must come through whole"
+    );
+    assert!(logs.iter().any(|l| l.contains("no speech")), "{logs:?}");
+}
+
+#[test]
+#[ignore]
+fn pauses_inside_the_line_survive() {
+    if skip_if_no_vad_fixture() {
         return;
     }
     // Two phrases with 1.5 s of room tone between them. The trim must follow
@@ -405,7 +432,7 @@ fn pauses_inside_the_line_survive() {
 #[test]
 #[ignore]
 fn speech_detection_costs_exactly_one_extra_ffmpeg_process() {
-    if skip_if_no_vad() {
+    if skip_if_no_vad_fixture() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();

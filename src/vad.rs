@@ -38,7 +38,9 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// this size at 16 kHz.
 pub const WINDOW: usize = 512;
 /// Samples of the previous frame prepended to each model input. The v5/v6
-/// models expect this context; without it the scores are visibly worse.
+/// models expect this context. `probabilities_match_the_reference_run` pins the
+/// model's output on real speech, so dropping or shifting it fails a test.
+#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 const CONTEXT: usize = 64;
 /// A silent run turns into speech when a frame scores at least this.
 pub const START_THRESHOLD: f32 = 0.5;
@@ -49,6 +51,11 @@ pub const END_THRESHOLD: f32 = 0.35;
 /// Speech bursts shorter than this are ignored, so a door slam or a mouth click
 /// does not become the start of the take.
 pub const MIN_SPEECH_SECS: f64 = 0.25;
+/// Speech only ends after this much uninterrupted quiet. One or two weak frames
+/// inside a word -- a stop consonant, a breath between syllables -- are common
+/// and must not cut the word in two (Silero's reference: `min_silence_duration_ms`,
+/// 100 ms).
+pub const MIN_SILENCE_SECS: f64 = 0.095;
 /// Audio kept before the first and after the last speech.
 pub const MARGIN_SECS: f64 = 0.150;
 /// Length of the fade-in and fade-out. A fixed value, but never longer than the
@@ -111,6 +118,7 @@ fn frame_secs() -> f64 {
 /// nominal end can lie past the real end of the file.
 pub fn speech_span(probs: &[f32], total_secs: f64) -> Option<SpeechSpan> {
     let min_frames = (MIN_SPEECH_SECS / frame_secs()).ceil() as usize;
+    let min_silence_frames = (MIN_SILENCE_SECS / frame_secs()).ceil() as usize;
     let mut first_start: Option<usize> = None;
     let mut last_end: Option<usize> = None;
     let mut keep = |s: usize, e: usize| {
@@ -120,19 +128,35 @@ pub fn speech_span(probs: &[f32], total_secs: f64) -> Option<SpeechSpan> {
         }
     };
 
+    // `open` is where the current segment began; `quiet_from` is where the
+    // current run of below-`END_THRESHOLD` frames began, if there is one. The
+    // segment closes at `quiet_from` -- the first quiet frame, not the one on
+    // which the run turned long enough to count -- so the end is not pushed
+    // out by the time it took to be sure.
     let mut open: Option<usize> = None;
+    let mut quiet_from: Option<usize> = None;
     for (i, &p) in probs.iter().enumerate() {
         match open {
             None if p >= START_THRESHOLD => open = Some(i),
-            Some(s) if p < END_THRESHOLD => {
-                keep(s, i);
-                open = None;
+            Some(s) => {
+                if p >= END_THRESHOLD {
+                    quiet_from = None;
+                } else {
+                    let from = *quiet_from.get_or_insert(i);
+                    if i + 1 - from >= min_silence_frames {
+                        keep(s, from);
+                        open = None;
+                        quiet_from = None;
+                    }
+                }
             }
             _ => {}
         }
     }
     if let Some(s) = open {
-        keep(s, probs.len());
+        // The file ended before the pause got long enough to count; whatever
+        // quiet run was under way is the tail of the file, not of the speech.
+        keep(s, quiet_from.unwrap_or(probs.len()));
     }
 
     let (s, e) = (first_start?, last_end?);
@@ -560,6 +584,48 @@ mod tests {
     }
 
     #[test]
+    fn a_dip_shorter_than_the_minimum_silence_does_not_split_speech() {
+        // One and two quiet frames inside a word: common, and not a pause.
+        for dip in [1usize, 2] {
+            let p = probs(&[(0.01, 4), (0.9, 12), (0.1, dip), (0.9, 12), (0.01, 4)]);
+            let total = p.len() as f64 * F;
+            let s = speech_span(&p, total).unwrap();
+            assert!(near(s.start, 4.0 * F), "dip {dip}: start {}", s.start);
+            assert!(
+                near(s.end, (4 + 12 + dip + 12) as f64 * F),
+                "dip {dip}: end {}",
+                s.end
+            );
+        }
+    }
+
+    #[test]
+    fn a_dip_in_the_first_word_does_not_hide_its_onset() {
+        // The scenario that motivated the minimum silence: without it the first
+        // five frames are a fragment too short to count, the span starts at the
+        // second fragment, and the onset of the take falls outside the margin.
+        let p = probs(&[(0.01, 6), (0.9, 5), (0.3, 1), (0.9, 10), (0.01, 6)]);
+        let s = speech_span(&p, p.len() as f64 * F).unwrap();
+        assert!(near(s.start, 6.0 * F), "start was {}", s.start);
+    }
+
+    #[test]
+    fn three_quiet_frames_end_the_speech_at_the_first_of_them() {
+        let p = probs(&[(0.01, 4), (0.9, 12), (0.1, 3), (0.9, 3), (0.01, 4)]);
+        // The 3-frame burst after the pause is too short to count, so the span
+        // ends where the pause began.
+        let s = speech_span(&p, p.len() as f64 * F).unwrap();
+        assert!(near(s.end, 16.0 * F), "end was {}", s.end);
+    }
+
+    #[test]
+    fn a_quiet_tail_shorter_than_the_minimum_silence_is_not_speech() {
+        let p = probs(&[(0.01, 4), (0.9, 12), (0.1, 2)]);
+        let s = speech_span(&p, p.len() as f64 * F).unwrap();
+        assert!(near(s.end, 16.0 * F), "end was {}", s.end);
+    }
+
+    #[test]
     fn only_a_short_burst_gives_none() {
         let p = probs(&[(0.01, 5), (0.95, 3), (0.01, 5)]);
         assert_eq!(speech_span(&p, 13.0 * F), None);
@@ -822,6 +888,70 @@ mod tests {
             "the URL must name a release tag, not a branch"
         );
     }
+
+    // ---- the model --------------------------------------------------------
+
+    /// The model's own output on real speech, pinned.
+    ///
+    /// The boundary tests in `tests/vad_integration.rs` tolerate two frames, so
+    /// they would not notice the model being fed slightly wrong input -- a
+    /// missing context window, a state that is not carried over -- as long as
+    /// the scores stay on the right side of the thresholds. These do. Values
+    /// were measured on the first 10 s of Silero's `tests/data/test.wav` with
+    /// `silero_vad.onnx` v6.2.2; the tolerance is wide enough for CPU-to-CPU
+    /// floating-point differences and far too narrow for a wrong input.
+    ///
+    /// `#[ignore]` because it needs the model and the fixture
+    /// (`VOCAN_SILERO_MODEL`, `VOCAN_VAD_FIXTURE`); skips without them.
+    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    #[test]
+    #[ignore]
+    fn probabilities_match_the_reference_run() {
+        let (Some(model), Some(fixture)) = (
+            model_path(),
+            std::env::var_os("VOCAN_VAD_FIXTURE").map(PathBuf::from),
+        ) else {
+            eprintln!("SKIP: needs VOCAN_SILERO_MODEL and VOCAN_VAD_FIXTURE");
+            return;
+        };
+        let mut reader = hound::WavReader::open(fixture).unwrap();
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .take(SAMPLE_RATE as usize * 10)
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+
+        let mut silero = engine::Silero::load(&model).unwrap();
+        let mut probs = Vec::new();
+        for frame in samples.chunks_exact(WINDOW) {
+            probs.push(silero.probability(frame).unwrap());
+        }
+
+        let sampled: Vec<f32> = REFERENCE_FRAMES.iter().map(|&i| probs[i]).collect();
+        for (&i, (&got, &want)) in REFERENCE_FRAMES
+            .iter()
+            .zip(sampled.iter().zip(REFERENCE_PROBS.iter()))
+        {
+            assert!(
+                (got - want).abs() < 0.02,
+                "frame {i}: model gave {got}, reference {want}"
+            );
+        }
+        let sum: f32 = probs.iter().sum();
+        assert!(
+            (sum - REFERENCE_SUM).abs() < 0.5,
+            "sum of 10 s of scores {sum}, reference {REFERENCE_SUM}"
+        );
+    }
+
+    /// Frames of the 10 s excerpt that are sampled: speech onset, mid-word,
+    /// the first pause, the second phrase, and the long pause after 6.8 s.
+    const REFERENCE_FRAMES: [usize; 12] = [0, 1, 2, 20, 61, 63, 70, 85, 140, 160, 215, 250];
+    const REFERENCE_PROBS: [f32; 12] = [
+        0.2083, 0.8179, 0.8912, 0.9999, 0.9339, 0.3287, 0.0183, 0.9974, 0.9998, 1.0000, 0.0358,
+        0.0318,
+    ];
+    const REFERENCE_SUM: f32 = 203.92;
 
     // ---- for_each_frame ---------------------------------------------------
 

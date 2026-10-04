@@ -114,14 +114,8 @@ fn the_windows_installer_puts_the_model_where_the_app_looks() {
     assert_code_has(
         f,
         &c,
-        "if ($gotHash -ine $ModelSha256) {",
-        "a hash that differs must be rejected",
-    );
-    assert_code_has(
-        f,
-        &c,
-        "Remove-Item $ModelDest -Force",
-        "a rejected download must not be left behind",
+        "if ($gotHash -ine $ModelSha256) {\nRemove-Item $ModelDest -Force",
+        "a model that fails the hash check must be deleted in that same branch, or the app would use it",
     );
     assert_code_has(
         f,
@@ -156,14 +150,8 @@ fn the_unix_installer_puts_the_model_where_the_app_looks() {
     assert_code_has(
         f,
         &c,
-        r#"elif [ "$GOT_SHA" != "$MODEL_SHA256" ]; then"#,
-        "a hash that differs must be rejected",
-    );
-    assert_code_has(
-        f,
-        &c,
-        r#"rm -f "$MODEL_DEST""#,
-        "a rejected download must not be left behind",
+        "elif [ \"$GOT_SHA\" != \"$MODEL_SHA256\" ]; then\nrm -f \"$MODEL_DEST\"",
+        "a model that fails the hash check must be deleted in that same branch, or the app would use it",
     );
     assert_code_has(
         f,
@@ -176,6 +164,16 @@ fn the_unix_installer_puts_the_model_where_the_app_looks() {
         &c,
         r#"export VOCAN_SILERO_MODEL="$MODEL_DEST""#,
         "the test run executes from target/.../deps, not from the app folder",
+    );
+}
+
+#[test]
+fn ci_makes_a_skipped_vad_test_a_failure() {
+    // A skip is a pass. Without this variable a wrong model path in CI would
+    // turn every real-model test into a green no-op.
+    assert!(
+        code_of(".github/workflows/ci.yml").contains("VOCAN_REQUIRE_VAD=1"),
+        "ci.yml must set VOCAN_REQUIRE_VAD=1 (see tests/common/mod.rs skip_or_fail)"
     );
 }
 

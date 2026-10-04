@@ -193,40 +193,59 @@ fn the_boundaries_do_not_depend_on_the_source_sample_rate() {
 
 #[test]
 #[ignore]
-fn quiet_speech_is_found_where_it_starts() {
+fn quiet_speech_is_found_where_it_starts_at_every_level() {
     if skip_if_no_vad_fixture() {
         return;
     }
-    // Speech 40 dB under the fixture, over a room floor 60 dB under it. Without
-    // the level evening in the detection decode the model finds the start
-    // 0.27 s late here, which eats the first word; with it, the start lands on
-    // the pinned reference like any other take.
+    // The same 8 s of speech, 14 to 40 dB under the fixture, over a room floor
+    // 35 dB under the speech, with and without one microphone bump in the lead.
+    //
+    // Two things are pinned at once. Quiet takes must be found where they start
+    // (without the gain pass the model finds the start 0.27 s late at -40 dB and
+    // over a second late at -45 dB, which eats the first word). And the gain
+    // pass must not move the answer for takes it merely brushes against: the
+    // levels near the rescue threshold are where a gain that also lifted the
+    // pauses would show up as an end of speech that has wandered into the
+    // breaths and room noise of the recording's own quiet tail.
     let dir = tempfile::tempdir().unwrap();
-    let take = dir.path().join("quiet.wav");
-    let gain = 10f32.powf(-40.0 / 20.0);
-    let mut samples = noise_at_dbfs(16_000 * 2, -75.0, 13);
-    samples.extend(
-        speech_samples(&fixture(), 8.0)
-            .into_iter()
-            .map(|s| s * gain),
-    );
-    samples.extend(noise_at_dbfs(16_000 * 2, -75.0, 17));
-    write_f32_wav(&take, &samples, 16_000);
+    for &(db, bump) in &[
+        (-14.0f32, false),
+        (-20.0, false),
+        (-26.0, false),
+        (-32.0, false),
+        (-40.0, false),
+        (-40.0, true),
+        (-26.0, true),
+    ] {
+        let take = dir.path().join("quiet.wav");
+        let gain = 10f32.powf(db / 20.0);
+        let floor_db = -23.0 + db - 35.0;
+        let mut samples = noise_at_dbfs(16_000 * 2, floor_db, 13);
+        samples.extend(
+            speech_samples(&fixture(), 8.0)
+                .into_iter()
+                .map(|s| s * gain),
+        );
+        samples.extend(noise_at_dbfs(16_000 * 2, floor_db, 17));
+        if bump {
+            // One loud sample in the lead-in: what a bump of the microphone
+            // leaves. It must not decide whether the take counts as quiet.
+            samples[16_000] = 0.6;
+        }
+        write_f32_wav(&take, &samples, 16_000);
 
-    let d = vad::detect_speech(&take, &common::ffmpeg_path(), &model()).unwrap();
-    let span = d.span.expect("quiet speech is still speech");
-    assert!(
-        (span.start - 2.032).abs() <= TOLERANCE,
-        "quiet speech starts at 2.032 s, found at {} s",
-        span.start
-    );
-    assert!(
-        (span.end - 8.848).abs() <= TOLERANCE,
-        "quiet speech ends at 8.848 s, found at {} s",
-        span.end
-    );
+        let d = vad::detect_speech(&take, &common::ffmpeg_path(), &model()).unwrap();
+        let span = d
+            .span
+            .unwrap_or_else(|| panic!("{db} dB (bump {bump}): speech not found"));
+        assert!(
+            (span.start - 2.032).abs() <= TOLERANCE && (span.end - 8.848).abs() <= TOLERANCE,
+            "{db} dB (bump {bump}): speech is 2.032-8.848 s, found {:.3}-{:.3} s",
+            span.start,
+            span.end
+        );
+    }
 }
-
 #[test]
 #[ignore]
 fn a_stereo_source_is_heard_as_mono() {

@@ -1300,7 +1300,7 @@ impl AudioBatchApp {
                     "Keeps 150 ms before the first word and 150 ms after the last, with a \
                      75 ms fade at each end, and cuts the rest. Pauses inside the line are \
                      kept. A file with no speech in it is left as it is. Costs one extra \
-                     decode of each file.",
+                     decode of each file (two for a very quiet one).",
                 );
             } else {
                 ui.add_space(6.0);

@@ -68,8 +68,12 @@ tests skip on a normal install.
   missing). Covers detection on the speech fixture and the end-to-end trim
   behaviour: 150 ms margins, 75 ms fades, no change when there is no speech,
   with the Automixer on and off. Also covers a stereo source, speech recorded
-  40 dB quieter than the fixture (the gain-and-redecode path for quiet files),
+  14 to 40 dB quieter than the fixture, with and without one loud bump in the
+  lead-in (the gain-and-redecode path for quiet files),
   a 48 kHz source and a pause inside the line.
+- `tests/vad_require.rs`: `VOCAN_REQUIRE_VAD` itself. A VAD test that cannot
+  run skips normally and fails when the variable is set (its own binary, since
+  it changes process-wide environment variables).
 - `tests/vad_stop.rs`: Stop (`proc::terminate_all`) reaches the speech
   detection decode of a 15-minute file. Its own binary, because terminating
   children is process-wide and would kill the other tests' ffmpegs.

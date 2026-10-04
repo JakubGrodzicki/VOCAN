@@ -346,7 +346,7 @@ In both cases the trim is part of the filter chain that the loudness measurement
 This is the second mode of **Trim silence**. It replaces the threshold filter chain above. VOCAN never uses both in one run.
 
 1. **Detection.** VOCAN starts one extra FFmpeg process per file. It decodes the file to 16 kHz mono and streams the samples to VOCAN. VOCAN feeds them, frame by frame, to the Silero VAD model, which runs in ONNX Runtime. The model returns a speech probability for each frame.
-2. **Hysteresis.** Speech starts when the probability reaches 0.5. Speech ends only after the probability has stayed below 0.35 for at least four frames (128 ms). The two limits and the minimum pause stop a single weak frame, such as a stop consonant, from chopping a word in half.
+2. **Hysteresis.** Speech starts when the probability reaches 0.5. Speech ends only after the probability has stayed below 0.35 for five frames in a row (160 ms). This is Silero's own rule: a pause closes the speech when a quiet frame lies 100 ms after the first quiet one. The two limits and the minimum pause stop a single weak frame, such as a stop consonant, from chopping a word in half.
 3. **Short bursts are ignored.** A speech burst shorter than 250 ms does not count. A click, a cough, or a chair creak cannot anchor the trim.
 4. **One span.** VOCAN takes the start of the first speech burst and the end of the last one. Pauses between them stay, so a breath or a dramatic pause inside a line comes through untouched.
 5. **Margins and fades.** VOCAN keeps 150 ms before the span and 150 ms after it. It applies a 75 ms fade-in at the start and a 75 ms fade-out at the end. Both fades sit inside the margins, so they never fall on speech. If the speech starts or ends closer than 75 ms to the edge of the file, that fade is only as long as the room that is there. Speech at the very first sample gets no fade-in.
@@ -355,7 +355,7 @@ This is the second mode of **Trim silence**. It replaces the threshold filter ch
 
 **Cost.** One extra FFmpeg process per file, for the detection decode. VOCAN keeps only the per-frame probabilities, not the audio, so memory use grows by about half a megabyte per hour of audio.
 
-**Quiet files.** The model judges speech partly by level, and a take recorded very quietly can be detected late, which would cut the start of the first word. So if the loudest sample of a file is below -34 dBFS, VOCAN decodes it a second time with a gain that brings its peak to -12 dBFS (at most +40 dB). Speech and pauses are raised together, so the model sees the same relation between them. This applies to the detection only. The audio that is written is never changed by it. A very quiet file therefore costs two extra FFmpeg processes instead of one.
+**Quiet files.** The model judges speech partly by level, and a take recorded very quietly can be detected late, which would cut the start of the first word. So if the level of a file is below -20 dBFS, VOCAN decodes it a second time with a gain that brings that level to about -10 dBFS (at most +40 dB). The level is the 99th percentile of the per-frame peaks, not the single loudest sample, so one bump of the microphone does not hide that the take is quiet. Speech and pauses are raised together, so the model sees the same relation between them. This applies to the detection only. The audio that is written is never changed by it. A very quiet file therefore costs two extra FFmpeg processes instead of one.
 
 **Model location.** VOCAN looks for the model in this order:
 

@@ -11,9 +11,11 @@
 //! the first can be tested without a model:
 //!
 //! 1. [`detect_speech`] decodes the file to 16 kHz mono in **one extra ffmpeg
-//!    process**, streams it through the model frame by frame and returns the
-//!    first start and last end of speech. Only the per-frame probabilities are
-//!    kept, so memory use does not grow with the length of the file.
+//!    process** (two for a file that is quiet as a whole, which is decoded a
+//!    second time with a gain), streams it through the model frame by frame and
+//!    returns the first start and last end of speech. Only per-frame numbers are
+//!    kept, never the audio, so memory use grows by under half a megabyte per
+//!    hour of audio.
 //! 2. [`plan_trim`] widens that span by [`MARGIN_SECS`] on each side and works
 //!    out the fades.
 //! 3. [`trim_filter`] turns the plan into an `atrim`/`afade` filter string that
@@ -54,21 +56,30 @@ pub const MIN_SPEECH_SECS: f64 = 0.25;
 /// Speech only ends after this much uninterrupted quiet. One or two weak frames
 /// inside a word -- a stop consonant, a breath between syllables -- are common
 /// and must not cut the word in two. Silero's reference uses
-/// `min_silence_duration_ms = 100`; frames are 32 ms, so that rounds up to four
-/// whole frames (128 ms), which is also the more cautious side: a longer
-/// required pause merges more, and merging never hides the start of a word.
+/// `min_silence_duration_ms = 100`, checked from the first quiet frame: with
+/// 32 ms frames that is four frames after it, so a pause closes the speech when
+/// it is five quiet frames long (160 ms). Fewer would split a short leading word
+/// from the rest of the line on a pause the reference bridges, and the word
+/// would then be dropped as too short to count.
 pub const MIN_SILENCE_SECS: f64 = 0.100;
 
-/// A file whose loudest sample is below this (-34 dBFS) is read a second time
-/// with a gain, see [`QUIET_TARGET_PEAK`].
+/// A file whose level is below this (-20 dBFS) is read a second time with a
+/// gain, see [`rescue_gain_db`].
 ///
 /// Silero's scores depend on level. Speech recorded 40 dB under a normal take
 /// was "found" 0.27 s late in testing, and 45 dB under it over a second late,
 /// so a quiet voice-over lost the opening of its first word to the cut.
-const QUIET_PEAK: f32 = 0.02;
-/// The loudest sample the second read is brought to (-12 dBFS): a normal level,
-/// well clear of clipping.
-const QUIET_TARGET_PEAK: f32 = 0.25;
+///
+/// "Level" is the 99th percentile of the per-frame peaks, not the largest
+/// sample: one bump of the microphone or a click is a single frame, and gating
+/// on the largest sample let it switch the rescue off for a take that was
+/// otherwise 40 dB too quiet (the cut then landed up to a second inside the
+/// speech). The threshold is generous on purpose; boosting a file that did not
+/// strictly need it was tested on white, pink and brown noise, hum and breaths
+/// and found no speech that was not there.
+const QUIET_LEVEL: f32 = 0.1;
+/// The level the second read is brought to (-10.5 dBFS): a normal level.
+const QUIET_TARGET_LEVEL: f32 = 0.3;
 /// Ceiling on that gain. Past it the file is noise-floor-sized and boosting it
 /// further finds only the noise.
 const QUIET_MAX_GAIN_DB: f32 = 40.0;
@@ -79,6 +90,26 @@ const QUIET_MAX_GAIN_DB: f32 = 40.0;
 // a file that is quiet as a whole raises speech and pause together, so their
 // relation, which is what the model judges, is unchanged. It costs a second
 // process only for files that are quiet to begin with.
+
+/// The gain, in dB, for the second read of a file whose level is `level`, or
+/// `None` when it should not be read again: it is loud enough already, or it is
+/// digital silence (a gain cannot find speech in zeros).
+fn rescue_gain_db(level: f32) -> Option<f32> {
+    if level.is_nan() || level <= 0.0 || level >= QUIET_LEVEL {
+        return None;
+    }
+    Some((20.0 * (QUIET_TARGET_LEVEL / level).log10()).min(QUIET_MAX_GAIN_DB))
+}
+
+/// The 99th percentile of `peaks` (0 for an empty slice).
+fn level_of(peaks: &[f32]) -> f32 {
+    if peaks.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = peaks.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    sorted[((sorted.len() - 1) as f64 * 0.99).floor() as usize]
+}
 /// Audio kept before the first and after the last speech.
 pub const MARGIN_SECS: f64 = 0.150;
 /// Length of the fade-in and fade-out. A fixed value, but never longer than the
@@ -166,7 +197,13 @@ pub fn speech_span(probs: &[f32], total_secs: f64) -> Option<SpeechSpan> {
                     quiet_from = None;
                 } else {
                     let from = *quiet_from.get_or_insert(i);
-                    if i + 1 - from >= min_silence_frames {
+                    // `i - from`, not `i + 1 - from`: Silero's reference closes
+                    // a segment when a quiet frame lies `min_silence` after the
+                    // *first* quiet one, so the run has to be that many frames
+                    // long *plus the first*. One frame less would split a
+                    // leading word from the rest on a pause the reference
+                    // bridges, and then drop it as too short.
+                    if i - from >= min_silence_frames {
                         keep(s, from);
                         open = None;
                         quiet_from = None;
@@ -374,8 +411,7 @@ fn for_each_frame(
 pub fn detect_speech(input: &Path, ffmpeg: &Path, model: &Path) -> Result<Detection> {
     let mut pass = run_pass(input, ffmpeg, model, None)?;
 
-    if pass.peak > 0.0 && pass.peak < QUIET_PEAK {
-        let gain_db = (20.0 * (QUIET_TARGET_PEAK / pass.peak).log10()).min(QUIET_MAX_GAIN_DB);
+    if let Some(gain_db) = rescue_gain_db(pass.level) {
         pass = run_pass(input, ffmpeg, model, Some(gain_db))?;
     }
 
@@ -392,9 +428,8 @@ struct Pass {
     probs: Vec<f32>,
     /// Real samples decoded (the zero padding of the last frame excluded).
     samples: u64,
-    /// Largest absolute sample the model was fed in this pass (so, with a gain
-    /// applied, the amplified peak).
-    peak: f32,
+    /// The level of what the model was fed in this pass (see [`QUIET_LEVEL`]).
+    level: f32,
 }
 
 /// Decodes `input` to 16 kHz mono, optionally with `gain_db` applied, and runs
@@ -438,14 +473,16 @@ fn run_pass(input: &Path, ffmpeg: &Path, model: &Path, gain_db: Option<f32>) -> 
     // result, close our read end so a still-writing ffmpeg cannot block the
     // `wait()`, reap, and only then propagate any error.
     let mut probs: Vec<f32> = Vec::new();
-    let mut peak = 0.0f32;
+    let mut frame_peaks: Vec<f32> = Vec::new();
     let read_result = match child.stdout.as_mut() {
         Some(stdout) => for_each_frame(stdout, |frame| {
             // An explicit comparison rather than `f32::max`: a NaN sample
             // compares false, so it can never become the peak.
-            peak = frame
-                .iter()
-                .fold(peak, |m, s| if s.abs() > m { s.abs() } else { m });
+            frame_peaks.push(
+                frame
+                    .iter()
+                    .fold(0.0f32, |m, s| if s.abs() > m { s.abs() } else { m }),
+            );
             probs.push(silero.probability(frame)?);
             Ok(())
         }),
@@ -470,7 +507,7 @@ fn run_pass(input: &Path, ffmpeg: &Path, model: &Path, gain_db: Option<f32>) -> 
     Ok(Pass {
         probs,
         samples,
-        peak,
+        level: level_of(&frame_peaks),
     })
 }
 
@@ -651,8 +688,8 @@ mod tests {
 
     #[test]
     fn a_dip_shorter_than_the_minimum_silence_does_not_split_speech() {
-        // One and two quiet frames inside a word: common, and not a pause.
-        for dip in [1usize, 2, 3] {
+        // Up to four quiet frames (128 ms) inside a line: not a pause.
+        for dip in [1usize, 2, 3, 4] {
             let p = probs(&[(0.01, 4), (0.9, 12), (0.1, dip), (0.9, 12), (0.01, 4)]);
             let total = p.len() as f64 * F;
             let s = speech_span(&p, total).unwrap();
@@ -676,8 +713,8 @@ mod tests {
     }
 
     #[test]
-    fn four_quiet_frames_end_the_speech_at_the_first_of_them() {
-        let p = probs(&[(0.01, 4), (0.9, 12), (0.1, 4), (0.9, 3), (0.01, 4)]);
+    fn five_quiet_frames_end_the_speech_at_the_first_of_them() {
+        let p = probs(&[(0.01, 4), (0.9, 12), (0.1, 5), (0.9, 3), (0.01, 4)]);
         // The 3-frame burst after the pause is too short to count, so the span
         // ends where the pause began.
         let s = speech_span(&p, p.len() as f64 * F).unwrap();
@@ -685,20 +722,20 @@ mod tests {
     }
 
     #[test]
-    fn the_minimum_pause_is_exactly_four_frames() {
+    fn the_minimum_pause_is_exactly_five_frames() {
         // Two halves that are each too short to count (5 frames) but together
         // are speech (>= 8). Whether they were merged is the only way to tell
-        // a 3-frame minimum pause from a 4-frame one from the span alone.
+        // a 4-frame minimum pause from a 5-frame one from the span alone. Five\n        // is what Silero's reference needs: a quiet frame four frames after the\n        // first quiet one.
         let gap = |n: usize| probs(&[(0.01, 4), (0.9, 5), (0.1, n), (0.9, 5), (0.01, 4)]);
         let merged = |n: usize| {
             let p = gap(n);
             speech_span(&p, p.len() as f64 * F).is_some()
         };
         assert!(
-            merged(1) && merged(2) && merged(3),
-            "a pause under 4 frames splits"
+            merged(1) && merged(2) && merged(3) && merged(4),
+            "a pause under 5 frames splits"
         );
-        assert!(!merged(4), "a pause of 4 frames must end the speech");
+        assert!(!merged(5), "a pause of 5 frames must end the speech");
         assert!(!merged(10));
     }
 
@@ -721,7 +758,7 @@ mod tests {
 
     #[test]
     fn a_quiet_tail_shorter_than_the_minimum_silence_is_not_speech() {
-        let p = probs(&[(0.01, 4), (0.9, 12), (0.1, 3)]);
+        let p = probs(&[(0.01, 4), (0.9, 12), (0.1, 4)]);
         let s = speech_span(&p, p.len() as f64 * F).unwrap();
         assert!(near(s.end, 16.0 * F), "end was {}", s.end);
     }
@@ -990,6 +1027,73 @@ mod tests {
         );
     }
 
+    // ---- the quiet-file rescue --------------------------------------------
+
+    #[test]
+    fn rescue_gain_brings_the_level_to_the_target() {
+        // 0.003 -> 0.3 is a factor of 100, i.e. exactly 40 dB; 0.03 -> 0.3 is
+        // 10x, 20 dB; 0.06 -> 0.3 is 5x, 13.98 dB.
+        let db = |level: f32| rescue_gain_db(level).unwrap();
+        assert!((db(0.03) - 20.0).abs() < 1e-3, "{}", db(0.03));
+        assert!((db(0.06) - 13.979).abs() < 1e-2, "{}", db(0.06));
+        assert!((db(0.003) - 40.0).abs() < 1e-3, "{}", db(0.003));
+        // The applied gain really does land the level on the target.
+        let level = 0.012_f32;
+        let landed = level * 10f32.powf(db(level) / 20.0);
+        assert!((landed - QUIET_TARGET_LEVEL).abs() < 1e-4, "{landed}");
+    }
+
+    #[test]
+    fn rescue_gain_is_capped() {
+        assert_eq!(rescue_gain_db(0.0001), Some(QUIET_MAX_GAIN_DB));
+        assert_eq!(rescue_gain_db(1e-20), Some(QUIET_MAX_GAIN_DB));
+        assert_eq!(QUIET_MAX_GAIN_DB, 40.0);
+    }
+
+    #[test]
+    fn rescue_is_off_for_loud_files_silence_and_nonsense() {
+        assert_eq!(
+            rescue_gain_db(QUIET_LEVEL),
+            None,
+            "the threshold is exclusive"
+        );
+        assert_eq!(rescue_gain_db(0.5), None);
+        assert_eq!(rescue_gain_db(1.0), None);
+        assert_eq!(rescue_gain_db(0.0), None, "digital silence gains nothing");
+        assert_eq!(rescue_gain_db(-0.1), None);
+        assert_eq!(rescue_gain_db(f32::NAN), None);
+        assert_eq!(rescue_gain_db(f32::INFINITY), None);
+        assert!(rescue_gain_db(QUIET_LEVEL * 0.99).is_some());
+    }
+
+    #[test]
+    fn the_level_ignores_a_single_loud_frame() {
+        // 500 frames of a quiet take and one bump of the microphone. The
+        // largest-sample rule read this file as loud and skipped the rescue.
+        let mut peaks = vec![0.005f32; 500];
+        peaks[200] = 0.9;
+        let level = level_of(&peaks);
+        assert!((level - 0.005).abs() < 1e-6, "level {level}");
+        assert!(rescue_gain_db(level).is_some());
+    }
+
+    #[test]
+    fn the_level_still_sees_a_take_that_is_loud_throughout() {
+        let peaks = vec![0.4f32; 300];
+        assert!((level_of(&peaks) - 0.4).abs() < 1e-6);
+        assert_eq!(rescue_gain_db(level_of(&peaks)), None);
+    }
+
+    #[test]
+    fn the_level_of_nothing_is_zero_and_of_one_frame_is_that_frame() {
+        assert_eq!(level_of(&[]), 0.0);
+        assert_eq!(level_of(&[0.07]), 0.07);
+        // The top 1% is dropped: 100 frames, the loudest one is ignored.
+        let mut peaks = vec![0.01f32; 99];
+        peaks.push(0.8);
+        assert!((level_of(&peaks) - 0.01).abs() < 1e-6);
+    }
+
     // ---- the model --------------------------------------------------------
 
     /// The model's own output on real speech, pinned.
@@ -1013,8 +1117,9 @@ mod tests {
             std::env::var_os("VOCAN_VAD_FIXTURE").map(PathBuf::from),
         ) else {
             // CI sets VOCAN_REQUIRE_VAD: there, a skip would be a green no-op.
+            let required = std::env::var_os("VOCAN_REQUIRE_VAD").is_some_and(|v| !v.is_empty());
             assert!(
-                std::env::var_os("VOCAN_REQUIRE_VAD").is_none(),
+                !required,
                 "VOCAN_REQUIRE_VAD is set but VOCAN_SILERO_MODEL / VOCAN_VAD_FIXTURE do not \
                  point at existing files"
             );

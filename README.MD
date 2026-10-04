@@ -52,9 +52,26 @@ If a preset is too low for your material, the silence in your files is louder th
 
 Keep is a **ceiling, not a target**. VOCAN keeps up to this much of the silence that was already in the file and never adds any. A take with 0.3 s of lead-in keeps 0.3 s even on Long.
 
-**Cost.** Trimming launches no extra processes. VOCAN adds the filter to a chain that FFmpeg was going to run anyway, so a trimmed run launches exactly as many processes and reads each file exactly as many times as an untrimmed one.
+**Cost.** The threshold trim launches no extra processes. VOCAN adds the filter to a chain that FFmpeg was going to run anyway, so a trimmed run launches exactly as many processes and reads each file exactly as many times as an untrimmed one. The optional speech detection described below launches one extra FFmpeg process per file.
 
 If nothing in a file reaches the threshold, nothing would survive the trim. With the Automixer on, VOCAN reports the file as an error and writes no output for it, rather than publishing an empty audio file that looks like a successful conversion. Without the Automixer, VOCAN cannot see the signal in memory and so cannot make that check without spending another FFmpeg process on every file in the batch; such a file is written out empty.
+
+#### Detect speech with Silero VAD (optional)
+
+The threshold trim judges volume. In a noisy room, the noise is louder than the threshold, so the trim finds no silence and does nothing. For that case, the **Trim silence** option has a second mode: select **Detect speech with Silero VAD**. VOCAN then finds the speech with a small speech-detection model (Silero VAD) instead of a volume threshold.
+
+In this mode, VOCAN does this to each file:
+
+1. It finds where the first speech starts and where the last speech ends.
+2. It keeps 150 ms before the first speech and 150 ms after the last speech.
+3. It drops everything outside that span.
+4. It fades in and out over 75 ms at the two edges. The fades sit inside the 150 ms margins and never touch the speech.
+
+Pauses inside the line stay, the same as with the threshold trim. If VOCAN finds no speech in a file, it leaves the file completely unchanged.
+
+The **Silence below** and **Keep** settings do not apply in this mode. The threshold trim is not used. The mode works with the Automixer on and with the Automixer off.
+
+The mode needs the model file `silero_vad.onnx`, which the setup scripts download. If the file is missing, the checkbox is disabled and a hint tells you to run the setup script again. It also costs one extra FFmpeg process per file. See "Silero VAD speech detection" in Technical Details.
 
 ### Automixer chain (optional)
 
@@ -99,6 +116,10 @@ On Windows, the FFmpeg file name is `ffmpeg.exe`. On Linux and macOS, the file n
 
 DeepFilterNet3 is optional. VOCAN needs DeepFilterNet3 only when you enable the dereverb option. Get the `deep-filter` executable file from the [DeepFilterNet releases page](https://github.com/Rikorose/DeepFilterNet/releases). Put this file in the same folder as the FFmpeg executable file. On Windows, the file name is `deep-filter.exe`.
 
+The Silero VAD model is optional. VOCAN needs it only for the **Detect speech with Silero VAD** checkbox. The model is one file, `silero_vad.onnx` (about 2.3 MB), and it must sit in a `models` folder next to the VOCAN executable file: `models/silero_vad.onnx`. As a fallback, VOCAN also accepts the file directly next to the executable. To use a file in another place, set the environment variable `VOCAN_SILERO_MODEL` to its full path. This variable takes priority over both folders. This model file is the only extra download. ONNX Runtime, which runs the model, is built into the VOCAN executable file, so you do not install it.
+
+Silero VAD is not available on Intel Macs, because ONNX Runtime has no build for them. On an Intel Mac, VOCAN works as usual but the checkbox stays disabled.
+
 The setup script in the next section can install all these requirements for you.
 
 ## Build Instructions
@@ -111,8 +132,9 @@ VOCAN has one setup script for macOS and Linux, and one setup script for Windows
 2. Installs Rust, if it is missing.
 3. Installs FFmpeg, if it is missing.
 4. Downloads DeepFilterNet3 and places it next to the VOCAN binary.
-5. Builds VOCAN in release mode.
-6. Runs the automated test suite, to confirm that the build works.
+5. Downloads the Silero VAD model into a `models` folder next to the VOCAN binary, and checks its SHA-256 hash.
+6. Builds VOCAN in release mode.
+7. Runs the automated test suite, to confirm that the build works.
 
 Do these steps on macOS or Linux:
 
@@ -133,7 +155,11 @@ cd VOCAN
 
 The script prints the location of the finished binary at the end.
 
-To skip the DeepFilterNet3 download, add the flag `--no-dfn3` (macOS/Linux) or `-NoDfn3` (Windows). To skip the test suite, add the flag `--skip-tests` (macOS/Linux) or `-SkipTests` (Windows).
+To skip the DeepFilterNet3 download, add the flag `--no-dfn3` (macOS/Linux) or `-NoDfn3` (Windows). To skip the Silero VAD model download, add the flag `--no-vad` (macOS/Linux) or `-NoVad` (Windows). To skip the test suite, add the flag `--skip-tests` (macOS/Linux) or `-SkipTests` (Windows).
+
+The Silero VAD model is the only extra download. The build itself fetches a prebuilt ONNX Runtime from the network and links it into the executable file, so there is nothing more to ship. If the model download or its hash check fails, the script deletes the file, prints a warning, and carries on. VOCAN then works without the Silero VAD checkbox. On Intel Macs, the script prints a warning and skips the model, because ONNX Runtime has no build for that CPU.
+
+On Linux, the build needs the OpenSSL headers and `pkg-config`, because the ONNX Runtime download runs over TLS. The script installs `libssl-dev` and `pkg-config` (or the matching packages for `dnf` and `pacman`) for you.
 
 **Note about DeepFilterNet3 and downloaded-file warnings:** the script downloads the `deep-filter` executable file from its official GitHub releases page and clears the "downloaded file" flag from your operating system, so that the file can run. On macOS, this flag is the Gatekeeper quarantine attribute. On Windows, this flag is the Mark of the Web. This is the same action you would take yourself, through your file manager, to run a downloaded executable file.
 
@@ -156,6 +182,32 @@ If you prefer not to use the setup script, do these steps:
 
 3. Find the binary at `target/release/VOCAN`. On Windows, the file name is `VOCAN.exe`.
 
+4. Optional: download the Silero VAD model, for the **Detect speech with Silero VAD** checkbox. Put it in a `models` folder next to the binary.
+
+   On macOS or Linux:
+
+   ```bash
+   mkdir -p target/release/models
+   curl -fL -o target/release/models/silero_vad.onnx \
+     https://github.com/snakers4/silero-vad/raw/v6.2.2/src/silero_vad/data/silero_vad.onnx
+   echo "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3  target/release/models/silero_vad.onnx" | sha256sum -c -
+   ```
+
+   On macOS, `sha256sum` may be missing. Use `shasum -a 256 -c -` instead. The check must print `OK`.
+
+   On Windows, in PowerShell:
+
+   ```powershell
+   New-Item -ItemType Directory -Force target\release\models | Out-Null
+   Invoke-WebRequest -UseBasicParsing -OutFile target\release\models\silero_vad.onnx `
+     -Uri 'https://github.com/snakers4/silero-vad/raw/v6.2.2/src/silero_vad/data/silero_vad.onnx'
+   (Get-FileHash target\release\models\silero_vad.onnx -Algorithm SHA256).Hash
+   ```
+
+   The hash must be `1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3`. PowerShell prints it in capital letters. If you run VOCAN with `cargo run`, the binary is in `target/debug`, so either copy the `models` folder there or set `VOCAN_SILERO_MODEL` to the full path of the file.
+
+   On Linux, the build needs the OpenSSL headers and `pkg-config` first (on Debian and Ubuntu: `sudo apt-get install libssl-dev pkg-config`), because the `ort` build script downloads ONNX Runtime over TLS. Intel Macs cannot build with Silero VAD, because ONNX Runtime has no build for them.
+
 `Cargo.toml` lists all dependencies. VOCAN uses these main dependencies:
 
 - `eframe` and `egui`, for the graphical interface
@@ -167,6 +219,7 @@ If you prefer not to use the setup script, do these steps:
 - `anyhow`, for error handling
 - `serde` and `serde_json`, to parse the FFmpeg `loudnorm` JSON output
 - `walkdir`, to scan folders
+- `ort`, to run the Silero VAD model with ONNX Runtime. The build downloads a prebuilt ONNX Runtime and links it statically
 
 ## Usage
 
@@ -180,6 +233,7 @@ Do these steps to process a folder of audio files:
 6. To cut the silence off the start and the end of every take, select the **Trim silence** checkbox. This option sits in the **Files** section, with the other settings that apply to every file. It works on its own — you do not need to enable the Automixer for it. Then set:
    - **Silence below**: what counts as silence. Safe (−60 dB), Recommended (−45 dB), Hard (−32 dB), or MAX (−21 dB). If the trim seems to do nothing, your recordings are noisier than the preset expects — move one step up.
    - **Keep**: how much of the original silence stays at each end. Tight (0 ms), Short (0.25 s), Medium (0.5 s), or Long (1 s).
+   - **Detect speech with Silero VAD**: instead of a volume threshold, find the speech with a model. VOCAN keeps 150 ms before the first speech and 150 ms after the last speech, with 75 ms fades at the edges, and leaves a file with no speech unchanged. This mode replaces **Silence below** and **Keep**. It is disabled, with a hint, when the model file is missing. Run the setup script again to download it.
 7. To enable the Automixer, select the **Automixer** checkbox. Then set the Automixer options:
    - **Intelligent noise removal (Spectral Gate)**: select only this option, or only the nnnoiseless option, not both.
    - **Noise reduction (nnnoiseless)**: select only this option, or only the spectral gate option, not both.
@@ -209,6 +263,8 @@ cargo test -- --ignored
 The full test suite needs a real FFmpeg executable on the PATH. These tests generate WAV files, then process the files through the real pipeline.
 
 The full test suite also includes tests for the DeepFilterNet3 dereverb feature. These tests need a `deep-filter` executable file next to FFmpeg. The setup script in "Build Instructions" installs this file for you. If VOCAN cannot find the file, these tests print a skip notice and pass without an error, so the full test suite still works on a computer without DeepFilterNet3.
+
+It also includes tests for Silero VAD speech detection. These tests need the model file and a speech recording. They read the paths from the environment variables `VOCAN_SILERO_MODEL` and `VOCAN_VAD_FIXTURE` (CI sets both). If a file is missing, the tests print a skip notice and pass.
 
 `TESTING.md` has a manual test checklist for the graphical interface.
 
@@ -247,6 +303,8 @@ VOCAN runs the Rust chain at the **source sample rate**. Two steps are the excep
 
 ### Silence trimming
 
+This section describes the threshold trim, which is the default. The speech-detection mode is described in "Silero VAD speech detection" below.
+
 VOCAN builds this filter chain, and gives it to FFmpeg as part of a chain that already runs. `THRESHOLD` comes from the **Silence below** preset and `SILENCE` from the **Keep** preset; shown here at the defaults, Recommended and Tight:
 
 ```
@@ -280,6 +338,28 @@ In both cases the trim is part of the filter chain that the loudness measurement
 `areverse` buffers the whole stream inside FFmpeg. For voice-over takes this costs nothing. It is worth knowing before pointing VOCAN at hour-long files with this option on.
 
 **One note on the interaction with other steps.** The 3-second threshold that picks the first loudness measurement is read from the untrimmed length, because that is all a probe can report without an extra process. It only decides which measurement is tried first, and the padded pass behind it catches any file that turns out to be too short.
+
+### Silero VAD speech detection
+
+This is the second mode of **Trim silence**. It replaces the threshold filter chain above. VOCAN never uses both in one run.
+
+1. **Detection.** VOCAN starts one extra FFmpeg process per file. It decodes the file to 16 kHz mono and streams the samples to VOCAN. VOCAN feeds them, frame by frame, to the Silero VAD model, which runs in ONNX Runtime. The model returns a speech probability for each frame.
+2. **Hysteresis.** Speech starts when the probability reaches 0.5. Speech ends when the probability falls below 0.35. The two limits stop a single noisy frame from chopping a word in half.
+3. **Short bursts are ignored.** A speech burst shorter than 250 ms does not count. A click, a cough, or a chair creak cannot anchor the trim.
+4. **One span.** VOCAN takes the start of the first speech burst and the end of the last one. Pauses between them stay, so a breath or a dramatic pause inside a line comes through untouched.
+5. **Margins and fades.** VOCAN keeps 150 ms before the span and 150 ms after it. It applies a fixed 75 ms fade-in at the start and a fixed 75 ms fade-out at the end. Both fades sit inside the margins, so they never fall on speech.
+6. **No speech, no change.** If the model finds no speech, VOCAN leaves the file completely unchanged. It does not trim or fade it.
+7. **Final chain.** VOCAN adds `atrim` and `afade` to the FFmpeg chain that already writes the output. This works the same with the Automixer on and with the Automixer off. The rest of the audio is not changed.
+
+**Cost.** One extra FFmpeg process per file, for the detection decode. VOCAN keeps only the per-frame probabilities, not the audio, so memory stays flat, even on a long file.
+
+**Model location.** VOCAN looks for the model in this order:
+
+1. The path in the environment variable `VOCAN_SILERO_MODEL`, if it is set.
+2. `models/silero_vad.onnx`, in the folder with the VOCAN executable file.
+3. `silero_vad.onnx`, directly in the folder with the VOCAN executable file.
+
+If VOCAN finds no model, the checkbox is disabled. ONNX Runtime is linked statically through the `ort` crate, so it is part of the executable file.
 
 ### Non-Automixer mode
 
@@ -321,6 +401,11 @@ The `loudnorm` filter has a silence gate at −70 LUFS. This gate excludes silen
 VOCAN writes all log messages to the graphical interface. If FFmpeg fails, VOCAN captures the FFmpeg error output and adds it to the log message. If one file causes a panic, VOCAN catches the panic and logs it. The panic does not stop the worker pool.
 
 VOCAN uses the `tempfile` crate to manage temporary files. VOCAN deletes these files automatically. VOCAN also deletes the DeepFilterNet3 output folder after each run.
+
+## Third-party components
+
+- The Silero VAD model (`silero_vad.onnx`): MIT license, [snakers4/silero-vad](https://github.com/snakers4/silero-vad). The setup scripts download it. VOCAN does not include it in this repository.
+- ONNX Runtime: MIT license, Microsoft. VOCAN gets it through the `ort` crate, which downloads a prebuilt copy at build time and links it into the executable file.
 
 ## License
 

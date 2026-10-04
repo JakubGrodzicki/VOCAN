@@ -15,18 +15,32 @@
          flag; this script clears that flag (Unblock-File) ONLY on this one
          downloaded file, so it can run -- the same thing you'd do manually
          via its file Properties dialog ("Unblock" checkbox).
-      5. Builds VOCAN in release mode.
-      6. Runs the automated test suite (fast tests, then ffmpeg-dependent
+      5. Builds VOCAN in release mode. The build downloads a prebuilt
+         ONNX Runtime from the network and links it into VOCAN.exe, so
+         there is nothing extra to ship for it.
+      6. Downloads the Silero VAD model (silero_vad.onnx, about 2.3 MB, MIT
+         licensed, github.com/snakers4/silero-vad) into a "models" folder
+         next to VOCAN.exe and checks its SHA-256. This is OPTIONAL
+         functionality in the app (only needed for the "Detect speech with
+         Silero VAD" checkbox). If the download or the check fails, the
+         file is deleted, the checkbox stays disabled and the install
+         carries on.
+      7. Runs the automated test suite (fast tests, then ffmpeg-dependent
          tests) to confirm everything actually works.
-      7. Copies just the files needed to run VOCAN (VOCAN.exe and, if
-         installed, deep-filter.exe) into a clean "VOCAN-App" folder, then
-         deletes the "target" build folder (many hundreds of MB of
-         intermediate build files you don't need to just run the app).
-         Your source code and this script are never touched by this step.
-      8. Prints a summary and keeps this window open, so you can read it.
+      8. Copies just the files needed to run VOCAN (VOCAN.exe and, if
+         installed, deep-filter.exe and the "models" folder) into a clean
+         "VOCAN-App" folder, then deletes the "target" build folder (many
+         hundreds of MB of intermediate build files you don't need to just
+         run the app). Your source code and this script are never touched
+         by this step.
+      9. Prints a summary and keeps this window open, so you can read it.
 
 .PARAMETER NoDfn3
     Skip the DeepFilterNet3 download entirely.
+
+.PARAMETER NoVad
+    Skip the Silero VAD model download entirely. The "Detect speech with
+    Silero VAD" checkbox in VOCAN then stays disabled.
 
 .PARAMETER SkipTests
     Skip running the test suite after building.
@@ -44,17 +58,23 @@
     .\installWindows.ps1
 
 .EXAMPLE
-    .\installWindows.ps1 -NoDfn3 -SkipTests
+    .\installWindows.ps1 -NoDfn3 -NoVad -SkipTests
 #>
 
 param(
     [switch]$NoDfn3,
+    [switch]$NoVad,
     [switch]$SkipTests,
     [switch]$KeepBuild,
     [switch]$NoPause
 )
 
 $ErrorActionPreference = "Stop"
+
+# Silero VAD model, pinned to a release tag and a SHA-256 so a changed or
+# corrupted download is rejected.
+$ModelUrl    = 'https://github.com/snakers4/silero-vad/raw/v6.2.2/src/silero_vad/data/silero_vad.onnx'
+$ModelSha256 = '1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3'
 
 function Step($msg)  { Write-Host "`n==> $msg" -ForegroundColor Cyan }
 function Ok($msg)    { Write-Host "  OK: $msg" -ForegroundColor Green }
@@ -133,6 +153,8 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
 }
 
 # --- 4. Build (needed before placing deep-filter.exe, so we know the binary path)
+# NOTE: the build downloads a prebuilt ONNX Runtime (cdn.pyke.io) for the `ort`
+# crate and links it statically, so this step needs network access.
 Step "Building VOCAN (release mode)"
 cargo build --release
 if ($LASTEXITCODE -ne 0) {
@@ -181,7 +203,32 @@ if ($NoDfn3) {
     }
 }
 
-# --- 6. Tests -------------------------------------------------------------------
+# --- 6. Silero VAD model (optional) --------------------------------------------
+$ModelDir  = Join-Path $BinDir "models"
+$ModelDest = Join-Path $ModelDir "silero_vad.onnx"
+if ($NoVad) {
+    Step "Skipping Silero VAD model (-NoVad given)"
+} else {
+    Step "Installing Silero VAD model (optional speech detection for Trim silence)"
+    try {
+        New-Item -ItemType Directory -Path $ModelDir -Force | Out-Null
+        Write-Host "  Downloading: $ModelUrl"
+        Invoke-WebRequest -Uri $ModelUrl -OutFile $ModelDest -UseBasicParsing
+
+        $gotHash = (Get-FileHash -Path $ModelDest -Algorithm SHA256).Hash
+        if ($gotHash -ine $ModelSha256) {
+            Remove-Item $ModelDest -Force -ErrorAction SilentlyContinue
+            Warn "Silero VAD model failed the SHA-256 check (got $gotHash). Deleted it. Speech detection stays disabled (this is an optional feature)."
+        } else {
+            Ok "Silero VAD model installed at $ModelDest"
+        }
+    } catch {
+        Remove-Item $ModelDest -Force -ErrorAction SilentlyContinue
+        Warn "Silero VAD model download failed: $($_.Exception.Message). Speech detection stays disabled (this is an optional feature)."
+    }
+}
+
+# --- 7. Tests -------------------------------------------------------------------
 $FastTestsOk = $true
 $FullTestsOk = $true
 $FastPassed = 0; $FastFailed = 0
@@ -201,6 +248,12 @@ function ParseTestCounts($outputLines) {
 if ($SkipTests) {
     Step "Skipping tests (-SkipTests given)"
 } else {
+    # The tests run from target\release\deps, not from next to VOCAN.exe, so
+    # tell the VAD tests where the model is (they skip themselves without it).
+    if (Test-Path $ModelDest) {
+        $env:VOCAN_SILERO_MODEL = $ModelDest
+    }
+
     Step "Running fast tests (no ffmpeg required)"
     # NOTE: cargo writes normal progress (e.g. "Compiling", "Finished") to stderr.
     # Under Windows PowerShell 5.1, capturing a native command's stderr via 2>&1
@@ -237,7 +290,7 @@ if ($SkipTests) {
     }
 }
 
-# --- 7. Package a clean, ready-to-run folder and remove build litter ----------
+# --- 8. Package a clean, ready-to-run folder and remove build litter ----------
 Step "Packaging a clean, ready-to-run folder"
 $AppDir = Join-Path $RepoRoot "VOCAN-App"
 if (Test-Path $AppDir) {
@@ -250,6 +303,10 @@ $DfnInBin = Join-Path $BinDir "deep-filter.exe"
 if (Test-Path $DfnInBin) {
     Copy-Item $DfnInBin (Join-Path $AppDir "deep-filter.exe")
 }
+
+if (Test-Path $ModelDir) {
+    Copy-Item $ModelDir (Join-Path $AppDir "models") -Recurse
+}
 Ok "Ready-to-run files copied to $AppDir"
 
 if ($KeepBuild) {
@@ -260,7 +317,7 @@ if ($KeepBuild) {
     Ok "Removed the target folder. Your source code is untouched; rebuild any time with 'cargo build --release'."
 }
 
-# --- 8. Summary ------------------------------------------------------------------
+# --- 9. Summary ------------------------------------------------------------------
 Step "Done"
 $OverallOk = $FastTestsOk -and $FullTestsOk
 if ($SkipTests) {

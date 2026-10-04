@@ -353,7 +353,7 @@ This is the second mode of **Trim silence**. It replaces the threshold filter ch
 6. **No speech, no change.** If the model finds no speech, VOCAN does not trim or fade the file. Everything else you switched on, such as normalization or the Automixer, still applies. A take shorter than 250 ms counts as no speech. Stereo is mixed to mono for the detection, so a file whose channels cancel each other (opposite phase) also counts as no speech.
 7. **Final chain.** VOCAN adds `atrim` and `afade` to the FFmpeg chain that already writes the output. This works the same with the Automixer on and with the Automixer off. The rest of the audio is not changed.
 
-**Cost.** One extra FFmpeg process per file, for the detection decode. VOCAN keeps only the per-frame probabilities, not the audio, so memory use grows by about half a megabyte per hour of audio.
+**Cost.** One extra FFmpeg process per file, for the detection decode. VOCAN keeps only the per-frame probabilities, not the audio, so memory use grows by about one megabyte per hour of audio.
 
 **Quiet files.** The model judges speech partly by level, and a take recorded very quietly can be detected late, which would cut the start of the first word. So if the level of a file is below -20 dBFS, VOCAN decodes it a second time with a gain that brings that level to about -10 dBFS (at most +40 dB). The level is the 99th percentile of the per-frame peaks, not the single loudest sample, so one bump of the microphone does not hide that the take is quiet. Speech and pauses are raised together, so the model sees the same relation between them. This applies to the detection only. The audio that is written is never changed by it. A very quiet file therefore costs two extra FFmpeg processes instead of one.
 

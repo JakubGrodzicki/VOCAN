@@ -195,7 +195,7 @@ fn a_quiet_take_costs_one_more_detection_pass() {
     if common::skip_if_no_vad() {
         return;
     }
-    // A file whose loudest sample is under -34 dBFS is decoded a second time
+    // A file whose level (99th percentile of frame peaks) is under -20 dBFS is decoded a second time
     // with a gain, because the model's scores depend on level. Only quiet files
     // pay for it; `spawns_for` writes a 0.5-amplitude sine, so the test above
     // is the loud case. This one writes its own file, at 0.005.

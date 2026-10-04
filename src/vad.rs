@@ -14,7 +14,7 @@
 //!    process** (two for a file that is quiet as a whole, which is decoded a
 //!    second time with a gain), streams it through the model frame by frame and
 //!    returns the first start and last end of speech. Only per-frame numbers are
-//!    kept, never the audio, so memory use grows by under half a megabyte per
+//!    kept, never the audio, so memory use grows by about a megabyte per
 //!    hour of audio.
 //! 2. [`plan_trim`] widens that span by [`MARGIN_SECS`] on each side and works
 //!    out the fades.
@@ -406,7 +406,7 @@ fn for_each_frame(
 ///
 /// Costs one ffmpeg process (counted by `ffmpeg::spawn_count`, pinned by
 /// `tests/spawn_budget.rs`), and a second one for a take that is quiet as a
-/// whole (see [`QUIET_PEAK`]). The children are registered with
+/// whole (see [`QUIET_LEVEL`]). The children are registered with
 /// [`proc::register`], so Stop kills them mid-file like any other pass.
 pub fn detect_speech(input: &Path, ffmpeg: &Path, model: &Path) -> Result<Detection> {
     let mut pass = run_pass(input, ffmpeg, model, None)?;
@@ -495,9 +495,11 @@ fn run_pass(input: &Path, ffmpeg: &Path, model: &Path, gain_db: Option<f32>) -> 
     let samples = read_result.context("running Silero VAD over the decoded audio")?;
     let status = status.context("FFmpeg speech detection wait failed")?;
     if !status.success() {
-        return Err(anyhow!(
-            "FFmpeg speech detection pass failed: {}",
-            stderr_text
+        // The shared helper keeps the last 600 characters, where the reason is,
+        // and says something useful when stderr is empty.
+        return Err(crate::ffmpeg::ffmpeg_failed(
+            "speech detection",
+            &stderr_text,
         ));
     }
     if samples == 0 {
@@ -725,7 +727,9 @@ mod tests {
     fn the_minimum_pause_is_exactly_five_frames() {
         // Two halves that are each too short to count (5 frames) but together
         // are speech (>= 8). Whether they were merged is the only way to tell
-        // a 4-frame minimum pause from a 5-frame one from the span alone. Five\n        // is what Silero's reference needs: a quiet frame four frames after the\n        // first quiet one.
+        // a 4-frame minimum pause from a 5-frame one from the span alone. Five
+        // is what Silero's reference needs: a quiet frame four frames after the
+        // first quiet one.
         let gap = |n: usize| probs(&[(0.01, 4), (0.9, 5), (0.1, n), (0.9, 5), (0.01, 4)]);
         let merged = |n: usize| {
             let p = gap(n);
@@ -929,6 +933,25 @@ mod tests {
     }
 
     #[test]
+    fn filter_cuts_even_a_few_milliseconds() {
+        // Below a millisecond is rounding noise; 5 ms is a real cut.
+        let plan = TrimPlan {
+            start: 0.005,
+            end: 4.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+        };
+        assert!(trim_filter(&plan, 4.0)
+            .unwrap()
+            .contains("atrim=start=0.005"));
+        let noise = TrimPlan {
+            start: 0.0004,
+            ..plan
+        };
+        assert_eq!(trim_filter(&noise, 4.0), None);
+    }
+
+    #[test]
     fn filter_is_none_when_nothing_would_change() {
         let plan = plan_trim(
             SpeechSpan {
@@ -1082,6 +1105,58 @@ mod tests {
         let peaks = vec![0.4f32; 300];
         assert!((level_of(&peaks) - 0.4).abs() < 1e-6);
         assert_eq!(rescue_gain_db(level_of(&peaks)), None);
+    }
+
+    #[test]
+    fn a_take_with_a_few_percent_loud_frames_counts_as_loud() {
+        // 5 of 100 frames carry the speech: the 99th percentile sees them, a
+        // lower percentile would call this file quiet and boost it.
+        let mut peaks = vec![0.01f32; 95];
+        peaks.extend([0.8f32; 5]);
+        assert!(
+            (level_of(&peaks) - 0.8).abs() < 1e-6,
+            "{}",
+            level_of(&peaks)
+        );
+    }
+
+    #[test]
+    fn the_documented_numbers_are_the_ones_in_the_code() {
+        // README.MD and the UI hint quote these. Changing one means changing the
+        // text, and this is what makes that a deliberate act.
+        assert_eq!(START_THRESHOLD, 0.5);
+        assert_eq!(END_THRESHOLD, 0.35);
+        assert_eq!(MIN_SPEECH_SECS, 0.25);
+        assert_eq!(MARGIN_SECS, 0.150);
+        assert_eq!(FADE_SECS, 0.075);
+        assert_eq!(QUIET_LEVEL, 0.1); // -20 dBFS
+        assert_eq!(QUIET_TARGET_LEVEL, 0.3); // about -10 dBFS
+        assert_eq!(QUIET_MAX_GAIN_DB, 40.0);
+        assert_eq!((WINDOW, SAMPLE_RATE), (512, 16_000));
+    }
+
+    #[test]
+    fn the_start_threshold_is_inclusive_and_the_end_threshold_is_exclusive() {
+        let span = |p: Vec<f32>| speech_span(&p, p.len() as f64 * F);
+        // 0.5 starts speech; just under it does not.
+        assert!(span(probs(&[(0.01, 3), (START_THRESHOLD, 12), (0.01, 6)])).is_some());
+        assert!(span(probs(&[
+            (0.01, 3),
+            (START_THRESHOLD - 0.001, 12),
+            (0.01, 6)
+        ]))
+        .is_none());
+        // A score of exactly 0.35 is not quiet (the pause never gets going, so
+        // the speech runs on); just under it is.
+        let with_gap = |p: f32| probs(&[(0.01, 3), (0.9, 5), (p, 6), (0.9, 5), (0.01, 6)]);
+        assert!(near(
+            speech_span(&with_gap(END_THRESHOLD), 25.0 * F).unwrap().end,
+            19.0 * F
+        ));
+        assert!(
+            speech_span(&with_gap(END_THRESHOLD - 0.001), 25.0 * F).is_none(),
+            "5 + 6 + 5 frames: a 6-frame pause under 0.35 splits two bursts too short to count"
+        );
     }
 
     #[test]

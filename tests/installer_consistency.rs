@@ -168,6 +168,65 @@ fn the_unix_installer_puts_the_model_where_the_app_looks() {
 }
 
 #[test]
+fn the_skip_flags_and_the_intel_mac_exclusion_guard_the_download() {
+    let (ps1, sh) = (code_of("installWindows.ps1"), code_of("installMacLinux.sh"));
+    assert_code_has(
+        "installWindows.ps1",
+        &ps1,
+        "if ($NoVad) {\nStep \"Skipping Silero VAD model (-NoVad given)\"",
+        "-NoVad must skip the download",
+    );
+    assert_code_has(
+        "installMacLinux.sh",
+        &sh,
+        "if [ \"$SKIP_VAD\" = true ]; then\nstep \"Skipping Silero VAD model (--no-vad given)\"",
+        "--no-vad must skip the download",
+    );
+    assert_code_has(
+        "installMacLinux.sh",
+        &sh,
+        "VAD_SUPPORTED=true\nif [ \"$PLATFORM\" = \"macos\" ] && [ \"$ARCH\" = \"x86_64\" ]; then\nVAD_SUPPORTED=false",
+        "Intel Macs have no ONNX Runtime build, so the model is not fetched there",
+    );
+    assert_code_has(
+        "installMacLinux.sh",
+        &sh,
+        "if ! curl -fL -o \"$MODEL_DEST\" \"$MODEL_URL\"; then",
+        "-f makes an HTTP error fail the download instead of saving the error page as the model",
+    );
+}
+
+#[test]
+fn ci_downloads_verifies_and_really_runs_the_vad_tests() {
+    let f = ".github/workflows/ci.yml";
+    let c = code_of(f);
+    assert_code_has(
+        f,
+        &c,
+        "echo \"${MODEL_SHA256} $dir/silero_vad.onnx\" | sha256sum -c -",
+        "the model must be hash-checked before the tests trust it",
+    );
+    assert_code_has(
+        f,
+        &c,
+        "echo \"${FIXTURE_SHA256} $dir/test.wav\" | sha256sum -c -",
+        "the fixture must be hash-checked too",
+    );
+    assert_code_has(
+        f,
+        &c,
+        "echo \"VOCAN_SILERO_MODEL=$dir/silero_vad.onnx\" >> \"$GITHUB_ENV\"",
+        "the tests find the model through this variable and the file name is fixed",
+    );
+    assert_code_has(
+        f,
+        &c,
+        "run: cargo test -- --ignored",
+        "the real-model tests are #[ignore]d and only run in this step",
+    );
+}
+
+#[test]
 fn ci_makes_a_skipped_vad_test_a_failure() {
     // A skip is a pass. Without this variable a wrong model path in CI would
     // turn every real-model test into a green no-op.

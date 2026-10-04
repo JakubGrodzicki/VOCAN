@@ -35,6 +35,47 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install ffmpeg -y
 
+      # The `ort` build script downloads a prebuilt ONNX Runtime over TLS and
+      # needs the OpenSSL headers on Linux. Must run before clippy/build.
+      - name: Install OpenSSL headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libssl-dev pkg-config
+
+      # Silero VAD model and a 60 s speech fixture for tests/vad_integration.rs.
+      # Both are pinned by release tag and SHA-256. Kept out of rust-cache on
+      # purpose: they are downloaded fresh into the runner's temp dir each run.
+      - name: Download Silero VAD model and speech fixture
+        shell: bash
+        env:
+          MODEL_URL: https://github.com/snakers4/silero-vad/raw/v6.2.2/src/silero_vad/data/silero_vad.onnx
+          MODEL_SHA256: 1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
+          FIXTURE_URL: https://github.com/snakers4/silero-vad/raw/v6.2.2/tests/data/test.wav
+          FIXTURE_SHA256: 89f17d9c94c4b31eb320f424628bcbc920abaddbee6e2760fd868bfb1d9a2e47
+        run: |
+          set -euo pipefail
+          # Windows runners: RUNNER_TEMP is D:\a\_temp; use the POSIX form in bash
+          # (a backslash in a path breaks `sha256sum -c`).
+          base="$RUNNER_TEMP"
+          if command -v cygpath >/dev/null 2>&1; then
+            base="$(cygpath -u "$RUNNER_TEMP")"
+          fi
+          dir="$base/vocan-vad"
+          mkdir -p "$dir"
+          curl -fL --retry 3 -o "$dir/silero_vad.onnx" "$MODEL_URL"
+          curl -fL --retry 3 -o "$dir/test.wav" "$FIXTURE_URL"
+          echo "${MODEL_SHA256}  $dir/silero_vad.onnx" | sha256sum -c -
+          echo "${FIXTURE_SHA256}  $dir/test.wav" | sha256sum -c -
+          # Windows runners: hand Rust a path it can open (D:/... form).
+          if command -v cygpath >/dev/null 2>&1; then
+            dir="$(cygpath -m "$dir")"
+          fi
+          echo "VOCAN_SILERO_MODEL=$dir/silero_vad.onnx" >> "$GITHUB_ENV"
+          echo "VOCAN_VAD_FIXTURE=$dir/test.wav" >> "$GITHUB_ENV"
+          # A skipped test is a passing test. With this set, a VAD test that
+          # cannot find its model or fixture fails instead, so a wrong path
+          # here cannot turn the real-model tests into green no-ops.
+          echo "VOCAN_REQUIRE_VAD=1" >> "$GITHUB_ENV"
+
       - name: Check formatting
         run: cargo fmt --check
 

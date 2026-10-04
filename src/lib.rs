@@ -7,3 +7,4 @@ pub mod processing;
 pub mod theme;
 pub mod types;
 pub mod ui;
+pub mod vad;

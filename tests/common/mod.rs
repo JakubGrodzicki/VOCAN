@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+#[allow(dead_code)]
 pub fn write_sine_wav(
     path: &Path,
     duration_secs: f32,
@@ -183,6 +184,129 @@ pub fn write_silence_wav(path: &Path, duration_secs: f32, sample_rate: u32) {
         writer.write_sample(0.0f32).expect("write sample");
     }
     writer.finalize().expect("finalize wav");
+}
+
+/// Writes `samples` as a mono 32-bit float WAV.
+#[allow(dead_code)]
+pub fn write_f32_wav(path: &Path, samples: &[f32], sample_rate: u32) {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec).expect("create wav");
+    for &s in samples {
+        writer.write_sample(s).expect("write sample");
+    }
+    writer.finalize().expect("finalize wav");
+}
+
+/// Seeded noise at `rms_dbfs` (white noise from a xorshift PRNG is uniform, so
+/// its RMS is `amplitude / sqrt(3)`; the scaling below accounts for that).
+#[allow(dead_code)]
+pub fn noise_at_dbfs(n: usize, rms_dbfs: f32, seed: u32) -> Vec<f32> {
+    let rms = 10f32.powf(rms_dbfs / 20.0);
+    xorshift_noise(n, rms * 3f32.sqrt(), seed)
+}
+
+/// Duration in seconds of a WAV file, from its header.
+#[allow(dead_code)]
+pub fn wav_secs(path: &Path) -> f64 {
+    let reader = hound::WavReader::open(path).expect("open wav");
+    reader.duration() as f64 / reader.spec().sample_rate as f64
+}
+
+/// RMS of `samples`, in linear units.
+#[allow(dead_code)]
+pub fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// The Silero model, if one is configured (`VOCAN_SILERO_MODEL`, set by CI and
+/// by anyone who has run the installer from the repo).
+#[allow(dead_code)]
+pub fn silero_model() -> Option<std::path::PathBuf> {
+    vocan::vad::model_path()
+}
+
+/// 60 s of 16 kHz mono speech (`tests/data/test.wav` from the Silero repo, MIT),
+/// downloaded by CI and located through `VOCAN_VAD_FIXTURE`. Not checked in:
+/// this repo does not carry binary assets.
+#[allow(dead_code)]
+pub fn speech_fixture() -> Option<std::path::PathBuf> {
+    std::env::var_os("VOCAN_VAD_FIXTURE")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
+}
+
+/// The speech fixture's samples as f32, first `secs` seconds only.
+#[allow(dead_code)]
+pub fn speech_samples(path: &Path, secs: f32) -> Vec<f32> {
+    let mut reader = hound::WavReader::open(path).expect("open speech fixture");
+    let spec = reader.spec();
+    assert_eq!(
+        (spec.channels, spec.sample_rate, spec.bits_per_sample),
+        (1, 16_000, 16),
+        "the speech fixture is expected to be 16 kHz mono 16-bit"
+    );
+    reader
+        .samples::<i16>()
+        .take((secs * 16_000.0) as usize)
+        .map(|s| s.expect("read sample") as f32 / 32768.0)
+        .collect()
+}
+
+/// A VAD test that cannot run skips, unless `VOCAN_REQUIRE_VAD` is set: CI sets
+/// it, because a skip is a pass, and a mistyped path to the model would
+/// otherwise turn every real-model test into a green no-op. With the variable
+/// set, the same condition is a failure with the reason in it.
+#[allow(dead_code)]
+fn skip_or_fail(why: &str) -> bool {
+    if std::env::var_os("VOCAN_REQUIRE_VAD").is_some_and(|v| !v.is_empty()) {
+        panic!("VOCAN_REQUIRE_VAD is set, but this test cannot run: {why}");
+    }
+    eprintln!("SKIP: {why}");
+    true
+}
+
+/// `true` (after printing why) when a VAD test cannot run: no ffmpeg, no model,
+/// or no speech fixture. Same convention as [`skip_if_no_ffmpeg`], except that
+/// `VOCAN_REQUIRE_VAD` turns every skip into a failure (see [`skip_or_fail`]).
+#[allow(dead_code)]
+pub fn skip_if_no_vad() -> bool {
+    if !ffmpeg_available() {
+        return skip_or_fail("ffmpeg not found on PATH");
+    }
+    if !vocan::vad::ENGINE_AVAILABLE {
+        // Not a CI configuration error: this target simply has no engine.
+        eprintln!("SKIP: no ONNX Runtime on this platform");
+        return true;
+    }
+    if silero_model().is_none() {
+        return skip_or_fail("Silero model not found (set VOCAN_SILERO_MODEL)");
+    }
+    false
+}
+
+/// [`skip_if_no_vad`], and also skips when the speech fixture is missing.
+///
+/// For the tests that cut real speech. A normal install has the model (the
+/// installers download it) but not the fixture (CI only), so these must skip
+/// there rather than fail; the tests that need only the model keep using
+/// [`skip_if_no_vad`] and run.
+#[allow(dead_code)]
+pub fn skip_if_no_vad_fixture() -> bool {
+    if skip_if_no_vad() {
+        return true;
+    }
+    if speech_fixture().is_none() {
+        return skip_or_fail("speech fixture not found (set VOCAN_VAD_FIXTURE)");
+    }
+    false
 }
 
 /// Resolves ffmpeg the same way the app does at runtime: PATH first.

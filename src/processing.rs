@@ -14,6 +14,7 @@ use crate::types::{
     AppMsg, LoudnormStats, NormResult, OutputFormat, ProcessingOptions, SilencePad,
     SilenceThreshold,
 };
+use crate::vad;
 
 // ---------------------------------------------------------------------------
 // Automixer filter chains
@@ -111,9 +112,80 @@ fn trim_silence_chain(threshold: SilenceThreshold, pad: SilencePad) -> String {
 /// `None` has to mean "not in the command line at all" rather than "a no-op
 /// filter": with the trim switched off, VOCAN must produce exactly the ffmpeg
 /// invocation it produced before this option existed.
+///
+/// This is the **threshold** trim only. With Silero VAD selected it returns
+/// `None` as well: that mode has no filter of its own to name before the file
+/// has been looked at, and [`resolve_trim_chain`] is what answers for it.
 fn trim_chain_for(opts: &ProcessingOptions) -> Option<String> {
-    opts.trim_silence
+    (opts.trim_silence && !opts.trim_silence_vad)
         .then(|| trim_silence_chain(opts.trim_silence_threshold, opts.trim_silence_pad))
+}
+
+/// The trim chain for `input`, whichever kind of trim is selected.
+///
+/// Threshold trim: a pure function of the options, no I/O. Silero VAD: the file
+/// is decoded once more, on its own, to find the speech, and the answer is a
+/// cut and two fades expressed as an `atrim`/`afade` chain (see [`crate::vad`]).
+/// Either way the result goes where the `silenceremove` chain always went, so
+/// the two modes share every downstream line, including the loudness
+/// measurements, which therefore see the trimmed audio.
+///
+/// A take with no speech in it yields `None`: the file passes through exactly
+/// as it would with the trim off, and the log says why. That is deliberately
+/// different from the threshold trim, which reports a fully silent file as an
+/// error -- here "nothing found" is a legitimate answer about the recording,
+/// not a failure of the settings.
+fn resolve_trim_chain(
+    input: &Path,
+    opts: &ProcessingOptions,
+    ffmpeg: &Path,
+) -> Result<Option<String>> {
+    if !opts.trim_silence {
+        return Ok(None);
+    }
+    if !opts.trim_silence_vad {
+        return Ok(trim_chain_for(opts));
+    }
+
+    let log = |msg: String| {
+        if let Some(tx) = &opts.log {
+            let _ = tx.send(AppMsg::Log(msg));
+        }
+    };
+    let name = input
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    if !vad::ENGINE_AVAILABLE {
+        return Err(anyhow!(
+            "Silero VAD is not available on this platform. Switch it off to trim by level."
+        ));
+    }
+    let model = vad::model_path().ok_or_else(|| {
+        anyhow!(
+            "Silero VAD model not found (looked for {} next to VOCAN, in a models folder \
+             there, and at the path in the {} environment variable). Re-run the \
+             installer, or switch Silero VAD off.",
+            vad::MODEL_FILE,
+            vad::MODEL_ENV
+        )
+    })?;
+
+    let detection = vad::detect_speech(input, ffmpeg, &model)?;
+    let Some(span) = detection.span else {
+        log(format!(
+            "{name}: Silero VAD found no speech, file left untouched"
+        ));
+        return Ok(None);
+    };
+
+    let plan = vad::plan_trim(span, detection.total_secs);
+    log(format!(
+        "{name}: speech {:.2}-{:.2} s of {:.2} s, keeping {:.2}-{:.2} s",
+        span.start, span.end, detection.total_secs, plan.start, plan.end
+    ));
+    Ok(vad::trim_filter(&plan, detection.total_secs))
 }
 
 // ---------------------------------------------------------------------------
@@ -470,11 +542,15 @@ fn read_f32le_stream(reader: &mut impl Read) -> Result<Vec<f32>> {
 /// performed on the DSP-processed audio (written to a temp WAV file), not the
 /// original input. This ensures the linear normalization in pass-2 operates on
 /// the same signal that was measured, producing correct target loudness.
+///
+/// `trim_chain` is the already-resolved silence trim for this file (see
+/// [`resolve_trim_chain`]); it is appended behind the clean-up chain in step 6.
 fn process_with_rust_dsp(
     input: &Path,
     output: &Path,
     opts: &ProcessingOptions,
     ffmpeg: &Path,
+    trim_chain: Option<String>,
 ) -> Result<NormResult> {
     // 1. Get original sample rate (to restore later).
     //
@@ -671,7 +747,12 @@ fn process_with_rust_dsp(
     // 8 kHz shelf +1 dB -- so the margin below covers all of it and then some.
     // Being wrong in the other direction would reject a file that had a
     // perfectly good take in it, which is far worse than writing an empty one.
-    if let Some(threshold) = opts.trim_silence.then(|| opts.trim_silence_threshold.db()) {
+    //
+    // Threshold trim only. Silero VAD never empties a file: when it finds no
+    // speech it leaves the file alone, so there is nothing to guard against.
+    if let Some(threshold) =
+        (opts.trim_silence && !opts.trim_silence_vad).then(|| opts.trim_silence_threshold.db())
+    {
         /// Headroom for everything `post_deesser_filters()` can add.
         const POST_FILTER_GAIN_MARGIN_DB: f32 = 8.0;
 
@@ -743,7 +824,7 @@ fn process_with_rust_dsp(
     // what keeps that honest: this one string is what the pass-1 measurement
     // reads, what pass 2 encodes, and what the un-normalized branch below
     // uses, so all three see the same trimmed audio by construction.
-    let post_filters = match trim_chain_for(opts) {
+    let post_filters = match trim_chain {
         Some(trim) => format!("{},{}", post_deesser_filters(), trim),
         None => post_deesser_filters(),
     };
@@ -815,10 +896,15 @@ pub fn process_single_file(
         std::fs::create_dir_all(parent)?;
     }
 
+    // Settled once per file, before either pipeline, so that both measure and
+    // encode the same trimmed signal and a Silero VAD failure (no model, no
+    // decodable audio) stops the file before any real work has been done.
+    let trim_chain = resolve_trim_chain(input, opts, ffmpeg)?;
+
     // If automixer is enabled, use the new pipeline with Rust DSP.
     // Otherwise, use old logic (no additional modules).
     if opts.automixer {
-        return process_with_rust_dsp(input, &output, opts, ffmpeg);
+        return process_with_rust_dsp(input, &output, opts, ffmpeg, trim_chain);
     }
 
     // Old pipeline (without automixer)
@@ -835,7 +921,6 @@ pub fn process_single_file(
     // threshold meets the raw recording. That is the case the presets exist
     // for: on an untreated room, Recommended can find no silence at all and
     // Hard is the answer.
-    let trim_chain = trim_chain_for(opts);
     let trim_prefix = trim_chain.as_deref();
 
     let norm_result = if let Some(lufs) = opts.target_lufs {

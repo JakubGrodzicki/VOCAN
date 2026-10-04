@@ -13,15 +13,26 @@
 #      On macOS, downloaded binaries are quarantined by Gatekeeper; this
 #      script removes that flag ONLY from this specific downloaded file so
 #      it can run, the same way you'd do manually via Finder/right-click.
-#   5. Builds VOCAN in release mode.
-#   6. Runs the automated test suite (fast tests, then ffmpeg-dependent
+#   5. Builds VOCAN in release mode. The build downloads a prebuilt ONNX
+#      Runtime from the network and links it into the VOCAN binary, so there
+#      is nothing extra to ship for it. On Linux this needs the OpenSSL
+#      headers (libssl-dev and pkg-config); step 3 installs them.
+#   6. Downloads the Silero VAD model (silero_vad.onnx, about 2.3 MB, MIT
+#      licensed, github.com/snakers4/silero-vad) into a "models" folder next
+#      to the VOCAN binary and checks its SHA-256. This is OPTIONAL
+#      functionality in the app (only needed for the "Detect speech with
+#      Silero VAD" checkbox). If the download or the check fails, the file
+#      is deleted, the checkbox stays disabled and the install carries on.
+#      Not available on Intel Macs (no ONNX Runtime build exists for them).
+#   7. Runs the automated test suite (fast tests, then ffmpeg-dependent
 #      tests) to confirm everything actually works.
-#   7. Copies just the files needed to run VOCAN (the VOCAN binary and, if
-#      installed, deep-filter) into a clean "VOCAN-App" folder, then deletes
-#      the "target" build folder (many hundreds of MB of intermediate build
-#      files you don't need to just run the app). Your source code and this
-#      script are never touched by this step.
-#   8. Prints a summary and, if run in an interactive terminal, waits for a
+#   8. Copies just the files needed to run VOCAN (the VOCAN binary and, if
+#      installed, deep-filter and the "models" folder) into a clean
+#      "VOCAN-App" folder, then deletes the "target" build folder (many
+#      hundreds of MB of intermediate build files you don't need to just run
+#      the app). Your source code and this script are never touched by this
+#      step.
+#   9. Prints a summary and, if run in an interactive terminal, waits for a
 #      key press before the window closes.
 #
 # Run it from the root of a cloned VOCAN repository:
@@ -30,6 +41,9 @@
 #
 # Flags:
 #   --no-dfn3      Skip the DeepFilterNet3 download entirely.
+#   --no-vad       Skip the Silero VAD model download entirely. The "Detect
+#                  speech with Silero VAD" checkbox in VOCAN then stays
+#                  disabled.
 #   --skip-tests   Skip running the test suite after building.
 #   --keep-build   Do not delete the "target" build folder at the end.
 #                  Use this if you plan to keep developing/rebuilding VOCAN.
@@ -38,13 +52,20 @@
 
 set -euo pipefail
 
+# Silero VAD model, pinned to a release tag and a SHA-256 so a changed or
+# corrupted download is rejected.
+MODEL_URL="https://github.com/snakers4/silero-vad/raw/v6.2.2/src/silero_vad/data/silero_vad.onnx"
+MODEL_SHA256="1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+
 SKIP_DFN3=false
+SKIP_VAD=false
 SKIP_TESTS=false
 KEEP_BUILD=false
 NO_PAUSE=false
 for arg in "$@"; do
   case "$arg" in
     --no-dfn3) SKIP_DFN3=true ;;
+    --no-vad) SKIP_VAD=true ;;
     --skip-tests) SKIP_TESTS=true ;;
     --keep-build) KEEP_BUILD=true ;;
     --no-pause) NO_PAUSE=true ;;
@@ -93,6 +114,15 @@ esac
 
 ok "Detected $PLATFORM / $ARCH"
 
+# ONNX Runtime (used by the optional Silero VAD feature) has no prebuilt
+# binary for Intel Macs, so the feature is unavailable there. The build still
+# succeeds; the model download is skipped.
+VAD_SUPPORTED=true
+if [ "$PLATFORM" = "macos" ] && [ "$ARCH" = "x86_64" ]; then
+  VAD_SUPPORTED=false
+  warn "Silero VAD (speech detection for Trim silence) is not available on Intel Macs: no ONNX Runtime build exists for this CPU. VOCAN works without it; the classic silence trim is unaffected."
+fi
+
 # --- 2. Rust ------------------------------------------------------------------
 step "Checking for Rust"
 if command -v cargo >/dev/null 2>&1; then
@@ -138,7 +168,32 @@ fi
 
 FFMPEG_BIN="$(command -v ffmpeg)"
 
+# --- 3b. OpenSSL headers (Linux only) -----------------------------------------
+# The build downloads a prebuilt ONNX Runtime over TLS (via the `ort` crate),
+# and its build script needs the OpenSSL headers and pkg-config on Linux.
+# macOS needs nothing extra.
+if [ "$PLATFORM" = "linux" ]; then
+  step "Checking for OpenSSL headers (needed by the build)"
+  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists openssl; then
+    ok "OpenSSL development files already installed."
+  else
+    warn "OpenSSL development files not found. Installing..."
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y openssl-devel pkgconf-pkg-config
+    elif command -v pacman >/dev/null 2>&1; then
+      sudo pacman -Sy --noconfirm openssl pkgconf
+    else
+      fail_exit "No supported package manager found (apt-get/dnf/pacman). Install the OpenSSL development files and pkg-config yourself (Debian/Ubuntu: libssl-dev pkg-config), then re-run this script."
+    fi
+    ok "OpenSSL development files installed."
+  fi
+fi
+
 # --- 4. Build (needed before placing deep-filter, so we know the binary path) -
+# NOTE: the build downloads a prebuilt ONNX Runtime (cdn.pyke.io) for the `ort`
+# crate and links it statically, so this step needs network access.
 step "Building VOCAN (release mode)"
 if ! cargo build --release; then
   fail_exit "Build failed. See the output above."
@@ -205,7 +260,47 @@ else
   fi
 fi
 
-# --- 6. Tests ------------------------------------------------------------------
+# --- 6. Silero VAD model (optional) -------------------------------------------
+MODEL_DIR="$BIN_DIR/models"
+MODEL_DEST="$MODEL_DIR/silero_vad.onnx"
+
+# Prints the SHA-256 of a file (lowercase hex), using whichever tool exists.
+# Prints nothing and returns 1 if neither tool is available.
+file_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    return 1
+  fi
+}
+
+if [ "$SKIP_VAD" = true ]; then
+  step "Skipping Silero VAD model (--no-vad given)"
+elif [ "$VAD_SUPPORTED" != true ]; then
+  step "Skipping Silero VAD model (not available on Intel Macs)"
+else
+  step "Installing Silero VAD model (optional speech detection for Trim silence)"
+  mkdir -p "$MODEL_DIR"
+  echo "  Downloading: $MODEL_URL"
+  # Every failure below is non-fatal under `set -e`: the command sits in an
+  # `if`, so a non-zero exit warns instead of ending the script.
+  if ! curl -fL -o "$MODEL_DEST" "$MODEL_URL"; then
+    rm -f "$MODEL_DEST"
+    warn "Silero VAD model download failed. Speech detection stays disabled (this is an optional feature)."
+  elif ! GOT_SHA="$(file_sha256 "$MODEL_DEST")" || [ -z "$GOT_SHA" ]; then
+    rm -f "$MODEL_DEST"
+    warn "Neither sha256sum nor shasum is available, so the Silero VAD model could not be verified. Deleted it. Speech detection stays disabled (this is an optional feature)."
+  elif [ "$GOT_SHA" != "$MODEL_SHA256" ]; then
+    rm -f "$MODEL_DEST"
+    warn "Silero VAD model failed the SHA-256 check (got $GOT_SHA). Deleted it. Speech detection stays disabled (this is an optional feature)."
+  else
+    ok "Silero VAD model installed at $MODEL_DEST"
+  fi
+fi
+
+# --- 7. Tests ------------------------------------------------------------------
 FAST_EXIT=0
 FULL_EXIT=0
 FAST_PASSED=0; FAST_FAILED=0
@@ -229,6 +324,12 @@ parse_test_counts() {
 if [ "$SKIP_TESTS" = true ]; then
   step "Skipping tests (--skip-tests given)"
 else
+  # The tests run from target/release/deps, not from next to the VOCAN binary,
+  # so tell the VAD tests where the model is (they skip themselves without it).
+  if [ -f "$MODEL_DEST" ]; then
+    export VOCAN_SILERO_MODEL="$MODEL_DEST"
+  fi
+
   step "Running fast tests (no ffmpeg required)"
   FAST_LOG="$(mktemp)"
   cargo test 2>&1 | tee "$FAST_LOG" || true
@@ -254,7 +355,7 @@ else
   fi
 fi
 
-# --- 7. Package a clean, ready-to-run folder and remove build litter ---------
+# --- 8. Package a clean, ready-to-run folder and remove build litter ---------
 step "Packaging a clean, ready-to-run folder"
 APP_DIR="$REPO_ROOT/VOCAN-App"
 rm -rf "$APP_DIR"
@@ -264,6 +365,9 @@ chmod +x "$APP_DIR/VOCAN"
 if [ -f "$BIN_DIR/deep-filter" ]; then
   cp "$BIN_DIR/deep-filter" "$APP_DIR/deep-filter"
   chmod +x "$APP_DIR/deep-filter"
+fi
+if [ -d "$MODEL_DIR" ]; then
+  cp -R "$MODEL_DIR" "$APP_DIR/models"
 fi
 ok "Ready-to-run files copied to $APP_DIR"
 
@@ -275,7 +379,7 @@ else
   ok "Removed target/. Your source code is untouched; rebuild any time with 'cargo build --release'."
 fi
 
-# --- 8. Summary ------------------------------------------------------------------
+# --- 9. Summary ------------------------------------------------------------------
 step "Done"
 if [ "$SKIP_TESTS" = true ]; then
   printf "${c_bold}${c_green}VOCAN was built. Tests were skipped (--skip-tests).${c_reset}\n"

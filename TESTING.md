@@ -67,8 +67,11 @@ tests skip on a normal install.
   behaviour: 150 ms margins, 75 ms fades, no change when there is no speech,
   with the Automixer on and off.
 - `src/vad.rs` `#[cfg(test)] mod tests`: gate tests for the VAD logic that
-  needs no model or ffmpeg (hysteresis, minimum speech burst, span and
-  margin arithmetic, model path lookup order).
+  needs no model or ffmpeg (hysteresis, minimum speech burst, minimum pause,
+  span and margin arithmetic, model path lookup order). One ignored test
+  there, `probabilities_match_the_reference_run`, pins the model's own scores
+  on the speech fixture, so a wrong input to the model (for example a lost
+  context window) fails it.
 - `tests/installer_consistency.rs`: gate test that `MODEL_URL` and
   `MODEL_SHA256` appear verbatim in `installWindows.ps1`,
   `installMacLinux.sh` and `.github/workflows/ci.yml`, so a pinned-model bump

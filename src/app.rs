@@ -976,8 +976,8 @@ impl AudioBatchApp {
                 "DeepFilterNet3 missing",
                 theme::AMBER,
                 &format!(
-                    "{} was not found next to VOCAN, so Dereverb cannot run. Re-run the \
-                     installer to download it, then restart VOCAN.",
+                    "{} was not found in the models folder next to VOCAN, so Dereverb \
+                     cannot run. Re-run the installer to download it, then restart VOCAN.",
                     audio_effects::DFN3_BINARY
                 ),
             );

@@ -168,6 +168,60 @@ fn the_unix_installer_puts_the_model_where_the_app_looks() {
 }
 
 #[test]
+fn both_installers_put_deep_filter_in_the_models_folder() {
+    // audio_effects::dfn3_binary_path looks in `<exe dir>/models/`, and the
+    // test run finds it through VOCAN_DEEPFILTER. A copy left next to the
+    // executable would no longer be found.
+    let (ps1, sh) = (code_of("installWindows.ps1"), code_of("installMacLinux.sh"));
+    let f = "installWindows.ps1";
+    assert_code_has(
+        f,
+        &ps1,
+        r#"$DfnDest = Join-Path $ModelDir "deep-filter.exe""#,
+        "deep-filter.exe belongs in the models folder",
+    );
+    assert_code_has(
+        f,
+        &ps1,
+        "$dest = $DfnDest",
+        "the download is saved to the models folder",
+    );
+    assert_code_has(
+        f,
+        &ps1,
+        "$env:VOCAN_DEEPFILTER = $DfnDest",
+        "the test run executes from target\\deps, not from the app folder",
+    );
+    assert!(
+        !ps1.contains("Join-Path $AppDir \"deep-filter.exe\""),
+        "{f}: deep-filter.exe must reach the app folder only inside models"
+    );
+    let f = "installMacLinux.sh";
+    assert_code_has(
+        f,
+        &sh,
+        r#"DFN3_DEST="$MODEL_DIR/deep-filter""#,
+        "deep-filter belongs in the models folder",
+    );
+    assert_code_has(
+        f,
+        &sh,
+        r#"DEST="$DFN3_DEST""#,
+        "the download is saved to the models folder",
+    );
+    assert_code_has(
+        f,
+        &sh,
+        r#"export VOCAN_DEEPFILTER="$DFN3_DEST""#,
+        "the test run executes from target/.../deps, not from the app folder",
+    );
+    assert!(
+        !sh.contains("$APP_DIR/deep-filter"),
+        "{f}: deep-filter must reach the app folder only inside models"
+    );
+}
+
+#[test]
 fn the_skip_flags_and_the_intel_mac_exclusion_guard_the_download() {
     let (ps1, sh) = (code_of("installWindows.ps1"), code_of("installMacLinux.sh"));
     assert_code_has(

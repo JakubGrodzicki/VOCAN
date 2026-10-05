@@ -677,7 +677,7 @@ fn process_with_rust_dsp(
             attenuation_limit: 30.0,
             post_filter: opts.automixer_dfn3_postfilter,
         };
-        // Look for deep-filter binary next to ffmpeg, or next to our exe.
+        // Look for the deep-filter binary in the models folder next to our exe.
         let dfn_path = audio_effects::dfn3_binary_path(ffmpeg)
             .ok_or_else(|| anyhow!("cannot locate {}", audio_effects::DFN3_BINARY))?;
         processed = audio_effects::apply_dereverb_dfn3(&processed, &params, &dfn_path, ffmpeg)?;

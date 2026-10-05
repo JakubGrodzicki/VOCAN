@@ -418,32 +418,20 @@ pub fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Finds a `deep-filter` (DeepFilterNet3) binary sitting in the *same*
-/// directory as a `ffmpeg` binary that's also on PATH.
+/// Finds a `deep-filter` (DeepFilterNet3) binary and a `ffmpeg` on PATH.
 ///
-/// This mirrors the layout `installMacLinux.sh` / `installWindows.ps1`
-/// produce (a copy of `deep-filter` next to the resolved ffmpeg binary) and,
-/// more importantly, the layout `process_with_rust_dsp` actually requires:
-/// its own `deep-filter` lookup is `ffmpeg.parent()` (falling back to "next
-/// to the running executable"), which is empty when `ffmpeg` is only a bare
-/// PATH-relative name -- so tests must pass the *resolved* ffmpeg path for
-/// that lookup to succeed, which is exactly what this helper returns.
+/// `deep-filter` is looked up exactly as the app does it
+/// (`audio_effects::dfn3_binary_path`): the `VOCAN_DEEPFILTER` variable the
+/// installers set for the test run, then `models/` next to the running
+/// executable, then next to ffmpeg. The *resolved* ffmpeg path is returned
+/// because the app's lookup uses `ffmpeg.parent()`, which is empty for a bare
+/// PATH-relative name.
 ///
 /// Returns `None` (meaning "skip this test") if either binary isn't
-/// findable, or if `deep-filter` isn't in ffmpeg's own directory.
+/// findable.
 #[allow(dead_code)]
-pub fn deep_filter_next_to_ffmpeg() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+pub fn deep_filter_and_ffmpeg() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let ffmpeg = find_on_path("ffmpeg")?;
-    let dir = ffmpeg.parent()?;
-    let dfn_name = if cfg!(windows) {
-        "deep-filter.exe"
-    } else {
-        "deep-filter"
-    };
-    let dfn_bin = dir.join(dfn_name);
-    if dfn_bin.is_file() {
-        Some((ffmpeg, dfn_bin))
-    } else {
-        None
-    }
+    let dfn_bin = vocan::audio_effects::dfn3_binary_path(&ffmpeg).filter(|p| p.is_file())?;
+    Some((ffmpeg, dfn_bin))
 }

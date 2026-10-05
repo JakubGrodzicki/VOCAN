@@ -1,7 +1,8 @@
 //! Tests for the optional DeepFilterNet3 (DFN3) dereverb integration.
 //!
-//! Gated on a real `deep-filter` binary actually being available next to
-//! `ffmpeg` on PATH (see `common::deep_filter_next_to_ffmpeg`). Unlike the
+//! Gated on a real `deep-filter` binary actually being available (the
+//! `VOCAN_DEEPFILTER` variable, or a `models` folder; see
+//! `common::deep_filter_and_ffmpeg`) and `ffmpeg` on PATH. Unlike the
 //! plain ffmpeg-dependent tests, these are NOT expected to run in ordinary
 //! CI -- DeepFilterNet3 needs a fairly large bundled model and isn't
 //! installed there. Run these on a machine that has both ffmpeg and
@@ -12,13 +13,13 @@
 
 mod common;
 
-use common::{deep_filter_next_to_ffmpeg, write_sine_wav};
+use common::{deep_filter_and_ffmpeg, write_sine_wav};
 
 #[test]
 #[ignore]
 fn apply_dereverb_dfn3_produces_finite_output_of_same_length() {
-    let Some((ffmpeg, dfn_bin)) = deep_filter_next_to_ffmpeg() else {
-        eprintln!("SKIP: deep-filter not found next to ffmpeg on PATH");
+    let Some((ffmpeg, dfn_bin)) = deep_filter_and_ffmpeg() else {
+        eprintln!("SKIP: deep-filter or ffmpeg not found (set VOCAN_DEEPFILTER)");
         return;
     };
     use vocan::audio_effects::{apply_dereverb_dfn3, DereverbParams};
@@ -48,8 +49,8 @@ fn apply_dereverb_dfn3_produces_finite_output_of_same_length() {
 #[test]
 #[ignore]
 fn apply_dereverb_dfn3_mix_zero_is_close_to_dry_signal() {
-    let Some((ffmpeg, dfn_bin)) = deep_filter_next_to_ffmpeg() else {
-        eprintln!("SKIP: deep-filter not found next to ffmpeg on PATH");
+    let Some((ffmpeg, dfn_bin)) = deep_filter_and_ffmpeg() else {
+        eprintln!("SKIP: deep-filter or ffmpeg not found (set VOCAN_DEEPFILTER)");
         return;
     };
     use vocan::audio_effects::{apply_dereverb_dfn3, DereverbParams};
@@ -81,8 +82,8 @@ fn apply_dereverb_dfn3_mix_zero_is_close_to_dry_signal() {
 #[test]
 #[ignore]
 fn process_single_file_with_dfn3_dereverb_enabled_succeeds() {
-    let Some((ffmpeg, _dfn_bin)) = deep_filter_next_to_ffmpeg() else {
-        eprintln!("SKIP: deep-filter not found next to ffmpeg on PATH");
+    let Some((ffmpeg, _dfn_bin)) = deep_filter_and_ffmpeg() else {
+        eprintln!("SKIP: deep-filter or ffmpeg not found (set VOCAN_DEEPFILTER)");
         return;
     };
     use vocan::processing::process_single_file;
@@ -103,9 +104,8 @@ fn process_single_file_with_dfn3_dereverb_enabled_succeeds() {
         ..Default::default()
     };
 
-    // Pass the *resolved* ffmpeg path, not a bare "ffmpeg": process_with_rust_dsp
-    // looks for deep-filter next to ffmpeg.parent(), which is empty for a bare
-    // PATH-relative name (see `deep_filter_next_to_ffmpeg`'s doc comment).
+    // Pass the *resolved* ffmpeg path, not a bare "ffmpeg", as the app does
+    // (see `deep_filter_and_ffmpeg`'s doc comment).
     process_single_file(&input_path, &input_base, &output_base, &opts, &ffmpeg)
         .expect("processing with DFN3 dereverb enabled should succeed");
 

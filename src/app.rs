@@ -1308,12 +1308,74 @@ impl AudioBatchApp {
                 return;
             }
 
-            // Speech detection replaces the level-based trim wholesale, so when
-            // it is on the two level rows below have nothing to say and are not
-            // shown. It is only offered when it can run: the model file has to
-            // be there, and the platform has to have an ONNX Runtime.
-            ui.add_space(11.0);
+            // Speech detection (below) replaces the level-based trim
+            // wholesale, so when it is on the two level rows have nothing to
+            // say and are greyed out, like the modules under a switched-off
+            // pane.
             let vad_ready = self.vad_available;
+            let levels_on = !(self.trim_silence_vad && vad_ready);
+            ui.add_enabled_ui(levels_on, |ui| {
+                ui.add_space(11.0);
+                let selected = self.trim_silence_threshold.label();
+                combo_row(
+                    ui,
+                    "Silence below",
+                    trim_w,
+                    "trim_threshold",
+                    selected,
+                    |ui| {
+                        for &t in SilenceThreshold::all() {
+                            ui.selectable_value(&mut self.trim_silence_threshold, t, t.label());
+                        }
+                    },
+                )
+                .on_hover_text(
+                    "Anything quieter than this counts as silence.\n\
+                 Too low and a noisy room hides the silence entirely, so nothing is\n\
+                 trimmed; too high and quiet consonants go with it.\n\
+                 With Clean up on, the trim runs last, on the denoised signal.",
+                );
+
+                // The threshold's own risk warning. Mirrors the expander's notice
+                // on `ReductionProfile::Max` -- same shape, same reason.
+                if self.trim_silence_threshold == SilenceThreshold::Max {
+                    ui.add_space(10.0);
+                    widgets::notice(
+                        ui,
+                        "MAX (-21 dB) counts anything below a raised voice as silence \u{2014} it \
+                     will cut quiet consonants and the tails of words, not just the dead air.",
+                    );
+                }
+
+                ui.add_space(11.0);
+                let selected = self.trim_silence_pad.label();
+                combo_row(ui, "Keep", trim_w, "trim_pad", selected, |ui| {
+                    for &p in SilencePad::all() {
+                        ui.selectable_value(&mut self.trim_silence_pad, p, p.label());
+                    }
+                })
+                .on_hover_text(
+                    "How much of the original silence to leave at each end.\n\
+                 A ceiling, not a target: VOCAN keeps up to this much of the silence\n\
+                 that was already there and never adds any, so a take with 0.3 s of\n\
+                 lead-in keeps 0.3 s even on Long.",
+                );
+
+                if self.trim_silence_pad == SilencePad::Tight {
+                    ui.add_space(10.0);
+                    widgets::notice(
+                        ui,
+                        "Tight (0 ms) cuts at the first and last sample above the threshold, \
+                     leaving no breathing room at all. A plosive can sound clipped, and \
+                     some engines click on a file that starts mid-waveform. Pick 0.25 s \
+                     if you are not editing the results afterwards.",
+                    );
+                }
+            });
+
+            // Offered only when it can run: the model file has to be there,
+            // and the platform has to have an ONNX Runtime.
+            ui.add_space(14.0);
             ui.add_enabled_ui(vad_ready, |ui| {
                 ui.horizontal(|ui| {
                     widgets::check(
@@ -1344,67 +1406,6 @@ impl AudioBatchApp {
             } else {
                 ui.add_space(6.0);
                 widgets::notice(ui, &vad::unavailable_reason());
-            }
-
-            if self.trim_silence_vad && vad_ready {
-                return;
-            }
-
-            ui.add_space(11.0);
-            let selected = self.trim_silence_threshold.label();
-            combo_row(
-                ui,
-                "Silence below",
-                trim_w,
-                "trim_threshold",
-                selected,
-                |ui| {
-                    for &t in SilenceThreshold::all() {
-                        ui.selectable_value(&mut self.trim_silence_threshold, t, t.label());
-                    }
-                },
-            )
-            .on_hover_text(
-                "Anything quieter than this counts as silence.\n\
-                 Too low and a noisy room hides the silence entirely, so nothing is\n\
-                 trimmed; too high and quiet consonants go with it.\n\
-                 With Clean up on, the trim runs last, on the denoised signal.",
-            );
-
-            // The threshold's own risk warning. Mirrors the expander's notice
-            // on `ReductionProfile::Max` -- same shape, same reason.
-            if self.trim_silence_threshold == SilenceThreshold::Max {
-                ui.add_space(10.0);
-                widgets::notice(
-                    ui,
-                    "MAX (-21 dB) counts anything below a raised voice as silence \u{2014} it \
-                     will cut quiet consonants and the tails of words, not just the dead air.",
-                );
-            }
-
-            ui.add_space(11.0);
-            let selected = self.trim_silence_pad.label();
-            combo_row(ui, "Keep", trim_w, "trim_pad", selected, |ui| {
-                for &p in SilencePad::all() {
-                    ui.selectable_value(&mut self.trim_silence_pad, p, p.label());
-                }
-            })
-            .on_hover_text(
-                "How much of the original silence to leave at each end.\n\
-                 A ceiling, not a target: VOCAN keeps up to this much of the silence\n\
-                 that was already there and never adds any, so a take with 0.3 s of\n\
-                 lead-in keeps 0.3 s even on Long.",
-            );
-
-            if self.trim_silence_pad == SilencePad::Tight {
-                ui.add_space(10.0);
-                widgets::notice(
-                    ui,
-                    "Tight (0 ms) cuts at the first and last sample above the threshold, \
-                     leaving no breathing room at all. A plosive can sound clipped, and \
-                     some engines click on a file that starts mid-waveform. Pick 0.25 s \
-                     if you are not editing the results afterwards.",
-                );
             }
         });
     }

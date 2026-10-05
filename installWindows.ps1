@@ -9,7 +9,7 @@
       3. Installs ffmpeg (via winget, or Chocolatey if available) if missing.
       4. Downloads the DeepFilterNet3 "deep-filter.exe" binary from its
          official GitHub releases (Rikorose/DeepFilterNet) and places it
-         next to the VOCAN binary. This is OPTIONAL functionality in the
+         in a "models" folder next to VOCAN.exe. This is OPTIONAL functionality in the
          app (only needed for the "Dereverb (DeepFilterNet3)" checkbox).
          Windows marks downloaded executables with a "Mark of the Web" zone
          flag; this script clears that flag (Unblock-File) ONLY on this one
@@ -28,7 +28,7 @@
       7. Runs the automated test suite (fast tests, then ffmpeg-dependent
          tests) to confirm everything actually works.
       8. Copies just the files needed to run VOCAN (VOCAN.exe and, if
-         installed, deep-filter.exe and the "models" folder) into a clean
+         installed, the "models" folder with both models) into a clean
          "VOCAN-App" folder, then deletes the "target" build folder (many
          hundreds of MB of intermediate build files you don't need to just
          run the app). Your source code and this script are never touched
@@ -169,6 +169,10 @@ if (-not (Test-Path $VocanExe)) {
 }
 Ok "Binary at $VocanExe"
 
+# Both optional models live in a "models" folder next to VOCAN.exe.
+$ModelDir = Join-Path $BinDir "models"
+$DfnDest  = Join-Path $ModelDir "deep-filter.exe"
+
 # --- 5. DeepFilterNet3 (optional) ----------------------------------------------
 if ($NoDfn3) {
     Step "Skipping DeepFilterNet3 (-NoDfn3 given)"
@@ -185,7 +189,8 @@ if ($NoDfn3) {
             if (-not $asset) {
                 Warn "Could not find a DeepFilterNet3 Windows release asset. Skipping (this is an optional feature)."
             } else {
-                $dest = Join-Path $BinDir "deep-filter.exe"
+                $dest = $DfnDest
+                New-Item -ItemType Directory -Path $ModelDir -Force | Out-Null
                 Write-Host "  Downloading: $($asset.browser_download_url)"
                 Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $dest
 
@@ -204,7 +209,6 @@ if ($NoDfn3) {
 }
 
 # --- 6. Silero VAD model (optional) --------------------------------------------
-$ModelDir  = Join-Path $BinDir "models"
 $ModelDest = Join-Path $ModelDir "silero_vad.onnx"
 if ($NoVad) {
     Step "Skipping Silero VAD model (-NoVad given)"
@@ -253,6 +257,9 @@ if ($SkipTests) {
     if (Test-Path $ModelDest) {
         $env:VOCAN_SILERO_MODEL = $ModelDest
     }
+    if (Test-Path $DfnDest) {
+        $env:VOCAN_DEEPFILTER = $DfnDest
+    }
 
     Step "Running fast tests (no ffmpeg required)"
     # NOTE: cargo writes normal progress (e.g. "Compiling", "Finished") to stderr.
@@ -299,11 +306,7 @@ if (Test-Path $AppDir) {
 New-Item -ItemType Directory -Path $AppDir | Out-Null
 Copy-Item $VocanExe (Join-Path $AppDir "VOCAN.exe")
 
-$DfnInBin = Join-Path $BinDir "deep-filter.exe"
-if (Test-Path $DfnInBin) {
-    Copy-Item $DfnInBin (Join-Path $AppDir "deep-filter.exe")
-}
-
+# The models folder holds both deep-filter.exe and silero_vad.onnx.
 if (Test-Path $ModelDir) {
     Copy-Item $ModelDir (Join-Path $AppDir "models") -Recurse
 }

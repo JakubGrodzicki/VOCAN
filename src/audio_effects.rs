@@ -359,7 +359,7 @@ pub fn apply_nnnoise(samples_48k_mono: &[f32], params: &NnnoiseParams) -> Result
 // ===========================================================================
 //
 // Requires `deep-filter` binary (https://github.com/Rikorose/DeepFilterNet/releases)
-// alongside ffmpeg. Expects 48 kHz mono f32 signal. Returns the same.
+// in the `models` folder next to VOCAN (see `dfn3_binary_path`). Expects 48 kHz mono f32 signal. Returns the same.
 //
 // DeepFilterNet3 performs joint denoise + dereverb at 48 kHz — no resampling required.
 // The -D flag compensates for STFT latency and model lookahead (sample-accurate),
@@ -465,23 +465,50 @@ pub const DFN3_BINARY: &str = if cfg!(windows) {
     "deep-filter"
 };
 
-/// Where the DeepFilterNet3 binary is expected: next to ffmpeg when ffmpeg was
-/// found by an explicit path, otherwise next to our own executable (an ffmpeg
-/// found on PATH is the bare name `ffmpeg`, whose parent is empty).
+/// Environment variable naming the `deep-filter` binary explicitly. The
+/// installers set it for the test run, which executes from `target/.../deps`
+/// rather than from the app folder.
+pub const DFN3_ENV: &str = "VOCAN_DEEPFILTER";
+
+/// Where the DeepFilterNet3 binary is, if it is anywhere VOCAN looks.
 ///
-/// Does not check that the file exists. The processing pipeline and the status
-/// indicator in the UI both go through here, so what the indicator reports is
-/// exactly what a run will try to open.
+/// Order: the file named by [`DFN3_ENV`] (a path that does not exist is
+/// skipped), then `models/deep-filter` next to our executable (where the
+/// installers put it), then next to ffmpeg when ffmpeg was found by an
+/// explicit path (older or manual installs). When none exists, returns the
+/// `models/` location, so error messages say where to put the file.
+///
+/// The processing pipeline and the status indicator in the UI both go through
+/// here, so what the indicator reports is exactly what a run will try to open.
 pub fn dfn3_binary_path(ffmpeg: &Path) -> Option<PathBuf> {
-    ffmpeg
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    dfn3_binary_path_in(std::env::var_os(DFN3_ENV), exe_dir.as_deref(), ffmpeg)
+}
+
+fn dfn3_binary_path_in(
+    env: Option<std::ffi::OsString>,
+    exe_dir: Option<&Path>,
+    ffmpeg: &Path,
+) -> Option<PathBuf> {
+    let from_env = env
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_file());
+    if from_env.is_some() {
+        return from_env;
+    }
+    let in_models = exe_dir.map(|d| d.join("models").join(DFN3_BINARY));
+    let next_to_ffmpeg = ffmpeg
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.join(DFN3_BINARY))
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join(DFN3_BINARY)))
-        })
+        .map(|p| p.join(DFN3_BINARY));
+    [in_models.clone(), next_to_ffmpeg]
+        .into_iter()
+        .flatten()
+        .find(|p| p.is_file())
+        .or(in_models)
 }
 
 /// Whether the DeepFilterNet3 binary is present where [`dfn3_binary_path`]
@@ -900,40 +927,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dfn3_path_is_next_to_an_explicit_ffmpeg() {
-        let ffmpeg = Path::new("some").join("dir").join("ffmpeg.exe");
+    fn dfn3_path_defaults_to_models_next_to_our_executable() {
+        // Nothing exists anywhere: the answer is where the file should go. A
+        // bare `ffmpeg` has an empty parent and must not turn into a lookup in
+        // the current directory.
+        let exe = tempfile::tempdir().unwrap();
         assert_eq!(
-            dfn3_binary_path(&ffmpeg),
-            Some(Path::new("some").join("dir").join(DFN3_BINARY))
+            dfn3_binary_path_in(None, Some(exe.path()), Path::new("ffmpeg")),
+            Some(exe.path().join("models").join(DFN3_BINARY))
         );
     }
 
     #[test]
-    fn dfn3_path_for_ffmpeg_on_path_is_next_to_our_executable() {
-        // A bare `ffmpeg` has an empty parent; joining onto that would look in
-        // the current directory instead of beside VOCAN.
-        let exe_dir = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_owned();
+    fn dfn3_models_folder_wins_over_the_ffmpeg_folder() {
+        let exe = tempfile::tempdir().unwrap();
+        let ff = tempfile::tempdir().unwrap();
+        let ffmpeg = ff.path().join("ffmpeg");
+        std::fs::write(ff.path().join(DFN3_BINARY), b"x").unwrap();
+        // Only the ffmpeg-side copy exists: it is found.
         assert_eq!(
-            dfn3_binary_path(Path::new("ffmpeg")),
-            Some(exe_dir.join(DFN3_BINARY))
+            dfn3_binary_path_in(None, Some(exe.path()), &ffmpeg),
+            Some(ff.path().join(DFN3_BINARY))
+        );
+        // Once models/ has one too, that one wins.
+        std::fs::create_dir(exe.path().join("models")).unwrap();
+        let in_models = exe.path().join("models").join(DFN3_BINARY);
+        std::fs::write(&in_models, b"x").unwrap();
+        assert_eq!(
+            dfn3_binary_path_in(None, Some(exe.path()), &ffmpeg),
+            Some(in_models)
+        );
+    }
+
+    #[test]
+    fn dfn3_env_wins_but_a_missing_file_is_skipped() {
+        let exe = tempfile::tempdir().unwrap();
+        std::fs::create_dir(exe.path().join("models")).unwrap();
+        let in_models = exe.path().join("models").join(DFN3_BINARY);
+        std::fs::write(&in_models, b"x").unwrap();
+        let custom = exe.path().join("custom-df");
+        std::fs::write(&custom, b"x").unwrap();
+        let ffmpeg = Path::new("ffmpeg");
+        assert_eq!(
+            dfn3_binary_path_in(Some(custom.clone().into()), Some(exe.path()), ffmpeg),
+            Some(custom)
+        );
+        let missing = exe.path().join("nope");
+        assert_eq!(
+            dfn3_binary_path_in(Some(missing.into()), Some(exe.path()), ffmpeg),
+            Some(in_models)
         );
     }
 
     #[test]
     fn dfn3_available_follows_the_file() {
+        // `dfn3_available` reads the real environment, so exercise the same
+        // decision through `dfn3_binary_path_in` on a scratch folder.
         let dir = tempfile::tempdir().unwrap();
-        let ffmpeg = dir.path().join("ffmpeg");
-        assert!(!dfn3_available(&ffmpeg));
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        let ffmpeg = Path::new("ffmpeg");
+        let found =
+            |d: &Path| dfn3_binary_path_in(None, Some(d), ffmpeg).is_some_and(|p| p.is_file());
+        assert!(!found(dir.path()));
         // A directory with the right name is not the binary.
-        std::fs::create_dir(dir.path().join(DFN3_BINARY)).unwrap();
-        assert!(!dfn3_available(&ffmpeg));
-        std::fs::remove_dir(dir.path().join(DFN3_BINARY)).unwrap();
-        std::fs::write(dir.path().join(DFN3_BINARY), b"x").unwrap();
-        assert!(dfn3_available(&ffmpeg));
+        std::fs::create_dir(models.join(DFN3_BINARY)).unwrap();
+        assert!(!found(dir.path()));
+        std::fs::remove_dir(models.join(DFN3_BINARY)).unwrap();
+        std::fs::write(models.join(DFN3_BINARY), b"x").unwrap();
+        assert!(found(dir.path()));
     }
 
     // -----------------------------------------------------------------------

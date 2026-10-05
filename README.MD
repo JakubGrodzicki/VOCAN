@@ -114,7 +114,7 @@ VOCAN needs FFmpeg. Do one of these two things:
 
 On Windows, the FFmpeg file name is `ffmpeg.exe`. On Linux and macOS, the file name is `ffmpeg`.
 
-DeepFilterNet3 is optional. VOCAN needs DeepFilterNet3 only when you enable the dereverb option. Get the `deep-filter` executable file from the [DeepFilterNet releases page](https://github.com/Rikorose/DeepFilterNet/releases). Put this file in the same folder as the FFmpeg executable file. On Windows, the file name is `deep-filter.exe`.
+DeepFilterNet3 is optional. VOCAN needs DeepFilterNet3 only when you enable the dereverb option. Get the `deep-filter` executable file from the [DeepFilterNet releases page](https://github.com/Rikorose/DeepFilterNet/releases). Put this file in a `models` folder next to the VOCAN executable file: `models/deep-filter`. On Windows, the file name is `deep-filter.exe`. As a fallback, VOCAN also accepts the file in the same folder as the FFmpeg executable file. To use a file in another place, set the environment variable `VOCAN_DEEPFILTER` to its full path.
 
 The Silero VAD model is optional. VOCAN needs it only for the **Detect speech with Silero VAD** checkbox. The model is one file, `silero_vad.onnx` (about 2.3 MB), and it must sit in a `models` folder next to the VOCAN executable file: `models/silero_vad.onnx`. As a fallback, VOCAN also accepts the file directly next to the executable. To use a file in another place, set the environment variable `VOCAN_SILERO_MODEL` to its full path. This variable takes priority over both folders. This model file is the only extra download. ONNX Runtime, which runs the model, is built into the VOCAN executable file, so you do not install it.
 
@@ -135,7 +135,7 @@ VOCAN has one setup script for macOS and Linux, and one setup script for Windows
 1. Detects your operating system and CPU architecture.
 2. Installs Rust, if it is missing.
 3. Installs FFmpeg, if it is missing.
-4. Downloads DeepFilterNet3 and places it next to the VOCAN binary.
+4. Downloads DeepFilterNet3 and places it in a `models` folder next to the VOCAN binary.
 5. Downloads the Silero VAD model into a `models` folder next to the VOCAN binary, and checks its SHA-256 hash.
 6. Builds VOCAN in release mode.
 7. Runs the automated test suite, to confirm that the build works.
@@ -266,7 +266,7 @@ cargo test -- --ignored
 
 The full test suite needs a real FFmpeg executable on the PATH. These tests generate WAV files, then process the files through the real pipeline.
 
-The full test suite also includes tests for the DeepFilterNet3 dereverb feature. These tests need a `deep-filter` executable file next to FFmpeg. The setup script in "Build Instructions" installs this file for you. If VOCAN cannot find the file, these tests print a skip notice and pass without an error, so the full test suite still works on a computer without DeepFilterNet3.
+The full test suite also includes tests for the DeepFilterNet3 dereverb feature. These tests need a `deep-filter` executable file in a `models` folder next to the test executable, or the environment variable `VOCAN_DEEPFILTER` set to its path (the setup script sets this variable for you). The setup script in "Build Instructions" installs this file for you. If VOCAN cannot find the file, these tests print a skip notice and pass without an error, so the full test suite still works on a computer without DeepFilterNet3.
 
 It also includes tests for Silero VAD speech detection. These tests need the model file and a speech recording. They read the paths from the environment variables `VOCAN_SILERO_MODEL` and `VOCAN_VAD_FIXTURE` (CI sets both). If a file is missing, the tests print a skip notice and pass.
 
@@ -386,7 +386,7 @@ When Automixer is off, FFmpeg processes the file directly. FFmpeg applies the si
 
 ### DeepFilterNet3 integration
 
-- VOCAN sends the audio to the `deep-filter` executable through temporary WAV files. VOCAN looks for this executable next to FFmpeg, or next to the VOCAN executable.
+- VOCAN sends the audio to the `deep-filter` executable through temporary WAV files. VOCAN looks for this executable in this order: the file named by the `VOCAN_DEEPFILTER` environment variable, then `models/deep-filter` next to the VOCAN executable, then the folder of the FFmpeg executable.
 - The model expects 48 kHz mono audio. VOCAN mixes the output with the original signal, at the ratio that you set.
 - VOCAN reads and writes the WAV files with the `hound` library.
 

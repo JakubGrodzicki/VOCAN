@@ -14,7 +14,7 @@ machine without ffmpeg -- but the primary gate is `#[ignore]` itself.
 
 `cargo test -- --ignored` also runs `tests/dfn3_integration.rs`, which
 exercises the real DeepFilterNet3 dereverb path. These tests check at
-runtime for a `deep-filter` binary next to `ffmpeg` on PATH, and print a
+runtime for a `deep-filter` binary (`VOCAN_DEEPFILTER`, or a `models` folder) and `ffmpeg` on PATH, and print a
 `SKIP` notice (not a failure) if it isn't there -- so they pass trivially on
 a machine or CI runner without DeepFilterNet3 installed, and actually run
 the model on a machine that has it (for example, after running
@@ -90,7 +90,7 @@ tests skip on a normal install.
 - `tests/dfn3_integration.rs`: the DeepFilterNet3 dereverb integration --
   direct calls to `apply_dereverb_dfn3`, and a full pipeline run with
   dereverb enabled. Skipped automatically when `deep-filter` isn't
-  installed next to ffmpeg.
+  found (see `VOCAN_DEEPFILTER`).
 
 ## Manual smoke test (GUI)
 
@@ -113,7 +113,7 @@ here. Before a release, or after any GUI-adjacent change, run through:
 8. Click "Stop" mid-run; confirm it actually stops and the UI returns to an
    idle state.
 9. If testing DFN3 dereverb specifically: ensure a `deep-filter` binary is
-   next to `ffmpeg` (or next to the app executable) first. `tests/dfn3_integration.rs`
+   in `models/` next to the app executable, or point `VOCAN_DEEPFILTER` at it, first. `tests/dfn3_integration.rs`
    already covers the underlying pipeline logic; this manual pass is only to
    confirm the checkbox, mix slider, and post-filter option behave correctly
    in the GUI itself.

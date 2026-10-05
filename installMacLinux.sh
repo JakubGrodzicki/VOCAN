@@ -7,8 +7,8 @@
 #   2. Installs Rust (via the official rustup installer) if it's missing.
 #   3. Installs ffmpeg (via Homebrew on macOS, apt/dnf/pacman on Linux) if missing.
 #   4. Downloads the DeepFilterNet3 "deep-filter" binary from its official
-#      GitHub releases (Rikorose/DeepFilterNet) and places it next to the
-#      VOCAN binary. This step is OPTIONAL functionality in the app (only
+#      GitHub releases (Rikorose/DeepFilterNet) and places it in a "models"
+#      folder next to the VOCAN binary. This step is OPTIONAL functionality in the app (only
 #      needed for the "Dereverb (DeepFilterNet3)" checkbox).
 #      On macOS, downloaded binaries are quarantined by Gatekeeper; this
 #      script removes that flag ONLY from this specific downloaded file so
@@ -27,7 +27,7 @@
 #   7. Runs the automated test suite (fast tests, then ffmpeg-dependent
 #      tests) to confirm everything actually works.
 #   8. Copies just the files needed to run VOCAN (the VOCAN binary and, if
-#      installed, deep-filter and the "models" folder) into a clean
+#      installed, the "models" folder with both models) into a clean
 #      "VOCAN-App" folder, then deletes the "target" build folder (many
 #      hundreds of MB of intermediate build files you don't need to just run
 #      the app). Your source code and this script are never touched by this
@@ -206,6 +206,10 @@ if [ ! -f "$BIN_DIR/VOCAN" ]; then
 fi
 ok "Binary at $BIN_DIR/VOCAN"
 
+# Both optional models live in a "models" folder next to the VOCAN binary.
+MODEL_DIR="$BIN_DIR/models"
+DFN3_DEST="$MODEL_DIR/deep-filter"
+
 # --- 5. DeepFilterNet3 (optional) ---------------------------------------------
 if [ "$SKIP_DFN3" = true ]; then
   step "Skipping DeepFilterNet3 (--no-dfn3 given)"
@@ -235,7 +239,8 @@ else
       fail "Downloaded file doesn't look like a valid executable. Skipping DeepFilterNet3 install."
       rm -f "$TMP_BIN"
     else
-      DEST="$BIN_DIR/deep-filter"
+      DEST="$DFN3_DEST"
+      mkdir -p "$MODEL_DIR"
       cp "$TMP_BIN" "$DEST"
       rm -f "$TMP_BIN"
       chmod +x "$DEST"
@@ -247,21 +252,12 @@ else
         xattr -d com.apple.quarantine "$DEST" 2>/dev/null || true
       fi
 
-      # Also place a copy next to ffmpeg, in case VOCAN resolves ffmpeg to an
-      # absolute path in some environment (belt-and-suspenders; the primary
-      # lookup VOCAN uses is next to its own executable, handled above).
-      FFMPEG_DIR="$(dirname "$FFMPEG_BIN")"
-      if [ -w "$FFMPEG_DIR" ]; then
-        cp "$DEST" "$FFMPEG_DIR/deep-filter" 2>/dev/null || true
-      fi
-
       ok "DeepFilterNet3 installed at $DEST"
     fi
   fi
 fi
 
 # --- 6. Silero VAD model (optional) -------------------------------------------
-MODEL_DIR="$BIN_DIR/models"
 MODEL_DEST="$MODEL_DIR/silero_vad.onnx"
 
 # Prints the SHA-256 of a file (lowercase hex), using whichever tool exists.
@@ -329,6 +325,9 @@ else
   if [ -f "$MODEL_DEST" ]; then
     export VOCAN_SILERO_MODEL="$MODEL_DEST"
   fi
+  if [ -f "$DFN3_DEST" ]; then
+    export VOCAN_DEEPFILTER="$DFN3_DEST"
+  fi
 
   step "Running fast tests (no ffmpeg required)"
   FAST_LOG="$(mktemp)"
@@ -362,10 +361,7 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR"
 cp "$BIN_DIR/VOCAN" "$APP_DIR/VOCAN"
 chmod +x "$APP_DIR/VOCAN"
-if [ -f "$BIN_DIR/deep-filter" ]; then
-  cp "$BIN_DIR/deep-filter" "$APP_DIR/deep-filter"
-  chmod +x "$APP_DIR/deep-filter"
-fi
+# The models folder holds both deep-filter and silero_vad.onnx.
 if [ -d "$MODEL_DIR" ]; then
   cp -R "$MODEL_DIR" "$APP_DIR/models"
 fi

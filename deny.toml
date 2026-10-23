@@ -14,6 +14,13 @@ ignore = [
     "RUSTSEC-2024-0436", # paste
     "RUSTSEC-2026-0192", # ttf-parser
     "RUSTSEC-2026-0257", # webbrowser, pulled in by eframe 0.27.2's egui-winit; resolved once the egui 0.36 bump lands
+    # zbus split-up: zbus_names, zvariant and zvariant_derive were merged into zbus 6.
+    # "Unmaintained" only, no safe upgrade exists. They arrive through eframe 0.27.2
+    # (accesskit_unix -> atspi) and rfd 0.14.1 (ashpd), so they go away with the
+    # eframe/rfd bumps rather than with a lockfile update.
+    "RUSTSEC-2026-0370", # zvariant
+    "RUSTSEC-2026-0371", # zbus_names
+    "RUSTSEC-2026-0372", # zvariant_derive
 ]
 
 [licenses]

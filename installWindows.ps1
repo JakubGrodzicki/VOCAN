@@ -7,7 +7,10 @@
       1. Detects your CPU architecture.
       2. Installs Rust (via the official rustup installer) if it's missing.
       3. Installs ffmpeg (via winget, or Chocolatey if available) if missing.
-      4. Downloads the DeepFilterNet3 "deep-filter.exe" binary from its
+      4. Builds VOCAN in release mode. The build downloads a prebuilt
+         ONNX Runtime from the network and links it into VOCAN.exe, so
+         there is nothing extra to ship for it.
+      5. Downloads the DeepFilterNet3 "deep-filter.exe" binary from its
          official GitHub releases (Rikorose/DeepFilterNet) and places it
          in a "models" folder next to VOCAN.exe. This is OPTIONAL functionality in the
          app (only needed for the "Dereverb (DeepFilterNet3)" checkbox).
@@ -15,9 +18,6 @@
          flag; this script clears that flag (Unblock-File) ONLY on this one
          downloaded file, so it can run -- the same thing you'd do manually
          via its file Properties dialog ("Unblock" checkbox).
-      5. Builds VOCAN in release mode. The build downloads a prebuilt
-         ONNX Runtime from the network and links it into VOCAN.exe, so
-         there is nothing extra to ship for it.
       6. Downloads the Silero VAD model (silero_vad.onnx, about 2.3 MB, MIT
          licensed, github.com/snakers4/silero-vad) into a "models" folder
          next to VOCAN.exe and checks its SHA-256. This is OPTIONAL

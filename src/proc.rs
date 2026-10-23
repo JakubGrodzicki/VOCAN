@@ -171,6 +171,12 @@ pub fn terminate_all() {
     }
 }
 
+/// How many registered children are alive right now. For tests that must press
+/// Stop only once a child is really running, instead of guessing with a sleep.
+pub fn live_count() -> usize {
+    lock_state().live.len()
+}
+
 /// Clears the "terminating" latch set by [`terminate_all`] so a new run can
 /// spawn children again.
 pub fn resume() {

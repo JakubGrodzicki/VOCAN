@@ -135,10 +135,11 @@ VOCAN has one setup script for macOS and Linux, and one setup script for Windows
 1. Detects your operating system and CPU architecture.
 2. Installs Rust, if it is missing.
 3. Installs FFmpeg, if it is missing.
-4. Downloads DeepFilterNet3 and places it in a `models` folder next to the VOCAN binary.
-5. Downloads the Silero VAD model into a `models` folder next to the VOCAN binary, and checks its SHA-256 hash.
-6. Builds VOCAN in release mode.
+4. Builds VOCAN in release mode.
+5. Downloads DeepFilterNet3 and places it in a `models` folder next to the VOCAN binary.
+6. Downloads the Silero VAD model into a `models` folder next to the VOCAN binary, and checks its SHA-256 hash.
 7. Runs the automated test suite, to confirm that the build works.
+8. Copies the finished files into a clean `VOCAN-App` folder and deletes the `target` build folder (unless you pass `--keep-build` or `-KeepBuild`).
 
 Do these steps on macOS or Linux:
 
@@ -163,7 +164,7 @@ To skip the DeepFilterNet3 download, add the flag `--no-dfn3` (macOS/Linux) or `
 
 The Silero VAD model is the only extra download. The build itself fetches a prebuilt ONNX Runtime from the network and links it into the executable file, so there is nothing more to ship. If the model download or its hash check fails, the script deletes the file, prints a warning, and carries on. VOCAN then works without the Silero VAD checkbox. On Intel Macs, the script prints a warning and skips the model, because ONNX Runtime has no build for that CPU.
 
-On Linux, the build needs the OpenSSL headers and `pkg-config`, because the ONNX Runtime download runs over TLS. The script installs `libssl-dev` and `pkg-config` (or the matching packages for `dnf` and `pacman`) for you.
+On Linux, the build needs the OpenSSL headers and `pkg-config`, because the ONNX Runtime download runs over TLS. The script installs `libssl-dev` and `pkg-config` (or the matching packages for `dnf` and `pacman`) for you. It also installs a C compiler if it is missing (on macOS it only checks that the Xcode command line tools exist, and tells you to run `xcode-select --install` if they do not). On Fedora without RPM Fusion, the script installs `ffmpeg-free` instead of `ffmpeg`. On Linux x86_64, the `deep-filter` file from the DeepFilterNet releases is a static `musl` build.
 
 **Note about DeepFilterNet3 and downloaded-file warnings:** the script downloads the `deep-filter` executable file from its official GitHub releases page and clears the "downloaded file" flag from your operating system, so that the file can run. On macOS, this flag is the Gatekeeper quarantine attribute. On Windows, this flag is the Mark of the Web. This is the same action you would take yourself, through your file manager, to run a downloaded executable file.
 

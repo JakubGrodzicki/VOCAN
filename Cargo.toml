@@ -21,7 +21,7 @@ num_cpus = "1.16"
 
 # new dependencies for DSP and temporary files
 rustfft = "6.2"
-biquad = "0.4"
+biquad = "0.6"
 # default features are `bin` + `dasp`, which exist only for the crate's own CLI
 # binaries and pull in clap and three dasp crates. We use `DenoiseState` only,
 # which is not feature-gated.

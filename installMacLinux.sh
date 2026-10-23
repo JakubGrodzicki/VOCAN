@@ -5,18 +5,22 @@
 # What this does, in order:
 #   1. Detects your OS and CPU architecture.
 #   2. Installs Rust (via the official rustup installer) if it's missing.
-#   3. Installs ffmpeg (via Homebrew on macOS, apt/dnf/pacman on Linux) if missing.
-#   4. Downloads the DeepFilterNet3 "deep-filter" binary from its official
+#   3. Installs ffmpeg (via Homebrew on macOS, apt/dnf/pacman on Linux) if
+#      missing. On Fedora without RPM Fusion it falls back to ffmpeg-free.
+#      Also makes sure the build prerequisites exist: on Linux the OpenSSL
+#      headers, pkg-config and a C compiler; on macOS the Xcode
+#      command line tools (it only checks for them).
+#   4. Builds VOCAN in release mode. The build downloads a prebuilt ONNX
+#      Runtime from the network and links it into the VOCAN binary, so there
+#      is nothing extra to ship for it.
+#   5. Downloads the DeepFilterNet3 "deep-filter" binary from its official
 #      GitHub releases (Rikorose/DeepFilterNet) and places it in a "models"
 #      folder next to the VOCAN binary. This step is OPTIONAL functionality in the app (only
-#      needed for the "Dereverb (DeepFilterNet3)" checkbox).
+#      needed for the "Dereverb (DeepFilterNet3)" checkbox). The Linux x86_64
+#      build is published as a static "musl" binary.
 #      On macOS, downloaded binaries are quarantined by Gatekeeper; this
 #      script removes that flag ONLY from this specific downloaded file so
 #      it can run, the same way you'd do manually via Finder/right-click.
-#   5. Builds VOCAN in release mode. The build downloads a prebuilt ONNX
-#      Runtime from the network and links it into the VOCAN binary, so there
-#      is nothing extra to ship for it. On Linux this needs the OpenSSL
-#      headers (libssl-dev and pkg-config); step 3 installs them.
 #   6. Downloads the Silero VAD model (silero_vad.onnx, about 2.3 MB, MIT
 #      licensed, github.com/snakers4/silero-vad) into a "models" folder next
 #      to the VOCAN binary and checks its SHA-256. This is OPTIONAL
@@ -95,6 +99,15 @@ fail_exit() {
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
+# Package installs need root. Run them directly when already root (containers),
+# and through sudo otherwise. Left empty, `$SUDO cmd` is simply `cmd`.
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  fi
+fi
+
 # --- 1. Detect OS and architecture -------------------------------------------
 step "Detecting platform"
 OS_NAME="$(uname -s)"
@@ -154,11 +167,16 @@ else
     fi
   else
     if command -v apt-get >/dev/null 2>&1; then
-      sudo apt-get update && sudo apt-get install -y ffmpeg
+      $SUDO apt-get update && $SUDO apt-get install -y ffmpeg
     elif command -v dnf >/dev/null 2>&1; then
-      sudo dnf install -y ffmpeg
+      # Stock Fedora has no "ffmpeg" package (it comes from RPM Fusion); the
+      # distribution's own build is "ffmpeg-free".
+      if ! $SUDO dnf install -y ffmpeg; then
+        warn "Package 'ffmpeg' is unavailable (RPM Fusion is not enabled?). Trying 'ffmpeg-free'..."
+        $SUDO dnf install -y ffmpeg-free || fail_exit "Could not install ffmpeg or ffmpeg-free. Enable RPM Fusion (https://rpmfusion.org) or install ffmpeg yourself, then re-run this script."
+      fi
     elif command -v pacman >/dev/null 2>&1; then
-      sudo pacman -Sy --noconfirm ffmpeg
+      $SUDO pacman -Sy --noconfirm ffmpeg
     else
       fail_exit "No supported package manager found (apt-get/dnf/pacman). Install ffmpeg yourself and make sure it's on PATH, then re-run this script."
     fi
@@ -166,7 +184,9 @@ else
   ok "ffmpeg installed."
 fi
 
-FFMPEG_BIN="$(command -v ffmpeg)"
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  fail_exit "ffmpeg still not on PATH after install. Open a new terminal and re-run this script."
+fi
 
 # --- 3b. OpenSSL headers (Linux only) -----------------------------------------
 # The build downloads a prebuilt ONNX Runtime over TLS (via the `ort` crate),
@@ -179,16 +199,42 @@ if [ "$PLATFORM" = "linux" ]; then
   else
     warn "OpenSSL development files not found. Installing..."
     if command -v apt-get >/dev/null 2>&1; then
-      sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      $SUDO apt-get update && $SUDO apt-get install -y libssl-dev pkg-config
     elif command -v dnf >/dev/null 2>&1; then
-      sudo dnf install -y openssl-devel pkgconf-pkg-config
+      $SUDO dnf install -y openssl-devel pkgconf-pkg-config
     elif command -v pacman >/dev/null 2>&1; then
-      sudo pacman -Sy --noconfirm openssl pkgconf
+      $SUDO pacman -Sy --noconfirm openssl pkgconf
     else
       fail_exit "No supported package manager found (apt-get/dnf/pacman). Install the OpenSSL development files and pkg-config yourself (Debian/Ubuntu: libssl-dev pkg-config), then re-run this script."
     fi
     ok "OpenSSL development files installed."
   fi
+fi
+
+# --- 3c. C compiler and linker -------------------------------------------------
+# rustc links through `cc`, and the OpenSSL bindings compile C. A fresh Linux
+# install often has neither; macOS gets them from the Xcode command line tools.
+step "Checking for a C compiler and linker"
+if [ "$PLATFORM" = "macos" ]; then
+  if xcode-select -p >/dev/null 2>&1; then
+    ok "Xcode command line tools already installed."
+  else
+    fail_exit "The Xcode command line tools are missing. Run 'xcode-select --install', wait for it to finish, then re-run this script."
+  fi
+elif command -v cc >/dev/null 2>&1; then
+  ok "C compiler already installed."
+else
+  warn "C compiler not found. Installing..."
+  if command -v apt-get >/dev/null 2>&1; then
+    $SUDO apt-get update && $SUDO apt-get install -y build-essential
+  elif command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf install -y gcc
+  elif command -v pacman >/dev/null 2>&1; then
+    $SUDO pacman -Sy --noconfirm base-devel
+  else
+    fail_exit "No supported package manager found (apt-get/dnf/pacman). Install a C compiler (gcc) yourself, then re-run this script."
+  fi
+  ok "C compiler installed."
 fi
 
 # --- 4. Build (needed before placing deep-filter, so we know the binary path) -
@@ -216,26 +262,52 @@ if [ "$SKIP_DFN3" = true ]; then
 else
   step "Installing DeepFilterNet3 (optional dereverb feature)"
 
+  # Release asset names. The x86_64 Linux build is published as "musl" (a
+  # static binary), not "gnu"; aarch64 Linux is "gnu". Candidates are tried
+  # in order, and the first one present in the release wins.
   if [ "$PLATFORM" = "macos" ]; then
-    ASSET_SUFFIX="${ARCH}-apple-darwin"
+    ASSET_SUFFIXES=("${ARCH}-apple-darwin")
   else
-    ASSET_SUFFIX="${ARCH}-unknown-linux-gnu"
+    ASSET_SUFFIXES=("${ARCH}-unknown-linux-musl" "${ARCH}-unknown-linux-gnu")
   fi
 
+  # Every lookup below must be non-fatal: under `set -e -o pipefail` a grep
+  # with no match (or a failed curl) would otherwise end the whole script here.
   API_JSON="$(curl -fsSL https://api.github.com/repos/Rikorose/DeepFilterNet/releases/latest || true)"
-  ASSET_URL="$(printf '%s' "$API_JSON" \
-    | grep -o "\"browser_download_url\": *\"[^\"]*deep-filter-[^\"]*${ASSET_SUFFIX}\"" \
-    | head -1 \
-    | sed -E 's/.*"(https[^"]+)"/\1/')"
+  ASSET_URL=""
+  for suffix in "${ASSET_SUFFIXES[@]}"; do
+    ASSET_URL="$(printf '%s' "$API_JSON" \
+      | grep -o "\"browser_download_url\": *\"[^\"]*deep-filter-[^\"]*${suffix}\"" \
+      | head -1 \
+      | sed -E 's/.*"(https[^"]+)"/\1/' || true)"
+    if [ -n "$ASSET_URL" ]; then break; fi
+  done
 
   if [ -z "$ASSET_URL" ]; then
-    warn "Could not find a DeepFilterNet3 release asset for ${ASSET_SUFFIX}. Skipping (this is an optional feature)."
+    if [ -z "$API_JSON" ]; then
+      warn "Could not reach the GitHub API to look up DeepFilterNet3 (network problem or rate limit). Skipping (this is an optional feature)."
+    else
+      warn "Could not find a DeepFilterNet3 release asset for ${ASSET_SUFFIXES[*]}. Skipping (this is an optional feature)."
+    fi
   else
-    TMP_BIN="$(mktemp)"
+    TMP_BIN="$(mktemp "${TMPDIR:-/tmp}/vocan.XXXXXX")"
     echo "  Downloading: $ASSET_URL"
-    curl -fsSL -o "$TMP_BIN" "$ASSET_URL"
+    if ! curl -fsSL -o "$TMP_BIN" "$ASSET_URL"; then
+      fail "DeepFilterNet3 download failed. Skipping (this is an optional feature)."
+      rm -f "$TMP_BIN"
+      TMP_BIN=""
+    fi
 
-    if ! file "$TMP_BIN" | grep -qE "Mach-O|ELF"; then
+    # Check the magic bytes directly (ELF or Mach-O) instead of relying on the
+    # `file` command, which is not installed by default on Fedora and friends.
+    MAGIC=""
+    if [ -n "$TMP_BIN" ]; then
+      MAGIC="$(head -c 4 "$TMP_BIN" | od -An -tx1 | tr -d ' \n' || true)"
+    fi
+
+    if [ -z "$TMP_BIN" ]; then
+      :
+    elif ! printf '%s' "$MAGIC" | grep -qiE '^(7f454c46|cffaedfe|cefaedfe|feedface|feedfacf|cafebabe)$'; then
       fail "Downloaded file doesn't look like a valid executable. Skipping DeepFilterNet3 install."
       rm -f "$TMP_BIN"
     else
@@ -330,9 +402,13 @@ else
   fi
 
   step "Running fast tests (no ffmpeg required)"
-  FAST_LOG="$(mktemp)"
-  cargo test 2>&1 | tee "$FAST_LOG" || true
+  FAST_LOG="$(mktemp "${TMPDIR:-/tmp}/vocan.XXXXXX")"
+  # errexit is off around the pipeline so cargo's exit status survives in
+  # PIPESTATUS (a trailing `|| true` would overwrite it with true's own 0).
+  set +e
+  cargo test 2>&1 | tee "$FAST_LOG"
   FAST_EXIT=${PIPESTATUS[0]}
+  set -e
   read -r FAST_PASSED FAST_FAILED <<< "$(parse_test_counts "$FAST_LOG")"
   rm -f "$FAST_LOG"
   if [ "$FAST_EXIT" -eq 0 ]; then
@@ -342,9 +418,11 @@ else
   fi
 
   step "Running full tests (ffmpeg-dependent)"
-  FULL_LOG="$(mktemp)"
-  cargo test -- --ignored 2>&1 | tee "$FULL_LOG" || true
+  FULL_LOG="$(mktemp "${TMPDIR:-/tmp}/vocan.XXXXXX")"
+  set +e
+  cargo test -- --ignored 2>&1 | tee "$FULL_LOG"
   FULL_EXIT=${PIPESTATUS[0]}
+  set -e
   read -r FULL_PASSED FULL_FAILED <<< "$(parse_test_counts "$FULL_LOG")"
   rm -f "$FULL_LOG"
   if [ "$FULL_EXIT" -eq 0 ]; then

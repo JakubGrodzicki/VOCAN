@@ -391,6 +391,20 @@ pub fn apply_loudnorm_pass2(
     source_sr: u32,
     prefix: Option<&str>,
 ) {
+    let filter = loudnorm_pass2_filter(target_lufs, stats, prefix);
+    cmd.args(["-af", &filter, "-ar", &source_sr.to_string()]);
+}
+
+/// The pass-2 `-af` value: `prefix` (if any) followed by the `loudnorm` filter
+/// built from the pass-1 `stats`.
+///
+/// Split out of [`apply_loudnorm_pass2`] so the same string can be handed to a
+/// speech-detection pass, which has to hear exactly what the encode will.
+pub fn loudnorm_pass2_filter(
+    target_lufs: f32,
+    stats: &LoudnormStats,
+    prefix: Option<&str>,
+) -> String {
     let loudnorm = format!(
         "loudnorm=I={lufs}:TP=-1.5:LRA=1.0:\
          measured_I={mi}:measured_LRA={mlra}:measured_TP={mtp}:\
@@ -402,11 +416,10 @@ pub fn apply_loudnorm_pass2(
         mt = stats.input_thresh,
         off = stats.target_offset,
     );
-    let filter = match prefix {
+    match prefix {
         Some(p) => format!("{},{}", p, loudnorm),
         None => loudnorm,
-    };
-    cmd.args(["-af", &filter, "-ar", &source_sr.to_string()]);
+    }
 }
 
 pub fn extract_loudnorm_stats(stderr: &str) -> Result<LoudnormStats> {

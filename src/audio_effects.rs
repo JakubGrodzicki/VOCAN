@@ -220,55 +220,556 @@ pub fn apply_spectral_gate(
 }
 
 // ===========================================================================
-// MODULE 2: Voice EQ (static biquad bank)
+// MODULE 2: Adaptive voice EQ (measure the take, then four gentle static gains)
 // ===========================================================================
+//
+// Compares the long-term spectrum of the speech in a take with the long-term
+// spectrum of speech in general, in four wide bands, and moves each band a
+// little of the way towards it: at most +/-1.5 dB overall.
+//
+// The gains are settled once per file and do not move while it plays. That is
+// what keeps the phase constant and rules out pumping, and it is why this can be
+// a handful of wide minimum-phase biquads instead of a time-varying filter bank.
+//
+// The reference is a speech spectrum, not a flat line: "evening out" a voice
+// towards flat is how you end up with something that sounds like white noise.
 
-pub fn apply_voice_eq_inplace(
+/// ANSI S3.5 (SII) standard speech spectrum level, normal vocal effort:
+/// third-octave centre frequency in Hz, spectrum level in dB per Hz. Values as
+/// published in the open-source MoSQITo implementation of the standard.
+///
+/// A *density*, which matters: see [`speech_target_db`] for the conversion to
+/// band power. A provisional reference for close-miked voice-over, kept in this
+/// one table so calibrating it against real takes means changing only this.
+const SPEECH_SPECTRUM: [(f32, f32); 18] = [
+    (160.0, 32.41),
+    (200.0, 34.48),
+    (250.0, 34.75),
+    (315.0, 33.98),
+    (400.0, 34.59),
+    (500.0, 34.27),
+    (630.0, 32.06),
+    (800.0, 28.30),
+    (1000.0, 25.01),
+    (1250.0, 23.00),
+    (1600.0, 20.15),
+    (2000.0, 17.32),
+    (2500.0, 13.18),
+    (3150.0, 11.55),
+    (4000.0, 9.33),
+    (5000.0, 5.31),
+    (6300.0, 2.59),
+    (8000.0, 1.13),
+];
+
+/// How many bands the EQ measures and corrects.
+pub const EQ_BANDS: usize = 4;
+/// Short names of the bands, for the log.
+const EQ_BAND_NAMES: [&str; EQ_BANDS] = ["low", "low-mid", "presence", "high"];
+/// Which [`SPEECH_SPECTRUM`] rows make up each band (start, end).
+const EQ_BAND_ROWS: [(usize, usize); EQ_BANDS] = [(0, 2), (2, 8), (8, 15), (15, 18)];
+/// The largest change the whole EQ may make at any frequency, in dB.
+const EQ_LIMIT_DB: f32 = 1.5;
+/// How much of the measured deviation a band is corrected by.
+const EQ_STRENGTH: f32 = 0.5;
+/// A band this far from the shape of the others is cut off or empty rather than
+/// merely coloured. A gentle boost cannot fix that, it can only raise the noise.
+const EQ_OUTLIER_DB: f32 = 12.0;
+/// A band is only boosted if the speech in it is this far above the background.
+const EQ_MIN_SNR_DB: f32 = 12.0;
+/// Below this much speech the take says more about which sounds happen to be in
+/// the line than about the recording, so nothing is corrected.
+const EQ_MIN_SPEECH_SECS: f32 = 1.0;
+/// From this much speech on, a measured deviation is trusted in full.
+const EQ_FULL_SPEECH_SECS: f32 = 4.0;
+/// Frames this far below the mean level of the file count as background, and
+/// everything above as speech. One gate with no neutral zone between the two:
+/// the reference is an average over all of running speech, and the unvoiced
+/// consonants that carry much of the top band sit well under the mean. A
+/// stricter speech gate would drop them, read the top band as dull, and boost it
+/// on nearly every file.
+const EQ_BACKGROUND_GATE_DB: f32 = -25.0;
+/// Where the noise check on the top band stops, if Nyquist does not stop it first.
+const EQ_TOP_GUARD_HZ: f32 = 20_000.0;
+/// A frame below this energy is digital silence (-140 dBFS RMS, the same floor
+/// [`estimate_noise_floor_db`] uses).
+const EQ_SILENT_ENERGY: f32 = 1e-14;
+
+/// The edges of a third-octave band centred on `centre`.
+fn third_octave_edges(centre: f32) -> (f32, f32) {
+    let half_band = 2f32.powf(1.0 / 6.0);
+    (centre / half_band, centre * half_band)
+}
+
+/// The [`SPEECH_SPECTRUM`] rows of `band` that fit under `nyquist`.
+///
+/// Measurement and target both go through this, so a band cut short by a low
+/// sample rate is shortened on both sides of the comparison.
+fn eq_band_rows(band: usize, nyquist: f32) -> &'static [(f32, f32)] {
+    let (start, end) = EQ_BAND_ROWS[band];
+    let rows = &SPEECH_SPECTRUM[start..end];
+    let fit = rows
+        .iter()
+        .take_while(|(centre, _)| third_octave_edges(*centre).1 <= nyquist)
+        .count();
+    &rows[..fit]
+}
+
+/// The total power of each band in the reference spectrum, in dB, or `None` for
+/// a band entirely above `nyquist`.
+///
+/// Total power, the same quantity [`measure_voice_bands`] sums: a density
+/// compared against a total would drift with the width of the band, and these
+/// bands differ in width by more than a factor of 40.
+fn speech_target_db(nyquist: f32) -> [Option<f32>; EQ_BANDS] {
+    std::array::from_fn(|band| {
+        let rows = eq_band_rows(band, nyquist);
+        if rows.is_empty() {
+            return None;
+        }
+        let power: f64 = rows
+            .iter()
+            .map(|&(centre, level)| {
+                let (lo, hi) = third_octave_edges(centre);
+                10f64.powf(level as f64 / 10.0) * (hi - lo) as f64
+            })
+            .sum();
+        Some(10.0 * power.log10() as f32)
+    })
+}
+
+/// What [`measure_voice_bands`] found in a take.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoiceBands {
+    /// Mean power of the speech frames per band, in dB (arbitrary reference);
+    /// `None` for a band above Nyquist.
+    pub speech_db: [Option<f32>; EQ_BANDS],
+    /// How far the speech is above the background in each band, in dB.
+    ///
+    /// The top band is judged up to [`EQ_TOP_GUARD_HZ`] rather than over its
+    /// measured range: its shelf lifts everything above it, and that is where
+    /// residual hiss lives. The low shelf has the same gap below its band, but
+    /// the fixed high-pass that follows covers most of that.
+    pub snr_db: [Option<f32>; EQ_BANDS],
+    /// How much of the take counted as speech.
+    pub speech_secs: f32,
+}
+
+/// Measures the spectrum of the speech and of the background in a mono signal.
+///
+/// Speech is told from background by frame energy relative to the mean level of
+/// the file, the way R128 gates loudness. Silero VAD would be more exact, but it
+/// is optional and costs a process per file. A take cut so tightly that nothing
+/// falls under the gate uses its quietest 12% as the background instead, as
+/// [`estimate_noise_floor_db`] does; that understates the signal-to-noise ratio,
+/// which only makes boosts less likely.
+///
+/// Returns `None` when there is nothing to measure: the signal is shorter than
+/// one frame or digitally silent throughout.
+pub fn measure_voice_bands(samples: &[f32], sample_rate: u32) -> Option<VoiceBands> {
+    use rustfft::{num_complex::Complex, FftPlanner};
+
+    if sample_rate == 0 {
+        return None;
+    }
+    let fft_size = ((sample_rate as f32 * 0.04) as usize)
+        .next_power_of_two()
+        .max(16);
+    let hop = fft_size / 2;
+    if samples.len() < fft_size {
+        return None;
+    }
+    let window: Vec<f32> = (0..fft_size)
+        .map(|n| {
+            let x = n as f32 / (fft_size - 1) as f32;
+            0.5 - 0.5 * (2.0 * std::f32::consts::PI * x).cos()
+        })
+        .collect();
+    let inv_w2_sum = 1.0 / window.iter().map(|w| w * w).sum::<f32>();
+
+    let energies: Vec<f32> = samples
+        .windows(fft_size)
+        .step_by(hop)
+        .map(|frame| {
+            let sum: f32 = frame
+                .iter()
+                .zip(&window)
+                .map(|(s, w)| (s * w) * (s * w))
+                .sum();
+            sum * inv_w2_sum
+        })
+        .collect();
+
+    let mut audible: Vec<f32> = energies
+        .iter()
+        .copied()
+        .filter(|e| *e > EQ_SILENT_ENERGY)
+        .collect();
+    if audible.is_empty() {
+        return None;
+    }
+    let mean = audible.iter().map(|e| *e as f64).sum::<f64>() / audible.len() as f64;
+    let speech_floor = (mean * 10f64.powf(EQ_BACKGROUND_GATE_DB as f64 / 10.0)) as f32;
+    let mut background_ceiling = speech_floor;
+    // Digital silence counts as background: a take with zeroed pauses has a
+    // background, and it is a very quiet one.
+    if !energies.iter().any(|e| *e < background_ceiling) {
+        let idx = ((audible.len() as f32 * 0.12) as usize).min(audible.len() - 1);
+        let (_, quiet, _) = audible.select_nth_unstable_by(idx, f32::total_cmp);
+        // Just above it, because the comparison below is a strict one.
+        background_ceiling = *quiet * 1.000_001;
+    }
+
+    // Each bin counts towards a band by how much of its width falls inside the
+    // band. At 48 kHz a bin is 23 Hz and the lowest band only 82 Hz wide, so
+    // rounding to whole bins would bias that band by up to a decibel.
+    let nyquist = sample_rate as f32 / 2.0;
+    let bin_hz = sample_rate as f32 / fft_size as f32;
+    let weights_between = |lo: f32, hi: f32| -> Vec<f32> {
+        (0..=fft_size / 2)
+            .map(|k| {
+                let centre = k as f32 * bin_hz;
+                let overlap = (centre + bin_hz / 2.0).min(hi) - (centre - bin_hz / 2.0).max(lo);
+                (overlap / bin_hz).max(0.0)
+            })
+            .collect()
+    };
+    let weights: [Vec<f32>; EQ_BANDS] = std::array::from_fn(|band| {
+        let rows = eq_band_rows(band, nyquist);
+        let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+            return Vec::new();
+        };
+        weights_between(third_octave_edges(first.0).0, third_octave_edges(last.0).1)
+    });
+    let top = EQ_BANDS - 1;
+    let top_guard = match eq_band_rows(top, nyquist).first() {
+        Some(first) => weights_between(third_octave_edges(first.0).0, nyquist.min(EQ_TOP_GUARD_HZ)),
+        None => Vec::new(),
+    };
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(fft_size);
+    let mut scratch = vec![Complex { re: 0.0, im: 0.0 }; fft.get_inplace_scratch_len()];
+    let mut buf = vec![Complex { re: 0.0, im: 0.0 }; fft_size];
+
+    let mut speech_power = [0f64; EQ_BANDS];
+    let mut background_power = [0f64; EQ_BANDS];
+    let (mut speech_top_guard, mut background_top_guard) = (0f64, 0f64);
+    let (mut speech_frames, mut background_frames) = (0usize, 0usize);
+
+    for (i, &energy) in energies.iter().enumerate() {
+        let is_speech = energy >= speech_floor;
+        let is_background = energy < background_ceiling;
+        if !is_speech && !is_background {
+            continue;
+        }
+        let frame = &samples[i * hop..i * hop + fft_size];
+        for ((slot, s), w) in buf.iter_mut().zip(frame).zip(&window) {
+            *slot = Complex { re: s * w, im: 0.0 };
+        }
+        fft.process_with_scratch(&mut buf, &mut scratch);
+
+        let power_in = |weights: &[f32]| -> f64 {
+            weights
+                .iter()
+                .zip(&buf)
+                .map(|(w, x)| *w as f64 * (x.re * x.re + x.im * x.im) as f64)
+                .sum()
+        };
+        for band in 0..EQ_BANDS {
+            let power = power_in(&weights[band]);
+            if is_speech {
+                speech_power[band] += power;
+            }
+            if is_background {
+                background_power[band] += power;
+            }
+        }
+        let guard_power = power_in(&top_guard);
+        if is_speech {
+            speech_top_guard += guard_power;
+        }
+        if is_background {
+            background_top_guard += guard_power;
+        }
+        speech_frames += usize::from(is_speech);
+        background_frames += usize::from(is_background);
+    }
+
+    let to_db = |power: f64, frames: usize, band: usize| {
+        (!weights[band].is_empty())
+            .then(|| 10.0 * (power / frames.max(1) as f64).max(1e-20).log10() as f32)
+    };
+    Some(VoiceBands {
+        speech_db: std::array::from_fn(|b| to_db(speech_power[b], speech_frames, b)),
+        snr_db: std::array::from_fn(|b| {
+            let (speech, background) = if b == top {
+                (speech_top_guard, background_top_guard)
+            } else {
+                (speech_power[b], background_power[b])
+            };
+            let speech = to_db(speech, speech_frames, b)?;
+            Some(speech - to_db(background, background_frames, b)?)
+        }),
+        speech_secs: speech_frames as f32 * hop as f32 / sample_rate as f32,
+    })
+}
+
+/// Why a band got the gain it got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandDecision {
+    /// Corrected from the measurement (the gain may still round to nothing).
+    Corrected,
+    /// The band lies above the file's Nyquist frequency.
+    AboveNyquist,
+    /// The band is too far from the shape of the others to be a matter of
+    /// colour: cut off, or empty.
+    NoUsableContent,
+    /// It wanted a boost, but that would raise the noise as much as the voice.
+    TooNoisyToBoost,
+}
+
+/// Why the whole stage was left out for a file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EqBypass {
+    /// Too little speech for the measurement to say anything about the recording.
+    TooLittleSpeech,
+    /// Too few usable bands (see [`plan_adaptive_eq`]): no shape left to compare.
+    TooFewBands,
+}
+
+/// The outcome of [`plan_adaptive_eq`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveEqPlan {
+    pub gains_db: [f32; EQ_BANDS],
+    /// How far each band measured from the reference, level taken out, in dB:
+    /// positive means hotter than the reference. Raw, before the strength,
+    /// confidence and limits that turn it into a gain.
+    pub shape_db: [Option<f32>; EQ_BANDS],
+    pub decisions: [BandDecision; EQ_BANDS],
+    pub bypass: Option<EqBypass>,
+    pub speech_secs: f32,
+}
+
+impl AdaptiveEqPlan {
+    /// One line for the log, and what calibrating [`SPEECH_SPECTRUM`] is done
+    /// from. It carries the measured shape as well as the gain because a gain at
+    /// the limit could mean 3 dB off or 20 dB off: a band that measures off in
+    /// one direction across a whole batch means the reference is off for this
+    /// material.
+    pub fn describe(&self) -> String {
+        match self.bypass {
+            Some(EqBypass::TooLittleSpeech) => {
+                return format!(
+                    "adaptive EQ left out, only {:.1} s of speech to measure",
+                    self.speech_secs
+                );
+            }
+            Some(EqBypass::TooFewBands) => {
+                return "adaptive EQ left out, the spectrum is too far from speech to compare"
+                    .to_owned();
+            }
+            None => {}
+        }
+        let bands: Vec<String> = (0..EQ_BANDS)
+            .map(|b| {
+                let name = EQ_BAND_NAMES[b];
+                let shape = self.shape_db[b].unwrap_or(0.0);
+                match self.decisions[b] {
+                    BandDecision::Corrected => {
+                        format!("{name} {:+.1} dB (measured {shape:+.1})", self.gains_db[b])
+                    }
+                    BandDecision::AboveNyquist => format!("{name} n/a"),
+                    BandDecision::NoUsableContent => {
+                        format!("{name} 0 dB, no usable content (measured {shape:+.1})")
+                    }
+                    BandDecision::TooNoisyToBoost => {
+                        format!("{name} 0 dB, too noisy to boost (measured {shape:+.1})")
+                    }
+                }
+            })
+            .collect();
+        format!(
+            "adaptive EQ {}, from {:.1} s of speech",
+            bands.join(", "),
+            self.speech_secs
+        )
+    }
+}
+
+/// Decides the gain of each band. No I/O and no audio, so every rule below can
+/// be tested on made-up measurements.
+pub fn plan_adaptive_eq(bands: &VoiceBands, sample_rate: u32) -> AdaptiveEqPlan {
+    let mut plan = AdaptiveEqPlan {
+        gains_db: [0.0; EQ_BANDS],
+        shape_db: [None; EQ_BANDS],
+        decisions: [BandDecision::AboveNyquist; EQ_BANDS],
+        bypass: None,
+        speech_secs: bands.speech_secs,
+    };
+
+    let target = speech_target_db(sample_rate as f32 / 2.0);
+    let devs: [Option<f32>; EQ_BANDS] =
+        std::array::from_fn(|b| Some(target[b]? - bands.speech_db[b]?));
+
+    // The raw deviations carry the absolute difference between dBFS and the
+    // table, which is tens of dB and means nothing. The median takes that out
+    // before outliers are judged, and one cut-off band cannot drag it along.
+    let mut sorted: Vec<f32> = devs.iter().flatten().copied().collect();
+    sorted.sort_by(f32::total_cmp);
+    let median = match sorted.len() {
+        0 => 0.0,
+        n if n % 2 == 1 => sorted[n / 2],
+        n => (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0,
+    };
+
+    let mut kept: Vec<f32> = Vec::with_capacity(EQ_BANDS);
+    for (b, dev) in devs.iter().enumerate() {
+        if let Some(dev) = *dev {
+            if (dev - median).abs() > EQ_OUTLIER_DB {
+                plan.decisions[b] = BandDecision::NoUsableContent;
+            } else {
+                plan.decisions[b] = BandDecision::Corrected;
+                kept.push(dev);
+            }
+        }
+    }
+    // A majority, not just two: with two of four bands out, the median sits
+    // between two unrelated groups and "the shape of the others" means nothing.
+    // A steady tone looks exactly like that, and so does a telephone band.
+    if kept.len() < 2 || kept.len() * 2 <= sorted.len() {
+        plan.bypass = Some(EqBypass::TooFewBands);
+        return plan;
+    }
+    if bands.speech_secs < EQ_MIN_SPEECH_SECS {
+        plan.bypass = Some(EqBypass::TooLittleSpeech);
+        return plan;
+    }
+
+    // Only the shape is corrected; loudness normalization sets the level.
+    let offset = kept.iter().sum::<f32>() / kept.len() as f32;
+    let confidence = ((bands.speech_secs - EQ_MIN_SPEECH_SECS)
+        / (EQ_FULL_SPEECH_SECS - EQ_MIN_SPEECH_SECS))
+        .clamp(0.0, 1.0);
+    plan.shape_db = devs.map(|dev| dev.map(|dev| offset - dev));
+
+    for (b, dev) in devs.iter().enumerate() {
+        if plan.decisions[b] != BandDecision::Corrected {
+            continue;
+        }
+        let Some(dev) = *dev else { continue };
+        let gain = (EQ_STRENGTH * confidence * (dev - offset)).clamp(-EQ_LIMIT_DB, EQ_LIMIT_DB);
+        let snr = bands.snr_db[b].unwrap_or(f32::INFINITY);
+        if gain > 0.0 && snr < EQ_MIN_SNR_DB {
+            plan.decisions[b] = BandDecision::TooNoisyToBoost;
+        } else {
+            plan.gains_db[b] = gain;
+        }
+    }
+
+    // The filters overlap, so neighbours within the limit can exceed it together.
+    // Scaling is not exactly linear in dB, hence a few rounds.
+    for _ in 0..4 {
+        let peak = eq_response_peak_db(&plan.gains_db, sample_rate);
+        if peak <= EQ_LIMIT_DB {
+            break;
+        }
+        let scale = EQ_LIMIT_DB / peak;
+        plan.gains_db.iter_mut().for_each(|g| *g *= scale);
+    }
+    plan
+}
+
+/// The biquads for `gains_db`: one wide filter per band, or `None` for a band
+/// with nothing to do or whose frequency a low sample rate cannot represent.
+fn eq_filters(
+    gains_db: &[f32; EQ_BANDS],
+    sample_rate: u32,
+) -> [Option<biquad::Coefficients<f32>>; EQ_BANDS] {
+    use biquad::{Coefficients, ToHertz, Type, Q_BUTTERWORTH_F32};
+
+    let designs: [(Type<f32>, f32, f32); EQ_BANDS] = [
+        (Type::LowShelf(gains_db[0]), 225.0, Q_BUTTERWORTH_F32),
+        (Type::PeakingEQ(gains_db[1]), 450.0, 0.67),
+        (Type::PeakingEQ(gains_db[2]), 2000.0, 0.55),
+        (Type::HighShelf(gains_db[3]), 4500.0, Q_BUTTERWORTH_F32),
+    ];
+    let fs = (sample_rate as f32).hz();
+    std::array::from_fn(|b| {
+        if gains_db[b].abs() < 0.01 {
+            return None;
+        }
+        let (kind, freq, q) = designs[b];
+        Coefficients::<f32>::from_params(kind, fs, freq.hz(), q).ok()
+    })
+}
+
+/// The combined response of the filters at `freq`, in dB.
+fn eq_response_db(
+    filters: &[Option<biquad::Coefficients<f32>>; EQ_BANDS],
+    freq: f32,
+    sample_rate: u32,
+) -> f32 {
+    let w = 2.0 * std::f64::consts::PI * freq as f64 / sample_rate as f64;
+    let (c1, s1, c2, s2) = (w.cos(), w.sin(), (2.0 * w).cos(), (2.0 * w).sin());
+    filters
+        .iter()
+        .flatten()
+        .map(|f| {
+            let (b0, b1, b2) = (f.b0 as f64, f.b1 as f64, f.b2 as f64);
+            let (a1, a2) = (f.a1 as f64, f.a2 as f64);
+            // |H|^2 at e^(jw): z^-1 = cos w - j sin w, z^-2 = cos 2w - j sin 2w.
+            let num = (b0 + b1 * c1 + b2 * c2).powi(2) + (b1 * s1 + b2 * s2).powi(2);
+            let den = (1.0 + a1 * c1 + a2 * c2).powi(2) + (a1 * s1 + a2 * s2).powi(2);
+            (10.0 * (num / den).log10()) as f32
+        })
+        .sum()
+}
+
+/// The largest absolute response of the filters for `gains_db`, in dB, across
+/// the audible range below Nyquist.
+fn eq_response_peak_db(gains_db: &[f32; EQ_BANDS], sample_rate: u32) -> f32 {
+    const POINTS: usize = 96;
+    let filters = eq_filters(gains_db, sample_rate);
+    let top = (sample_rate as f32 * 0.49).min(20_000.0);
+    (0..POINTS)
+        .map(|i| 20.0 * (top / 20.0).powf(i as f32 / (POINTS - 1) as f32))
+        .map(|freq| eq_response_db(&filters, freq, sample_rate).abs())
+        .fold(0.0, f32::max)
+}
+
+/// Applies the gains of an [`AdaptiveEqPlan`] in place.
+///
+/// Infallible: a band with no gain or no room below Nyquist simply has no
+/// filter, so all-zero gains leave the signal untouched to the bit.
+pub fn apply_adaptive_eq_inplace(
     buf: &mut [f32],
     sample_rate: u32,
     channels: u16,
-    strength: f32,
-) -> Result<()> {
-    use biquad::{Biquad, Coefficients, DirectForm2Transposed, ToHertz, Type, Q_BUTTERWORTH_F32};
+    gains_db: &[f32; EQ_BANDS],
+) {
+    use biquad::{Biquad, DirectForm2Transposed};
 
     // Same guard as `apply_spectral_gate` / `apply_expander_inplace`: `frames`
     // below divides by `ch`, which panics at zero.
     if buf.is_empty() || channels == 0 {
-        return Ok(());
+        return;
     }
-
-    let fs = (sample_rate as f32).hz();
-    let s = strength.clamp(0.0, 1.0);
-    let bands: [(Type<f32>, f32, f32); 4] = [
-        (Type::LowShelf(-3.0 * s), 120.0, Q_BUTTERWORTH_F32),
-        (Type::PeakingEQ(-1.5 * s), 400.0, 1.0),
-        (Type::PeakingEQ(2.0 * s), 2500.0, 1.2),
-        (Type::HighShelf(1.5 * s), 10000.0, Q_BUTTERWORTH_F32),
-    ];
+    let coeffs: Vec<_> = eq_filters(gains_db, sample_rate)
+        .into_iter()
+        .flatten()
+        .collect();
+    if coeffs.is_empty() {
+        return;
+    }
 
     let ch = channels as usize;
     let frames = buf.len() / ch;
-
-    // Build coefficients once, propagating errors instead of unwrap.
-    let coeffs: [Coefficients<f32>; 4] = {
-        let mut arr: [Option<Coefficients<f32>>; 4] = [None, None, None, None];
-        for (i, (t, f, q)) in bands.iter().enumerate() {
-            arr[i] = Some(
-                Coefficients::<f32>::from_params(*t, fs, f.hz(), *q)
-                    .map_err(|e| anyhow::anyhow!("biquad coeffs failed for band {}: {:?}", i, e))?,
-            );
-        }
-        [
-            arr[0].unwrap(),
-            arr[1].unwrap(),
-            arr[2].unwrap(),
-            arr[3].unwrap(),
-        ]
-    };
-
     for c in 0..ch {
-        let mut filters: [DirectForm2Transposed<f32>; 4] =
-            std::array::from_fn(|i| DirectForm2Transposed::<f32>::new(coeffs[i]));
+        let mut filters: Vec<DirectForm2Transposed<f32>> = coeffs
+            .iter()
+            .map(|co| DirectForm2Transposed::<f32>::new(*co))
+            .collect();
         for i in 0..frames {
             let idx = i * ch + c;
             let mut x = buf[idx];
@@ -278,7 +779,6 @@ pub fn apply_voice_eq_inplace(
             buf[idx] = x;
         }
     }
-    Ok(())
 }
 
 // ===========================================================================
@@ -764,7 +1264,7 @@ pub fn estimate_noise_floor_db(samples: &[f32], sample_rate: u32) -> Option<f32>
 ///
 /// In-place is safe here because each sample is read and written at the same
 /// index and never read again afterwards; this mirrors
-/// [`apply_voice_eq_inplace`] and avoids a full-length copy of the signal for
+/// [`apply_adaptive_eq_inplace`] and avoids a full-length copy of the signal for
 /// what is otherwise a strictly element-wise gain.
 pub fn apply_expander_inplace(
     buf: &mut [f32],
@@ -1323,38 +1823,406 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // apply_voice_eq_inplace
+    // Adaptive EQ: the decision, on made-up measurements
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn apply_voice_eq_inplace_zero_strength_is_near_identity() {
-        // At strength=0.0 all bands are configured for 0dB gain, which for
-        // shelving/peaking biquads is a true allpass (unity magnitude
-        // response) -- RMS should be preserved after the initial transient.
-        let original = sine_wave(300.0, 48000, 1.0, 0.4);
-        let mut buf = original.clone();
-        apply_voice_eq_inplace(&mut buf, 48000, 1, 0.0).unwrap();
-        assert!(buf.iter().all(|s| s.is_finite()));
+    const SR: u32 = 48_000;
 
-        let settle = 500; // skip filter startup transient
-        let ratio = rms(&buf[settle..]) / rms(&original[settle..]);
-        assert!((0.9..=1.1).contains(&ratio), "ratio={ratio}");
+    /// A measurement that matches the reference exactly, offset by `level_db`
+    /// (dBFS and the table share no reference), with plenty of speech and a
+    /// background far below it.
+    fn on_target(level_db: f32) -> VoiceBands {
+        let target = speech_target_db(SR as f32 / 2.0);
+        VoiceBands {
+            speech_db: target.map(|t| t.map(|t| t + level_db)),
+            snr_db: target.map(|t| t.map(|_| 40.0)),
+            speech_secs: 10.0,
+        }
+    }
+
+    /// `on_target(-30.0)` with `deviation_db` added to the measured bands: a
+    /// positive deviation means the band is hotter than the reference.
+    fn deviated(deviation_db: [f32; EQ_BANDS]) -> VoiceBands {
+        let mut bands = on_target(-30.0);
+        for (band, deviation) in bands.speech_db.iter_mut().zip(deviation_db) {
+            *band = band.map(|m| m + deviation);
+        }
+        bands
     }
 
     #[test]
-    fn apply_voice_eq_inplace_zero_channels_leaves_input_unchanged() {
-        // `frames = buf.len() / ch` panicked at ch == 0.
-        let samples = sine_wave(440.0, 48000, 0.1, 0.5);
+    fn a_take_on_the_reference_is_left_alone_at_any_level() {
+        for level in [0.0, -30.0, -60.0] {
+            let plan = plan_adaptive_eq(&on_target(level), SR);
+            assert_eq!(plan.bypass, None);
+            assert!(
+                plan.gains_db.iter().all(|g| g.abs() < 0.01),
+                "level {level}: {:?}",
+                plan.gains_db
+            );
+        }
+    }
+
+    #[test]
+    fn a_small_deviation_is_corrected_by_half_in_the_opposite_direction() {
+        let plan = plan_adaptive_eq(&deviated([0.0, 1.0, -1.0, 0.0]), SR);
+        assert!((plan.gains_db[0]).abs() < 0.01, "{:?}", plan.gains_db);
+        assert!((plan.gains_db[1] + 0.5).abs() < 0.01, "{:?}", plan.gains_db);
+        assert!((plan.gains_db[2] - 0.5).abs() < 0.01, "{:?}", plan.gains_db);
+    }
+
+    #[test]
+    fn the_correction_is_clamped_and_the_whole_response_stays_within_the_limit() {
+        // Every band far off, in directions that pile up where filters overlap.
+        for deviation in [
+            [-10.0, -10.0, 10.0, 10.0],
+            [10.0, -10.0, -10.0, 10.0],
+            [-11.0, 11.0, -11.0, 11.0],
+        ] {
+            let plan = plan_adaptive_eq(&deviated(deviation), SR);
+            assert!(plan.gains_db.iter().all(|g| g.abs() <= EQ_LIMIT_DB));
+            let peak = eq_response_peak_db(&plan.gains_db, SR);
+            assert!(peak <= EQ_LIMIT_DB + 0.01, "{deviation:?}: peak {peak} dB");
+        }
+    }
+
+    #[test]
+    fn a_cut_off_band_gets_nothing_and_does_not_skew_the_others() {
+        // A top band 40 dB down is a low-passed source, not a dull one. If it
+        // reached the offset, the other three would all look too hot.
+        let plan = plan_adaptive_eq(&deviated([0.0, 0.0, 0.0, -40.0]), SR);
+        assert_eq!(plan.decisions[3], BandDecision::NoUsableContent);
+        assert_eq!(plan.gains_db, [0.0; EQ_BANDS]);
+    }
+
+    #[test]
+    fn too_few_usable_bands_bypasses_the_stage() {
+        // All the energy in one band: what a steady tone looks like.
+        let plan = plan_adaptive_eq(&deviated([-60.0, 0.0, -80.0, -100.0]), SR);
+        assert_eq!(plan.bypass, Some(EqBypass::TooFewBands));
+        assert_eq!(plan.gains_db, [0.0; EQ_BANDS]);
+    }
+
+    #[test]
+    fn a_band_buried_in_noise_may_be_cut_but_not_boosted() {
+        let mut bands = deviated([3.0, 0.0, 0.0, -3.0]);
+        // Both the band that wants a cut and the one that wants a boost are
+        // only a few dB above the background.
+        bands.snr_db[0] = Some(3.0);
+        bands.snr_db[3] = Some(3.0);
+        let plan = plan_adaptive_eq(&bands, SR);
+        assert!(plan.gains_db[0] < 0.0, "{:?}", plan.gains_db);
+        assert_eq!(plan.gains_db[3], 0.0);
+        assert_eq!(plan.decisions[3], BandDecision::TooNoisyToBoost);
+    }
+
+    #[test]
+    fn short_lines_are_trusted_less_and_very_short_ones_not_at_all() {
+        let gain_at = |secs: f32| {
+            let mut bands = deviated([0.0, 2.0, -2.0, 0.0]);
+            bands.speech_secs = secs;
+            plan_adaptive_eq(&bands, SR)
+        };
+        let short = gain_at(0.5);
+        assert_eq!(short.bypass, Some(EqBypass::TooLittleSpeech));
+        assert_eq!(short.gains_db, [0.0; EQ_BANDS]);
+
+        let halfway = gain_at(2.5);
+        let full = gain_at(4.0);
+        assert!((full.gains_db[2] - 1.0).abs() < 0.01, "{:?}", full.gains_db);
+        assert!(
+            (halfway.gains_db[2] - 0.5).abs() < 0.01,
+            "{:?}",
+            halfway.gains_db
+        );
+    }
+
+    #[test]
+    fn a_low_sample_rate_shortens_the_comparison_on_both_sides() {
+        // 16 kHz: the 8 kHz row no longer fits, and a measurement that also
+        // stops short of it must still read as being on target.
+        let target = speech_target_db(8_000.0);
+        let full = speech_target_db(24_000.0);
+        assert!(target[3].unwrap() < full[3].unwrap());
+        let bands = VoiceBands {
+            speech_db: target.map(|t| t.map(|t| t - 30.0)),
+            snr_db: target.map(|t| t.map(|_| 40.0)),
+            speech_secs: 10.0,
+        };
+        let plan = plan_adaptive_eq(&bands, 16_000);
+        assert!(plan.gains_db.iter().all(|g| g.abs() < 0.01));
+
+        // 8 kHz: the top band is gone altogether.
+        assert_eq!(speech_target_db(4_000.0)[3], None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Adaptive EQ: the measurement
+    // -----------------------------------------------------------------------
+
+    /// Noise with exactly the reference's spectrum, made in the frequency domain
+    /// straight from the table's density. It deliberately shares nothing with
+    /// the band integration, so a density compared against a total -- an error
+    /// that grows with the width of the band -- cannot cancel out here.
+    fn noise_shaped_like_speech(sample_rate: u32, secs: f32, seed: u32) -> Vec<f32> {
+        let raw = noise_with_density(sample_rate, secs, seed, reference_density);
+        let peak = raw.iter().fold(0f32, |m, s| m.max(s.abs()));
+        raw.iter().map(|s| s / peak * 0.3).collect()
+    }
+
+    /// The table's density at `f`, in dB per Hz; its ends continue flat.
+    fn reference_density(f: f32) -> Option<f32> {
+        let row = SPEECH_SPECTRUM
+            .iter()
+            .find(|(centre, _)| f < third_octave_edges(*centre).1)
+            .unwrap_or(&SPEECH_SPECTRUM[SPEECH_SPECTRUM.len() - 1]);
+        Some(row.1)
+    }
+
+    /// Noise with `density(f)` dB per Hz, or nothing where it returns `None`.
+    /// Scaled so that signals of any length with one density have one level.
+    fn noise_with_density(
+        sample_rate: u32,
+        secs: f32,
+        seed: u32,
+        density: impl Fn(f32) -> Option<f32>,
+    ) -> Vec<f32> {
+        use rustfft::{num_complex::Complex, FftPlanner};
+
+        let n = ((sample_rate as f32 * secs) as usize).next_power_of_two();
+        let bin_hz = sample_rate as f32 / n as f32;
+        let phases = xorshift_noise(n / 2 + 1, std::f32::consts::PI, seed);
+        let mut spectrum = vec![Complex { re: 0.0, im: 0.0 }; n];
+        for k in 1..n / 2 {
+            if let Some(level) = density(k as f32 * bin_hz) {
+                spectrum[k] = Complex::from_polar(10f32.powf(level / 20.0), phases[k]);
+                spectrum[n - k] = spectrum[k].conj();
+            }
+        }
+        FftPlanner::<f32>::new()
+            .plan_fft_inverse(n)
+            .process(&mut spectrum);
+        let scale = 1.0 / (n as f32).sqrt();
+        spectrum.iter().map(|c| c.re * scale).collect()
+    }
+
+    #[test]
+    fn noise_shaped_like_speech_measures_as_being_on_target() {
+        let samples = noise_shaped_like_speech(SR, 8.0, 21);
+        let bands = measure_voice_bands(&samples, SR).expect("measurable");
+        let target = speech_target_db(SR as f32 / 2.0);
+        let devs: Vec<f32> = (0..EQ_BANDS)
+            .map(|b| target[b].unwrap() - bands.speech_db[b].unwrap())
+            .collect();
+        let spread = devs.iter().cloned().fold(f32::MIN, f32::max)
+            - devs.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(spread < 0.5, "deviations {devs:?}");
+    }
+
+    #[test]
+    fn measuring_a_tilted_take_finds_the_tilt() {
+        // The same noise with the top band pushed up through the real filters.
+        let mut samples = noise_shaped_like_speech(SR, 8.0, 22);
+        let flat = measure_voice_bands(&samples, SR).unwrap();
+        apply_adaptive_eq_inplace(&mut samples, SR, 1, &[0.0, 0.0, 0.0, 3.0]);
+        let tilted = measure_voice_bands(&samples, SR).unwrap();
+        let rise = tilted.speech_db[3].unwrap() - flat.speech_db[3].unwrap();
+        let low_rise = tilted.speech_db[0].unwrap() - flat.speech_db[0].unwrap();
+        assert!(rise > 2.0, "top band rose {rise} dB");
+        assert!(low_rise.abs() < 0.2, "low band moved {low_rise} dB");
+    }
+
+    #[test]
+    fn the_gate_keeps_quiet_passages_out_of_the_speech_measurement() {
+        // Speech-shaped noise, then a much quieter passage of a different shape.
+        // Its tilt must not leak into the speech bands, and it must show up as
+        // the background.
+        let speech = noise_shaped_like_speech(SR, 4.0, 23);
+        let hiss: Vec<f32> = xorshift_noise(SR as usize * 2, 0.001, 24);
+        let alone = measure_voice_bands(&speech, SR).unwrap();
+
+        let mut mixed = speech.clone();
+        mixed.extend_from_slice(&hiss);
+        let bands = measure_voice_bands(&mixed, SR).unwrap();
+
+        for b in 0..EQ_BANDS {
+            let moved = bands.speech_db[b].unwrap() - alone.speech_db[b].unwrap();
+            assert!(moved.abs() < 0.3, "band {b} moved {moved} dB");
+            assert!(bands.snr_db[b].unwrap() > EQ_MIN_SNR_DB, "band {b}");
+        }
+        assert!((bands.speech_secs - alone.speech_secs).abs() < 0.2);
+    }
+
+    #[test]
+    fn frames_well_under_the_mean_still_count_as_speech() {
+        // Unvoiced consonants sit far below the vowels and carry much of the top
+        // band. Dropping them would read that band as dull on every real take.
+        let loud = noise_shaped_like_speech(SR, 4.0, 28);
+        let mut take = loud.clone();
+        let consonants: Vec<f32> = noise_shaped_like_speech(SR, 4.0, 29)
+            .iter()
+            .map(|s| s * 0.1) // -20 dB
+            .collect();
+        take.extend_from_slice(&consonants);
+
+        let alone = measure_voice_bands(&loud, SR).unwrap();
+        let bands = measure_voice_bands(&take, SR).unwrap();
+        assert!(
+            bands.speech_secs > alone.speech_secs * 1.8,
+            "{} s of {} s",
+            bands.speech_secs,
+            alone.speech_secs
+        );
+    }
+
+    #[test]
+    fn hiss_above_the_measured_range_stops_the_top_band_from_being_boosted() {
+        // The high shelf lifts everything above it, but the table stops at 8 kHz.
+        // Hiss from 10 kHz up is invisible to the comparison and would still be
+        // raised, so the noise check has to look there.
+        let speech = noise_with_density(SR, 4.0, 30, reference_density);
+        let hiss = noise_with_density(SR, 2.0, 31, |f| (f > 10_000.0).then_some(-7.0));
+        let scale = 0.3 / speech.iter().fold(0f32, |m, s| m.max(s.abs()));
+        let take: Vec<f32> = speech.iter().chain(&hiss).map(|s| s * scale).collect();
+
+        let bands = measure_voice_bands(&take, SR).unwrap();
+        let top = bands.snr_db[EQ_BANDS - 1].unwrap();
+        let low = bands.snr_db[0].unwrap();
+        assert!(top < EQ_MIN_SNR_DB, "top band {top} dB");
+        assert!(low > EQ_MIN_SNR_DB, "low band {low} dB");
+    }
+
+    #[test]
+    fn a_take_with_no_quiet_frames_falls_back_on_its_quietest_frames() {
+        // Steady noise: nothing is 25 dB under the mean, so the background is
+        // the quietest 12% of the very same signal, and no band can show enough
+        // signal-to-noise for a boost.
+        let samples = noise_shaped_like_speech(SR, 8.0, 25);
+        let bands = measure_voice_bands(&samples, SR).unwrap();
+        for b in 0..EQ_BANDS {
+            let snr = bands.snr_db[b].unwrap();
+            assert!(snr.abs() < EQ_MIN_SNR_DB, "band {b}: {snr} dB");
+        }
+    }
+
+    #[test]
+    fn digitally_silent_pauses_count_as_a_very_quiet_background() {
+        let mut samples = noise_shaped_like_speech(SR, 4.0, 26);
+        samples.extend(std::iter::repeat_n(0.0f32, SR as usize));
+        let bands = measure_voice_bands(&samples, SR).unwrap();
+        for b in 0..EQ_BANDS {
+            let snr = bands.snr_db[b].unwrap();
+            assert!(snr > EQ_MIN_SNR_DB, "band {b}: {snr} dB");
+        }
+    }
+
+    #[test]
+    fn nothing_to_measure_gives_none() {
+        assert_eq!(measure_voice_bands(&[], SR), None);
+        assert_eq!(measure_voice_bands(&[0.1; 64], SR), None);
+        assert_eq!(measure_voice_bands(&vec![0.0; SR as usize], SR), None);
+        assert_eq!(measure_voice_bands(&vec![0.1; SR as usize], 0), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Adaptive EQ: the filters
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zero_gains_leave_the_signal_identical_to_the_bit() {
+        let original = xorshift_noise(4800, 0.3, 31);
+        let mut buf = original.clone();
+        apply_adaptive_eq_inplace(&mut buf, SR, 1, &[0.0; EQ_BANDS]);
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn a_gain_reaches_a_tone_in_the_middle_of_its_band() {
+        let tone = sine_wave(2000.0, SR, 1.0, 0.1);
+        let mut buf = tone.clone();
+        apply_adaptive_eq_inplace(&mut buf, SR, 1, &[0.0, 0.0, 1.5, 0.0]);
+        let settle = 4800;
+        let db = 20.0 * (rms(&buf[settle..]) / rms(&tone[settle..])).log10();
+        assert!((db - 1.5).abs() < 0.05, "{db} dB");
+    }
+
+    #[test]
+    fn equal_gains_sum_to_a_nearly_flat_response() {
+        // Bands that overlap too little leave dips between them, too much and
+        // they pile up. Either way a broad correction would come out lumpy.
+        let filters = eq_filters(&[1.0; EQ_BANDS], SR);
+        for freq in [
+            60.0, 150.0, 300.0, 600.0, 1000.0, 2000.0, 4000.0, 8000.0, 14000.0,
+        ] {
+            let db = eq_response_db(&filters, freq, SR);
+            println!("{freq:>7} Hz: {db:+.2} dB");
+            assert!((0.5..=1.5).contains(&db), "{freq} Hz: {db} dB");
+        }
+    }
+
+    #[test]
+    fn measuring_planning_and_applying_brings_a_coloured_take_closer_to_the_reference() {
+        // Speech-shaped noise, made boomy and dull, then a digitally silent
+        // pause so that boosts are allowed.
+        let mut samples = noise_shaped_like_speech(SR, 8.0, 27);
+        apply_adaptive_eq_inplace(&mut samples, SR, 1, &[2.0, 0.0, 0.0, -2.0]);
+        samples.extend(std::iter::repeat_n(0.0f32, SR as usize));
+
+        let spread = |samples: &[f32]| {
+            let bands = measure_voice_bands(samples, SR).unwrap();
+            let target = speech_target_db(SR as f32 / 2.0);
+            let devs: Vec<f32> = (0..EQ_BANDS)
+                .map(|b| target[b].unwrap() - bands.speech_db[b].unwrap())
+                .collect();
+            devs.iter().cloned().fold(f32::MIN, f32::max)
+                - devs.iter().cloned().fold(f32::MAX, f32::min)
+        };
+
+        let before = spread(&samples);
+        let plan = plan_adaptive_eq(&measure_voice_bands(&samples, SR).unwrap(), SR);
+        assert_eq!(plan.bypass, None);
+        assert!(plan.gains_db[0] < 0.0, "{:?}", plan.gains_db);
+        assert!(plan.gains_db[3] > 0.0, "{:?}", plan.gains_db);
+
+        apply_adaptive_eq_inplace(&mut samples, SR, 1, &plan.gains_db);
+        let after = spread(&samples);
+        assert!(after < before * 0.8, "spread {before} dB -> {after} dB");
+    }
+
+    #[test]
+    fn the_log_line_says_what_happened_to_each_band() {
+        let mut bands = deviated([1.0, 0.0, 0.0, -40.0]);
+        bands.speech_secs = 6.0;
+        let line = plan_adaptive_eq(&bands, SR).describe();
+        assert!(line.contains("low -"), "{line}");
+        // The band's raw measurement, not only the gain it led to.
+        assert!(line.contains("(measured +0.7)"), "{line}");
+        assert!(line.contains("high 0 dB, no usable content"), "{line}");
+        assert!(line.contains("6.0 s of speech"), "{line}");
+
+        bands.speech_secs = 0.4;
+        let line = plan_adaptive_eq(&bands, SR).describe();
+        assert!(line.contains("left out"), "{line}");
+    }
+
+    #[test]
+    fn apply_adaptive_eq_zero_channels_leaves_input_unchanged() {
+        // `frames = buf.len() / ch` panics at ch == 0.
+        let samples = sine_wave(440.0, SR, 0.1, 0.5);
         let mut buf = samples.clone();
-        apply_voice_eq_inplace(&mut buf, 48000, 0, 0.5).unwrap();
+        apply_adaptive_eq_inplace(&mut buf, SR, 0, &[1.5; EQ_BANDS]);
         assert_eq!(buf, samples);
     }
 
     #[test]
-    fn apply_voice_eq_inplace_full_strength_stays_finite() {
-        let mut buf = xorshift_noise(48000, 0.3, 11);
-        apply_voice_eq_inplace(&mut buf, 48000, 1, 1.0).unwrap();
-        assert!(buf.iter().all(|s| s.is_finite()));
+    fn apply_adaptive_eq_is_finite_and_never_fails_at_low_sample_rates() {
+        // The old Voice EQ returned an error here: a fixed 10 kHz band is above
+        // Nyquist for anything under 20 kHz, which failed the whole file.
+        for sample_rate in [8_000, 11_025, 16_000, 22_050] {
+            let mut buf = xorshift_noise(sample_rate as usize, 0.3, 11);
+            apply_adaptive_eq_inplace(&mut buf, sample_rate, 1, &[1.5, -1.5, 1.5, 1.5]);
+            assert!(buf.iter().all(|s| s.is_finite()), "{sample_rate} Hz");
+        }
     }
 
     // -----------------------------------------------------------------------

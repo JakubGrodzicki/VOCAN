@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 
 use crate::audio_effects;
 use crate::ffmpeg::{
-    apply_loudnorm_pass2, ffmpeg_cmd, get_file_stats, get_file_stats_padded, measure_peak_dbfs,
+    ffmpeg_cmd, get_file_stats, get_file_stats_padded, loudnorm_pass2_filter, measure_peak_dbfs,
     probe_input,
 };
 use crate::memory;
@@ -27,19 +27,16 @@ fn deesser_only_filter() -> String {
 
 /// Returns filters after the de-esser: HPF, EQ, compressor (no de-esser).
 fn post_deesser_filters() -> String {
-    let hpf = "highpass=f=70:poles=2:width_type=q:width=1.0,highpass=f=70:poles=1";
-    let eq_90 = "equalizer=f=90:width_type=q:width=2.478:g=-2.0";
-    let eq_175 = "equalizer=f=175:width_type=q:width=1.0:g=-2.22";
-    let eq_360 = "equalizer=f=360:width_type=q:width=1.0:g=-1.23";
-    let eq_1350 = "equalizer=f=1350:width_type=q:width=1.4:g=1.4";
-    let eq_4246 = "equalizer=f=4246:width_type=q:width=2.0:g=-1.36";
-    let shelf_8k = "highshelf=f=8000:width_type=q:width=1.0:g=1.0";
+    // Few, very wide filters on purpose: this runs on every file with no
+    // knowledge of the recording, and for a voice tool keeping the phase natural
+    // comes first. A 2-pole Q=1 section and a 1-pole section at one cutoff are
+    // exactly a 3rd-order Butterworth: 18 dB/oct.
+    let hpf = "highpass=f=40:poles=2:width_type=q:width=1.0,highpass=f=40:poles=1";
+    let eq_310 = "equalizer=f=310:width_type=q:width=0.339:g=-2.5";
+    let eq_2970 = "equalizer=f=2970:width_type=q:width=0.271:g=1.7";
     let comp = "acompressor=threshold=0.251:ratio=4:attack=5:release=80:makeup=4";
 
-    format!(
-        "{},{},{},{},{},{},{},{}",
-        hpf, eq_90, eq_175, eq_360, eq_1350, eq_4246, shelf_8k, comp
-    )
+    format!("{},{},{},{}", hpf, eq_310, eq_2970, comp)
 }
 
 // ---------------------------------------------------------------------------
@@ -115,47 +112,39 @@ fn trim_silence_chain(threshold: SilenceThreshold, pad: SilencePad) -> String {
 ///
 /// This is the **threshold** trim only. With Silero VAD selected it returns
 /// `None` as well: that mode has no filter of its own to name before the file
-/// has been looked at, and [`resolve_trim_chain`] is what answers for it.
+/// has been looked at, and [`vad_trim_chain`] is what answers for it.
 fn trim_chain_for(opts: &ProcessingOptions) -> Option<String> {
     (opts.trim_silence && !opts.trim_silence_vad)
         .then(|| trim_silence_chain(opts.trim_silence_threshold, opts.trim_silence_pad))
 }
 
-/// The trim chain for `input`, whichever kind of trim is selected.
+/// Which trim a file gets, settled before any work is done on it.
+enum Trim {
+    Off,
+    /// `silenceremove` chain. A pure function of the options; it goes in front
+    /// of the loudness normalization (see [`trim_chain_for`]).
+    Threshold(String),
+    /// Silero VAD, with the model to use. Needs the file looked at, and runs
+    /// **after** loudness normalization: the normalization chain is decided
+    /// first, the model then listens to the take as that chain delivers it, and
+    /// the resulting cut is appended behind the chain (see [`vad_trim_chain`]).
+    /// A quiet voice-over is brought up to level before the model hears it
+    /// instead of being cut into because it was quiet.
+    Vad(std::path::PathBuf),
+}
+
+/// Picks the trim for these options.
 ///
-/// Threshold trim: a pure function of the options, no I/O. Silero VAD: the file
-/// is decoded once more, on its own, to find the speech, and the answer is a
-/// cut and two fades expressed as an `atrim`/`afade` chain (see [`crate::vad`]).
-/// Either way the result goes where the `silenceremove` chain always went, so
-/// the two modes share every downstream line, including the loudness
-/// measurements, which therefore see the trimmed audio.
-///
-/// A take with no speech in it yields `None`: the file passes through exactly
-/// as it would with the trim off, and the log says why. That is deliberately
-/// different from the threshold trim, which reports a fully silent file as an
-/// error -- here "nothing found" is a legitimate answer about the recording,
-/// not a failure of the settings.
-fn resolve_trim_chain(
-    input: &Path,
-    opts: &ProcessingOptions,
-    ffmpeg: &Path,
-) -> Result<Option<String>> {
+/// For Silero VAD this is where a missing engine or model is reported, so the
+/// file stops before any real work has been done rather than after the DSP has
+/// run; the detection itself comes later.
+fn plan_trim(opts: &ProcessingOptions) -> Result<Trim> {
     if !opts.trim_silence {
-        return Ok(None);
+        return Ok(Trim::Off);
     }
     if !opts.trim_silence_vad {
-        return Ok(trim_chain_for(opts));
+        return Ok(trim_chain_for(opts).map_or(Trim::Off, Trim::Threshold));
     }
-
-    let log = |msg: String| {
-        if let Some(tx) = &opts.log {
-            let _ = tx.send(AppMsg::Log(msg));
-        }
-    };
-    let name = input
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
 
     if !vad::ENGINE_AVAILABLE {
         return Err(anyhow!(
@@ -171,8 +160,45 @@ fn resolve_trim_chain(
             vad::MODEL_ENV
         )
     })?;
+    Ok(Trim::Vad(model))
+}
 
-    let detection = vad::detect_speech(input, ffmpeg, &model)?;
+/// The Silero VAD trim chain for a take.
+///
+/// `detect_input` is what the model reads and `normalization` is the filter
+/// chain the encode will apply to it before the trim (loudness normalization,
+/// plus whatever clean-up chain precedes it). The model is fed the output of
+/// that chain, so its timestamps are on the timeline the trim is cut from. The
+/// caller must put the returned chain directly behind the same `normalization`
+/// string in the encode, or the cut lands in the wrong place.
+///
+/// A take with no speech in it yields `None`: the file passes through exactly
+/// as it would with the trim off, and the log says why. That is deliberately
+/// different from the threshold trim, which reports a fully silent file as an
+/// error -- here "nothing found" is a legitimate answer about the recording,
+/// not a failure of the settings.
+///
+/// `source` only names the file in the log; with the Automixer on, `detect_input`
+/// is a scratch file.
+fn vad_trim_chain(
+    source: &Path,
+    detect_input: &Path,
+    model: &Path,
+    normalization: Option<&str>,
+    ffmpeg: &Path,
+    opts: &ProcessingOptions,
+) -> Result<Option<String>> {
+    let log = |msg: String| {
+        if let Some(tx) = &opts.log {
+            let _ = tx.send(AppMsg::Log(msg));
+        }
+    };
+    let name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let detection = vad::detect_speech_filtered(detect_input, ffmpeg, model, normalization)?;
     let Some(span) = detection.span else {
         log(format!(
             "{name}: Silero VAD found no speech, file left untouched"
@@ -186,6 +212,14 @@ fn resolve_trim_chain(
         span.start, span.end, detection.total_secs, plan.start, plan.end
     ));
     Ok(vad::trim_filter(&plan, detection.total_secs))
+}
+
+/// `chain` with `tail` appended behind it, comma-joined; either may be absent.
+fn join_filters(chain: Option<String>, tail: Option<String>) -> Option<String> {
+    match (chain, tail) {
+        (Some(c), Some(t)) => Some(format!("{c},{t}")),
+        (c, t) => c.or(t),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,8 +371,24 @@ fn measure_and_decide_normalization(
     )
 }
 
-/// Applies a [`NormDecision`] to the FFmpeg command (pass-2 filter args) and
-/// returns the corresponding [`NormResult`] for logging.
+/// [`apply_norm_decision_then`] without a tail.
+#[cfg(test)]
+fn apply_norm_decision(
+    cmd: &mut Command,
+    decision: &NormDecision,
+    target_lufs: f32,
+    source_sr: u32,
+    prefix: Option<&str>,
+) -> NormResult {
+    apply_norm_decision_then(cmd, decision, target_lufs, source_sr, prefix, None)
+}
+
+/// Applies a [`NormDecision`] to the FFmpeg command (pass-2 filter args), with
+/// `tail` appended behind the normalization filter, and returns the
+/// corresponding [`NormResult`] for logging.
+///
+/// The Silero VAD trim is what goes in `tail`: it is cut from the output of the
+/// normalization, so it has to follow it.
 ///
 /// Every branch explicitly sets `-ar source_sr`, even when the caller's own
 /// pipeline never resampled the signal (in which case this is a no-op, since
@@ -348,38 +398,49 @@ fn measure_and_decide_normalization(
 /// exported file at 48kHz instead of the original sample rate whenever
 /// loudness normalization was off or fell back past the Standard/Padded
 /// EBU R128 passes.
-fn apply_norm_decision(
+fn apply_norm_decision_then(
     cmd: &mut Command,
     decision: &NormDecision,
     target_lufs: f32,
     source_sr: u32,
     prefix: Option<&str>,
+    tail: Option<String>,
 ) -> NormResult {
+    let chain = join_filters(norm_filter(decision, target_lufs, prefix), tail);
+    if let Some(f) = chain {
+        cmd.args(["-af", &f]);
+    }
+    cmd.args(["-ar", &source_sr.to_string()]);
+    norm_result(decision)
+}
+
+/// The `-af` value that applies `decision` behind `prefix`, or `None` when
+/// there is nothing to apply (normalization skipped and no prefix).
+///
+/// Exposed as a string, and not only through the command, because the Silero
+/// VAD pass has to hear exactly this chain.
+fn norm_filter(decision: &NormDecision, target_lufs: f32, prefix: Option<&str>) -> Option<String> {
     match decision {
-        NormDecision::Standard(stats) => {
-            apply_loudnorm_pass2(cmd, target_lufs, stats, source_sr, prefix);
-            NormResult::Standard
-        }
-        NormDecision::Padded(stats) => {
-            apply_loudnorm_pass2(cmd, target_lufs, stats, source_sr, prefix);
-            NormResult::Padded
+        NormDecision::Standard(stats) | NormDecision::Padded(stats) => {
+            Some(loudnorm_pass2_filter(target_lufs, stats, prefix))
         }
         NormDecision::Peak { gain_db } => {
             let vol_filter = format!("volume={:.4}dB", gain_db);
-            let filter = match prefix {
+            Some(match prefix {
                 Some(p) => format!("{},{}", p, vol_filter),
                 None => vol_filter,
-            };
-            cmd.args(["-af", &filter, "-ar", &source_sr.to_string()]);
-            NormResult::Peak { gain_db: *gain_db }
+            })
         }
-        NormDecision::Skipped => {
-            if let Some(p) = prefix {
-                cmd.args(["-af", p]);
-            }
-            cmd.args(["-ar", &source_sr.to_string()]);
-            NormResult::Skipped
-        }
+        NormDecision::Skipped => prefix.map(str::to_owned),
+    }
+}
+
+fn norm_result(decision: &NormDecision) -> NormResult {
+    match decision {
+        NormDecision::Standard(_) => NormResult::Standard,
+        NormDecision::Padded(_) => NormResult::Padded,
+        NormDecision::Peak { gain_db } => NormResult::Peak { gain_db: *gain_db },
+        NormDecision::Skipped => NormResult::Skipped,
     }
 }
 
@@ -536,21 +597,23 @@ fn read_f32le_stream(reader: &mut impl Read) -> Result<Vec<f32>> {
 // New pipeline with Rust DSP (when automixer + new modules are active)
 // ---------------------------------------------------------------------------
 
-/// Processes the file using Rust DSP (SG/NN + Voice EQ) between the de-esser and the rest of the chain.
+/// Processes the file using Rust DSP (SG/NN + adaptive EQ) between the de-esser and the rest of the chain.
 ///
 /// **Loudnorm correctness:** All loudness/peak measurements (pass-1 stats) are
 /// performed on the DSP-processed audio (written to a temp WAV file), not the
 /// original input. This ensures the linear normalization in pass-2 operates on
 /// the same signal that was measured, producing correct target loudness.
 ///
-/// `trim_chain` is the already-resolved silence trim for this file (see
-/// [`resolve_trim_chain`]); it is appended behind the clean-up chain in step 6.
+/// `trim` is the silence trim picked for this file (see [`plan_trim`]). A
+/// threshold trim is appended behind the clean-up chain and in front of the
+/// normalization in step 6; Silero VAD is run on the normalized result and its
+/// cut goes behind the normalization.
 fn process_with_rust_dsp(
     input: &Path,
     output: &Path,
     opts: &ProcessingOptions,
     ffmpeg: &Path,
-    trim_chain: Option<String>,
+    trim: Trim,
 ) -> Result<NormResult> {
     // 1. Get original sample rate (to restore later).
     //
@@ -717,8 +780,23 @@ fn process_with_rust_dsp(
             audio_effects::apply_nnnoise(&processed, &audio_effects::NnnoiseParams::default())?;
     }
 
-    // Voice EQ always at 50% strength — LAST in the chain (in-place)
-    audio_effects::apply_voice_eq_inplace(&mut processed, dsp_sr, 1, 0.5)?;
+    // Adaptive EQ — LAST in the chain (in-place). It measures here, on the
+    // cleaned-up signal, so noise does not count as part of the voice's tone. The
+    // fixed EQ in `post_deesser_filters()` comes after it and is not measured.
+    if opts.automixer_adaptive_eq {
+        let description = match audio_effects::measure_voice_bands(&processed, dsp_sr) {
+            Some(bands) => {
+                let plan = audio_effects::plan_adaptive_eq(&bands, dsp_sr);
+                audio_effects::apply_adaptive_eq_inplace(&mut processed, dsp_sr, 1, &plan.gains_db);
+                plan.describe()
+            }
+            None => "adaptive EQ left out, nothing to measure".to_owned(),
+        };
+        if let Some(tx) = &opts.log {
+            let name = input.file_name().unwrap_or_default().to_string_lossy();
+            let _ = tx.send(AppMsg::Log(format!("{name}: {description}")));
+        }
+    }
 
     // The trim runs in step 6, downstream of this buffer, so a take that is
     // entirely below the threshold would be cut down to nothing there -- and a
@@ -730,8 +808,8 @@ fn process_with_rust_dsp(
     //
     // The check is deliberately one-sided. `post_deesser_filters()` sits
     // between this buffer and the trim and can only make a low-level signal
-    // louder -- `acompressor` makeup is +4 dB, the 1350 Hz band +1.4 dB, the
-    // 8 kHz shelf +1 dB -- so the margin below covers all of it and then some.
+    // louder -- `acompressor` makeup is +4 dB, the 2970 Hz band +1.7 dB -- so the
+    // margin below covers all of it and then some.
     // Being wrong in the other direction would reject a file that had a
     // perfectly good take in it, which is far worse than writing an empty one.
     //
@@ -810,10 +888,17 @@ fn process_with_rust_dsp(
     // quiet. Appending it to `post_filters` rather than to any one command is
     // what keeps that honest: this one string is what the pass-1 measurement
     // reads, what pass 2 encodes, and what the un-normalized branch below
-    // uses, so all three see the same trimmed audio by construction.
-    let post_filters = match trim_chain {
-        Some(trim) => format!("{},{}", post_deesser_filters(), trim),
-        None => post_deesser_filters(),
+    // uses, so all three see the same trimmed audio by construction (a
+    // threshold trim; the Silero VAD cut is appended after them).
+    //
+    // Silero VAD is the exception, and deliberately: it is not a level gate, so
+    // it does not need the noise taken out first, but it does need the voice at
+    // a usable level, which only the normalization provides. Its cut is
+    // detected on the normalized stream and appended behind the normalization
+    // below, so the measurements here see the whole, untrimmed take.
+    let post_filters = match &trim {
+        Trim::Threshold(chain) => format!("{},{}", post_deesser_filters(), chain),
+        Trim::Off | Trim::Vad(_) => post_deesser_filters(),
     };
 
     // Normalization and encoding — stats measured on the PROCESSED temp WAV.
@@ -833,12 +918,46 @@ fn process_with_rust_dsp(
             opts.target_peak_dbfs,
             opts.log.as_ref(),
         );
-        apply_norm_decision(&mut cmd, &decision, lufs, source_sr, Some(&post_filters))
+        // The normalization chain is a string before it is a command, because
+        // the speech detection reads the output of exactly this chain.
+        let chain = norm_filter(&decision, lufs, Some(&post_filters));
+        let vad_cut = match &trim {
+            Trim::Vad(model) => {
+                vad_trim_chain(input, &temp_wav_path, model, chain.as_deref(), ffmpeg, opts)?
+            }
+            Trim::Off | Trim::Threshold(_) => None,
+        };
+        apply_norm_decision_then(
+            &mut cmd,
+            &decision,
+            lufs,
+            source_sr,
+            Some(&post_filters),
+            vad_cut,
+        )
     } else {
         // No normalization requested at all -- still must restore the
         // original sample rate, since the DSP stage above always runs at a
         // fixed 48kHz and the temp WAV we're now reading is 48kHz too.
-        cmd.args(["-af", &post_filters, "-ar", &source_sr.to_string()]);
+        //
+        // With nothing to normalize, the clean-up chain is all the model can be
+        // given to hear.
+        let vad_cut = match &trim {
+            Trim::Vad(model) => vad_trim_chain(
+                input,
+                &temp_wav_path,
+                model,
+                Some(&post_filters),
+                ffmpeg,
+                opts,
+            )?,
+            Trim::Off | Trim::Threshold(_) => None,
+        };
+        let filter = match vad_cut {
+            Some(cut) => format!("{post_filters},{cut}"),
+            None => post_filters,
+        };
+        cmd.args(["-af", &filter, "-ar", &source_sr.to_string()]);
         NormResult::Skipped
     };
 
@@ -883,15 +1002,16 @@ pub fn process_single_file(
         std::fs::create_dir_all(parent)?;
     }
 
-    // Settled once per file, before either pipeline, so that both measure and
-    // encode the same trimmed signal and a Silero VAD failure (no model, no
-    // decodable audio) stops the file before any real work has been done.
-    let trim_chain = resolve_trim_chain(input, opts, ffmpeg)?;
+    // Settled once per file, before either pipeline, so that a Silero VAD
+    // setup failure (no engine, no model) stops the file before any real work
+    // has been done. The detection itself happens later, behind the
+    // normalization, inside each pipeline.
+    let trim = plan_trim(opts)?;
 
     // If automixer is enabled, use the new pipeline with Rust DSP.
     // Otherwise, use old logic (no additional modules).
     if opts.automixer {
-        return process_with_rust_dsp(input, &output, opts, ffmpeg, trim_chain);
+        return process_with_rust_dsp(input, &output, opts, ffmpeg, trim);
     }
 
     // Old pipeline (without automixer)
@@ -908,7 +1028,14 @@ pub fn process_single_file(
     // threshold meets the raw recording. That is the case the presets exist
     // for: on an untreated room, Recommended can find no silence at all and
     // Hard is the answer.
-    let trim_prefix = trim_chain.as_deref();
+    //
+    // Silero VAD is not part of the prefix: it is cut from the *normalized*
+    // take, so it follows the normalization instead (see below), and the
+    // measurements see the whole take.
+    let trim_prefix = match &trim {
+        Trim::Threshold(chain) => Some(chain.as_str()),
+        Trim::Off | Trim::Vad(_) => None,
+    };
 
     let norm_result = if let Some(lufs) = opts.target_lufs {
         // One probe process yields both values; they come from the same stderr.
@@ -930,13 +1057,28 @@ pub fn process_single_file(
             opts.target_peak_dbfs,
             opts.log.as_ref(),
         );
-        apply_norm_decision(&mut cmd, &decision, lufs, source_sr, trim_prefix)
+        // The chain as a string first: the speech detection reads its output.
+        let chain = norm_filter(&decision, lufs, trim_prefix);
+        let vad_cut = match &trim {
+            Trim::Vad(model) => {
+                vad_trim_chain(input, input, model, chain.as_deref(), ffmpeg, opts)?
+            }
+            Trim::Off | Trim::Threshold(_) => None,
+        };
+        apply_norm_decision_then(&mut cmd, &decision, lufs, source_sr, trim_prefix, vad_cut)
     } else {
         // No normalization to hang the filter off, so the trim is the only
         // thing in `-af`. Still no `-ar`: this path never resampled, so there
         // is no source rate to restore.
-        if let Some(trim) = trim_prefix {
-            cmd.args(["-af", trim]);
+        //
+        // Nothing is normalized, so the model hears the file as it is.
+        let cut = match &trim {
+            Trim::Threshold(chain) => Some(chain.clone()),
+            Trim::Vad(model) => vad_trim_chain(input, input, model, None, ffmpeg, opts)?,
+            Trim::Off => None,
+        };
+        if let Some(cut) = cut {
+            cmd.args(["-af", &cut]);
         }
         NormResult::Skipped
     };
@@ -1041,7 +1183,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // apply_norm_decision: Peak/Skipped build the expected -af filter args
-    // (Standard/Padded delegate filter-building to apply_loudnorm_pass2,
+    // (Standard/Padded delegate filter-building to loudnorm_pass2_filter,
     // covered separately in ffmpeg.rs).
     // -----------------------------------------------------------------------
 
@@ -1266,6 +1408,80 @@ mod tests {
                 "-ar".to_string(),
                 "44100".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn the_fixed_eq_is_the_three_wide_filters_ahead_of_the_compressor() {
+        assert_eq!(
+            post_deesser_filters(),
+            "highpass=f=40:poles=2:width_type=q:width=1.0,highpass=f=40:poles=1,\
+             equalizer=f=310:width_type=q:width=0.339:g=-2.5,\
+             equalizer=f=2970:width_type=q:width=0.271:g=1.7,\
+             acompressor=threshold=0.251:ratio=4:attack=5:release=80:makeup=4"
+        );
+    }
+
+    #[test]
+    fn the_vad_cut_goes_behind_the_normalization_and_in_front_of_nothing() {
+        // Silero VAD is cut from the *normalized* take: `-af` is the clean-up
+        // chain, then the normalization, then the cut -- never the other way.
+        let chain = default_chain();
+        let cut = "asetpts=PTS-STARTPTS,atrim=start=1.000,asetpts=PTS-STARTPTS".to_string();
+        let mut cmd = Command::new("ffmpeg");
+        apply_norm_decision_then(
+            &mut cmd,
+            &NormDecision::Peak { gain_db: 2.0 },
+            -16.0,
+            44100,
+            Some(&chain),
+            Some(cut.clone()),
+        );
+        assert_eq!(
+            args_of(&cmd),
+            vec![
+                "-af".to_string(),
+                format!("{chain},volume=2.0000dB,{cut}"),
+                "-ar".to_string(),
+                "44100".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_filter_the_vad_hears_is_the_filter_the_encode_applies() {
+        // The detection pass and the encode must share one string, or the cut
+        // is made on a different timeline from the one it was found on.
+        let chain = default_chain();
+        let decision = NormDecision::Peak { gain_db: -3.5 };
+        let heard = norm_filter(&decision, -16.0, Some(&chain)).unwrap();
+
+        let mut cmd = Command::new("ffmpeg");
+        apply_norm_decision_then(&mut cmd, &decision, -16.0, 44100, Some(&chain), None);
+        assert_eq!(args_of(&cmd)[1], heard);
+        assert!(
+            !heard.contains("atrim") && !heard.contains("afade"),
+            "the model hears the take before the cut: {heard}"
+        );
+    }
+
+    #[test]
+    fn a_skipped_normalization_leaves_the_vad_with_the_prefix_alone() {
+        assert_eq!(norm_filter(&NormDecision::Skipped, -16.0, None), None);
+        assert_eq!(
+            norm_filter(&NormDecision::Skipped, -16.0, Some("a,b")).as_deref(),
+            Some("a,b")
+        );
+    }
+
+    #[test]
+    fn join_filters_joins_what_is_there() {
+        assert_eq!(join_filters(None, None), None);
+        assert_eq!(join_filters(Some("a".into()), None).as_deref(), Some("a"));
+        assert_eq!(join_filters(None, Some("b".into())).as_deref(), Some("b"));
+        assert_eq!(
+            join_filters(Some("a".into()), Some("b".into())).as_deref(),
+            Some("a,b")
         );
     }
 

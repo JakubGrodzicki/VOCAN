@@ -21,9 +21,13 @@
 //! 3. [`trim_filter`] turns the plan into an `atrim`/`afade` filter string that
 //!    goes where the `silenceremove` chain would have gone.
 //!
-//! The decode is independent of everything else in the pipeline. It reads the
-//! original file, writes nothing, and the audio that is finally encoded differs
-//! from the non-VAD result only by the cut and the two fades.
+//! The decode writes nothing. In the pipeline it runs **after** loudness
+//! normalization: [`detect_speech_filtered`] is handed the normalization chain,
+//! so the model hears the take at its delivered level (a quiet voice-over is
+//! brought up first, the model does not have to guess at it), and the audio that
+//! is finally encoded differs from the non-VAD result only by the cut and the
+//! two fades. Without a loudness target there is nothing to run first, and the
+//! model hears the file as it is.
 
 use anyhow::{anyhow, Context, Result};
 use std::io::Read;
@@ -45,11 +49,11 @@ pub const WINDOW: usize = 512;
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
 const CONTEXT: usize = 64;
 /// A silent run turns into speech when a frame scores at least this.
-pub const START_THRESHOLD: f32 = 0.5;
+pub const START_THRESHOLD: f32 = 0.4;
 /// Speech ends when a frame scores below this. Lower than the start threshold
 /// so that one weak frame in the middle of a word does not end the speech
 /// (Silero's own hysteresis: `threshold - 0.15`).
-pub const END_THRESHOLD: f32 = 0.35;
+pub const END_THRESHOLD: f32 = 0.25;
 /// Speech bursts shorter than this are ignored, so a door slam or a mouth click
 /// does not become the start of the take.
 pub const MIN_SPEECH_SECS: f64 = 0.25;
@@ -409,10 +413,27 @@ fn for_each_frame(
 /// whole (see [`QUIET_LEVEL`]). The children are registered with
 /// [`proc::register`], so Stop kills them mid-file like any other pass.
 pub fn detect_speech(input: &Path, ffmpeg: &Path, model: &Path) -> Result<Detection> {
-    let mut pass = run_pass(input, ffmpeg, model, None)?;
+    detect_speech_filtered(input, ffmpeg, model, None)
+}
+
+/// [`detect_speech`] on `input` as it sounds after `pre_filter`.
+///
+/// The pipeline passes its loudness-normalization chain here, so the model hears
+/// the take at the level it will be delivered at -- a voice-over recorded far
+/// under a normal level is brought up first and is not cut into on account of
+/// its volume. The returned times are on the timeline of the *filtered* stream,
+/// which is the one the trim is applied to, provided the encode uses the very
+/// same chain ahead of it.
+pub fn detect_speech_filtered(
+    input: &Path,
+    ffmpeg: &Path,
+    model: &Path,
+    pre_filter: Option<&str>,
+) -> Result<Detection> {
+    let mut pass = run_pass(input, ffmpeg, model, pre_filter, None)?;
 
     if let Some(gain_db) = rescue_gain_db(pass.level) {
-        pass = run_pass(input, ffmpeg, model, Some(gain_db))?;
+        pass = run_pass(input, ffmpeg, model, pre_filter, Some(gain_db))?;
     }
 
     let total_secs = pass.samples as f64 / SAMPLE_RATE as f64;
@@ -434,16 +455,27 @@ struct Pass {
 
 /// Decodes `input` to 16 kHz mono, optionally with `gain_db` applied, and runs
 /// the model over it frame by frame.
-fn run_pass(input: &Path, ffmpeg: &Path, model: &Path, gain_db: Option<f32>) -> Result<Pass> {
+fn run_pass(
+    input: &Path,
+    ffmpeg: &Path,
+    model: &Path,
+    pre_filter: Option<&str>,
+    gain_db: Option<f32>,
+) -> Result<Pass> {
     // Load first: a missing or corrupt model should fail before a process is
     // spawned for nothing.
     let mut silero = engine::Silero::load(model)?;
 
-    // Downmix first, then gain: the model hears the mono sum, and that is the
-    // signal whose level matters.
-    let filter = match gain_db {
+    // `pre_filter` first (it is what the encode applies to the stereo/source
+    // signal), then downmix, then gain: the model hears the mono sum, and that
+    // is the signal whose level matters.
+    let tail = match gain_db {
         Some(db) => format!("aformat=channel_layouts=mono,volume={db:.2}dB:precision=float"),
         None => "aformat=channel_layouts=mono".to_string(),
+    };
+    let filter = match pre_filter {
+        Some(pre) => format!("{pre},{tail}"),
+        None => tail,
     };
 
     let mut child = ffmpeg_cmd(ffmpeg)
@@ -745,15 +777,15 @@ mod tests {
 
     #[test]
     fn scores_between_the_thresholds_neither_start_nor_end_speech() {
-        // A long stretch at 0.4 -- above the end threshold, below the start one
+        // A long stretch at 0.3 -- above the end threshold, below the start one
         // -- keeps speech going, however long it lasts...
-        let p = probs(&[(0.01, 4), (0.9, 6), (0.4, 20), (0.9, 6), (0.01, 4)]);
+        let p = probs(&[(0.01, 4), (0.9, 6), (0.3, 20), (0.9, 6), (0.01, 4)]);
         let s = speech_span(&p, p.len() as f64 * F).unwrap();
         assert!(near(s.start, 4.0 * F) && near(s.end, 36.0 * F), "{s:?}");
         // ...and on its own it never starts any.
-        assert_eq!(speech_span(&run(0.4, 40), 40.0 * F), None);
-        // The end threshold is exclusive on the quiet side: 0.35 is not quiet.
-        let p = probs(&[(0.01, 4), (0.9, 6), (0.35, 6), (0.9, 6), (0.01, 4)]);
+        assert_eq!(speech_span(&run(0.3, 40), 40.0 * F), None);
+        // The end threshold is exclusive on the quiet side: 0.25 is not quiet.
+        let p = probs(&[(0.01, 4), (0.9, 6), (0.25, 6), (0.9, 6), (0.01, 4)]);
         assert!(near(
             speech_span(&p, p.len() as f64 * F).unwrap().end,
             22.0 * F
@@ -784,8 +816,8 @@ mod tests {
 
     #[test]
     fn hysteresis_one_weak_frame_does_not_split_speech() {
-        // 0.4 sits between the thresholds: it neither starts nor ends speech.
-        let p = probs(&[(0.01, 4), (0.9, 6), (0.4, 1), (0.9, 6), (0.01, 4)]);
+        // 0.3 sits between the thresholds: it neither starts nor ends speech.
+        let p = probs(&[(0.01, 4), (0.9, 6), (0.3, 1), (0.9, 6), (0.01, 4)]);
         let s = speech_span(&p, 21.0 * F).unwrap();
         assert!(near(s.start, 4.0 * F));
         assert!(near(s.end, 17.0 * F));
@@ -793,7 +825,7 @@ mod tests {
 
     #[test]
     fn hysteresis_a_middling_score_does_not_start_speech() {
-        assert_eq!(speech_span(&run(0.45, 50), 50.0 * F), None);
+        assert_eq!(speech_span(&run(0.35, 50), 50.0 * F), None);
     }
 
     #[test]
@@ -1124,8 +1156,8 @@ mod tests {
     fn the_documented_numbers_are_the_ones_in_the_code() {
         // README.MD and the UI hint quote these. Changing one means changing the
         // text, and this is what makes that a deliberate act.
-        assert_eq!(START_THRESHOLD, 0.5);
-        assert_eq!(END_THRESHOLD, 0.35);
+        assert_eq!(START_THRESHOLD, 0.4);
+        assert_eq!(END_THRESHOLD, 0.25);
         assert_eq!(MIN_SPEECH_SECS, 0.25);
         assert_eq!(MARGIN_SECS, 0.150);
         assert_eq!(FADE_SECS, 0.075);
@@ -1138,7 +1170,7 @@ mod tests {
     #[test]
     fn the_start_threshold_is_inclusive_and_the_end_threshold_is_exclusive() {
         let span = |p: Vec<f32>| speech_span(&p, p.len() as f64 * F);
-        // 0.5 starts speech; just under it does not.
+        // 0.4 starts speech; just under it does not.
         assert!(span(probs(&[(0.01, 3), (START_THRESHOLD, 12), (0.01, 6)])).is_some());
         assert!(span(probs(&[
             (0.01, 3),
@@ -1146,7 +1178,7 @@ mod tests {
             (0.01, 6)
         ]))
         .is_none());
-        // A score of exactly 0.35 is not quiet (the pause never gets going, so
+        // A score of exactly 0.25 is not quiet (the pause never gets going, so
         // the speech runs on); just under it is.
         let with_gap = |p: f32| probs(&[(0.01, 3), (0.9, 5), (p, 6), (0.9, 5), (0.01, 6)]);
         assert!(near(
@@ -1155,7 +1187,7 @@ mod tests {
         ));
         assert!(
             speech_span(&with_gap(END_THRESHOLD - 0.001), 25.0 * F).is_none(),
-            "5 + 6 + 5 frames: a 6-frame pause under 0.35 splits two bursts too short to count"
+            "5 + 6 + 5 frames: a 6-frame pause under 0.25 splits two bursts too short to count"
         );
     }
 

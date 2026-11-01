@@ -21,7 +21,7 @@
 //! The fixture is Silero's own `tests/data/test.wav`: 60 s of continuous
 //! conversational speech. Its boundaries are not guessed. They are what the
 //! model reports on it frame by frame, measured with the reference
-//! segmentation (threshold 0.5 to enter, 0.35 to leave) and pinned below, so a
+//! segmentation (threshold 0.4 to enter, 0.25 to leave) and pinned below, so a
 //! change in the decode, the framing, the context handling or the model version
 //! moves them and fails these tests:
 //!
@@ -365,6 +365,77 @@ fn plain_pipeline_keeps_speech_plus_margins_and_fades_the_edges() {
     );
 }
 
+/// The cut has to land on the normalized stream's timeline: a quiet take comes
+/// out at the same length as a loud one, brought up to the target loudness. This
+/// checks the alignment of the detection and the encode; that the detector hears
+/// the normalized audio at all is pinned by `spawn_budget.rs`.
+#[test]
+#[ignore]
+fn a_quiet_take_is_normalized_before_it_is_cut() {
+    if skip_if_no_vad_fixture() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let take = dir.path().join("quiet.wav");
+    make_take(&take, 8.0, 2.0, 2.0, 1);
+    let loud = read_wav_samples_f32(&take);
+    let quiet: Vec<f32> = loud.iter().map(|s| s * 0.03).collect(); // -30 dB
+    write_f32_wav(&take, &quiet, 16_000);
+
+    for automixer in [false, true] {
+        let mut opts = vad_opts();
+        opts.target_lufs = Some(-16.0);
+        if automixer {
+            // The same 48 kHz source the other Automixer tests here use.
+            let up: Vec<f32> = quiet
+                .iter()
+                .flat_map(|&s| std::iter::repeat_n(s, 3))
+                .collect();
+            write_f32_wav(&take, &up, 48_000);
+            opts.automixer = true;
+            opts.automixer_spectral_gate = true;
+        }
+        let (out, _) = run(&take, opts);
+        let secs = wav_secs(&out);
+        assert!(
+            (secs - KEPT_SECS).abs() <= 0.15,
+            "automixer={automixer}: expected {KEPT_SECS:.3} s, got {secs:.3} s"
+        );
+        let samples = read_wav_samples_f32(&out);
+        assert!(
+            rms(&samples) > rms(&quiet) * 10.0,
+            "automixer={automixer}: the output should have been brought up"
+        );
+    }
+}
+
+/// The adaptive EQ on real speech, which the synthetic noise in `audio_effects`
+/// cannot stand in for: speech is not stationary, and how much of it the gate
+/// keeps decides what the top band reads. `--nocapture` prints the log lines.
+#[test]
+#[ignore]
+fn the_adaptive_eq_reads_real_speech_the_same_at_any_level() {
+    if skip_if_no_vad_fixture() {
+        return;
+    }
+    use vocan::audio_effects::{measure_voice_bands, plan_adaptive_eq};
+
+    for secs in [3.0, 8.0, 20.0, 60.0] {
+        let speech = speech_samples(&fixture(), secs);
+        let plan = plan_adaptive_eq(&measure_voice_bands(&speech, 16_000).unwrap(), 16_000);
+        println!("{secs:>4} s: {}", plan.describe());
+        assert_eq!(plan.bypass, None, "{secs} s of continuous speech");
+        assert!(plan.gains_db.iter().all(|g| g.abs() <= 1.5));
+
+        // Gate and shape are both relative, so a 40 dB quieter take is the same.
+        let quiet: Vec<f32> = speech.iter().map(|s| s * 0.01).collect();
+        let quiet_plan = plan_adaptive_eq(&measure_voice_bands(&quiet, 16_000).unwrap(), 16_000);
+        for (a, b) in plan.gains_db.iter().zip(&quiet_plan.gains_db) {
+            assert!((a - b).abs() < 0.05, "{secs} s: {a} dB vs {b} dB");
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn automixer_pipeline_trims_the_same_way() {
@@ -373,10 +444,8 @@ fn automixer_pipeline_trims_the_same_way() {
     }
     let dir = tempfile::tempdir().unwrap();
     let take = dir.path().join("take.wav");
-    // 48 kHz, not the fixture's native 16 kHz: the Automixer's voice EQ has a
-    // band at 8 kHz, which sits on the Nyquist frequency of a 16 kHz signal and
-    // makes the pipeline fail with "biquad coeffs failed for band 3" -- a
-    // limitation of the Automixer that has nothing to do with the trim.
+    // 48 kHz, not the fixture's native 16 kHz: the rate the Automixer runs at
+    // whenever DeepFilterNet3 or nnnoiseless is on.
     make_take(&take, 8.0, 2.0, 2.0, 3);
 
     let mut opts = vad_opts();

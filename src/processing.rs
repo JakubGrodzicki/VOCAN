@@ -27,6 +27,12 @@ fn deesser_only_filter() -> String {
 
 /// Returns filters after the de-esser: HPF, EQ, compressor (no de-esser).
 fn post_deesser_filters() -> String {
+    // These filters read the scratch WAV, which hound labels as front left when
+    // it has one channel. Left alone, that label reaches the output: players use
+    // the left ear only, and encoders without that layout (ADPCM) go stereo. This
+    // only relabels the channel; the samples pass through untouched.
+    let mono = "pan=mono|c0=c0";
+
     // Few, very wide filters on purpose: this runs on every file with no
     // knowledge of the recording, and for a voice tool keeping the phase natural
     // comes first. A 2-pole Q=1 section and a 1-pole section at one cutoff are
@@ -36,7 +42,7 @@ fn post_deesser_filters() -> String {
     let eq_2970 = "equalizer=f=2970:width_type=q:width=0.271:g=1.7";
     let comp = "acompressor=threshold=0.251:ratio=4:attack=5:release=80:makeup=4";
 
-    format!("{},{},{},{}", hpf, eq_310, eq_2970, comp)
+    format!("{},{},{},{},{}", mono, hpf, eq_310, eq_2970, comp)
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,7 +1421,8 @@ mod tests {
     fn the_fixed_eq_is_the_three_wide_filters_ahead_of_the_compressor() {
         assert_eq!(
             post_deesser_filters(),
-            "highpass=f=40:poles=2:width_type=q:width=1.0,highpass=f=40:poles=1,\
+            "pan=mono|c0=c0,\
+             highpass=f=40:poles=2:width_type=q:width=1.0,highpass=f=40:poles=1,\
              equalizer=f=310:width_type=q:width=0.339:g=-2.5,\
              equalizer=f=2970:width_type=q:width=0.271:g=1.7,\
              acompressor=threshold=0.251:ratio=4:attack=5:release=80:makeup=4"

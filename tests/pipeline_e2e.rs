@@ -433,6 +433,75 @@ fn automixer_handles_low_sample_rate_sources() {
     }
 }
 
+/// The Automixer's scratch WAV comes from hound, which labels a single channel
+/// front left. A player takes that literally and plays the file in the left ear
+/// only, and an encoder without that layout (ADPCM) makes the file stereo, so the
+/// label must not reach the output.
+#[test]
+#[ignore]
+fn automixer_output_is_mono_and_not_front_left() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input_base = dir.path().join("in");
+    let output_base = dir.path().join("out");
+    std::fs::create_dir_all(&input_base).unwrap();
+    let input_path = input_base.join("tone.wav");
+    write_sine_wav(&input_path, 3.0, 48000, 440.0, 0.5);
+
+    for target_lufs in [Some(-16.0), None] {
+        for &format in OutputFormat::all() {
+            let codec = format.ffmpeg_codec();
+            if !ffmpeg_has_encoder(codec) {
+                eprintln!("SKIP {format:?}: ffmpeg has no '{codec}' encoder in this environment");
+                continue;
+            }
+            let mut opts = base_opts();
+            opts.automixer = true;
+            opts.target_lufs = target_lufs;
+            opts.output_format = format;
+            process_single_file(
+                &input_path,
+                &input_base,
+                &output_base,
+                &opts,
+                &ffmpeg_path(),
+            )
+            .unwrap_or_else(|e| panic!("processing failed for {format:?}: {e}"));
+
+            let output_path = output_base
+                .join("tone.wav")
+                .with_extension(format.extension());
+            let probe = std::process::Command::new(ffmpeg_path())
+                .args(["-hide_banner", "-i"])
+                .arg(&output_path)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&probe.stderr).into_owned();
+            let stream = stderr
+                .lines()
+                .find(|line| line.contains("Audio:"))
+                .unwrap_or_else(|| panic!("no audio stream for {format:?}: {stderr}"));
+            println!("{format:?} lufs={target_lufs:?}: {}", stream.trim());
+            assert!(
+                stream.contains(" mono,"),
+                "{format:?} lufs={target_lufs:?} is not mono: {stream}"
+            );
+
+            // Read from the header itself, so this does not rest on how FFmpeg
+            // chooses to print it. 4 is SPEAKER_FRONT_CENTER.
+            if format == OutputFormat::Pcm24Wav {
+                let bytes = std::fs::read(&output_path).unwrap();
+                assert_eq!(&bytes[12..16], b"fmt ");
+                assert_eq!(u16::from_le_bytes([bytes[20], bytes[21]]), 0xFFFE);
+                let mask = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
+                assert_eq!(mask, 4, "lufs={target_lufs:?}");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Silence trim
 // ---------------------------------------------------------------------------

@@ -37,7 +37,7 @@ pub struct AudioBatchApp {
     /// Target peak (dBFS) used as a peak-normalization fallback when EBU R128
     /// loudness measurement (standard or padded) fails.
     target_peak_dbfs: f32,
-    /// Applies a fixed processing chain (EQ → De-esser → Compressor) before normalization.
+    /// Applies a processing chain (De-esser → EQ → Compressor) before normalization.
     automixer: bool,
     /// Module 1: custom spectral gate (FFT).
     automixer_spectral_gate: bool,
@@ -53,6 +53,8 @@ pub struct AudioBatchApp {
     automixer_expander_safety_pct: f32,
     /// Preset reduction depth (Safe/Recommended/Hard/Max).
     automixer_expander_reduction_profile: ReductionProfile,
+    /// Module 2: measures each take and corrects four bands by at most 1.5 dB.
+    automixer_adaptive_eq: bool,
     /// Trims leading and trailing silence from every take.
     ///
     /// Not one of the automixer modules above and not gated by
@@ -149,8 +151,9 @@ impl Section {
                  silence off each take is here too \u{2014} it needs nothing from Clean up."
             }
             Self::CleanUp => {
-                "De-ess \u{2192} dereverb \u{2192} expand \u{2192} denoise \u{2192} voice EQ \
-                 \u{2192} compress. The whole chain runs before loudness normalization."
+                "De-ess \u{2192} dereverb \u{2192} expand \u{2192} denoise \u{2192} adaptive EQ \
+                 \u{2192} fixed EQ \u{2192} compress. The whole chain runs before loudness \
+                 normalization."
             }
             Self::Loudness => {
                 "Two-pass EBU R128, with a padded measurement for files under 3 seconds and \
@@ -328,6 +331,7 @@ impl AudioBatchApp {
             automixer_expander: false,
             automixer_expander_safety_pct: 50.0,
             automixer_expander_reduction_profile: ReductionProfile::Recommended,
+            automixer_adaptive_eq: true,
             trim_silence: false,
             trim_silence_threshold: SilenceThreshold::Recommended,
             trim_silence_pad: SilencePad::Tight,
@@ -697,6 +701,7 @@ impl AudioBatchApp {
             automixer_expander: self.automixer_expander,
             automixer_expander_safety_pct: self.automixer_expander_safety_pct,
             automixer_expander_reduction_profile: self.automixer_expander_reduction_profile,
+            automixer_adaptive_eq: self.automixer_adaptive_eq,
             trim_silence: self.trim_silence,
             trim_silence_threshold: self.trim_silence_threshold,
             trim_silence_pad: self.trim_silence_pad,
@@ -1022,13 +1027,14 @@ impl AudioBatchApp {
         if !self.automixer {
             return ("off".to_owned(), theme::TXT3);
         }
-        // Voice EQ, the de-esser and the post chain are unconditional once the
-        // automixer is on, so the count is "what you switched on" plus that
-        // fixed stage -- the same set the recipe line in the action bar names.
+        // The de-esser and the post chain are unconditional once the automixer
+        // is on, so the count is "what you switched on" plus that fixed stage --
+        // the same set the recipe line in the action bar names.
         let n = 1
             + usize::from(self.automixer_dfn3_dereverb)
             + usize::from(self.automixer_expander)
-            + usize::from(self.automixer_spectral_gate || self.automixer_nn_dereverb);
+            + usize::from(self.automixer_spectral_gate || self.automixer_nn_dereverb)
+            + usize::from(self.automixer_adaptive_eq);
         (format!("{n} stages"), theme::TXT3)
     }
 
@@ -1093,7 +1099,10 @@ impl AudioBatchApp {
             if self.automixer_nn_dereverb {
                 modules.push("nnnoiseless");
             }
-            modules.push("voice EQ");
+            if self.automixer_adaptive_eq {
+                modules.push("adaptive EQ");
+            }
+            modules.push("fixed EQ");
             parts.push(format!("clean up: {}", modules.join(", ")));
         } else {
             parts.push("no clean-up".to_owned());
@@ -1551,13 +1560,27 @@ impl AudioBatchApp {
             ui.add_space(12.0);
 
             widgets::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    widgets::check(ui, &mut self.automixer_adaptive_eq, "Adaptive EQ");
+                    ui.label(RichText::new("4 bands").size(11.5).color(theme::TXT3));
+                });
+                indented_hint(
+                    ui,
+                    "Measures each take against an average speech spectrum and evens it out \
+                     by at most 1.5 dB. The log shows what it did to each file.",
+                );
+            });
+
+            ui.add_space(12.0);
+
+            widgets::card(ui, |ui| {
                 ui.label(RichText::new("Always on").color(theme::TXT2));
                 ui.add_space(6.0);
                 ui.add(
                     egui::Label::new(
                         RichText::new(
-                            "Voice EQ at 50% strength \u{b7} de-esser \u{b7} post EQ and \
-                             compressor with make-up gain.\nStereo sources are downmixed to mono.",
+                            "De-esser \u{b7} fixed EQ and compressor with make-up gain.\n\
+                             Stereo sources are downmixed to mono.",
                         )
                         .size(11.5)
                         .color(theme::TXT3),
@@ -2390,6 +2413,7 @@ mod tests {
             automixer_expander,
             automixer_expander_safety_pct,
             automixer_expander_reduction_profile,
+            automixer_adaptive_eq,
             trim_silence,
             trim_silence_threshold,
             trim_silence_pad,
@@ -2417,6 +2441,7 @@ mod tests {
             automixer_expander_reduction_profile,
             d.automixer_expander_reduction_profile
         );
+        assert_eq!(automixer_adaptive_eq, d.automixer_adaptive_eq);
         assert_eq!(trim_silence, d.trim_silence);
         assert_eq!(trim_silence_threshold, d.trim_silence_threshold);
         assert_eq!(trim_silence_pad, d.trim_silence_pad);

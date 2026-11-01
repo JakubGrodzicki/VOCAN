@@ -282,16 +282,105 @@ fn automixer_toggle_combinations_do_not_error() {
     ];
 
     for (i, &(sg, nn, exp)) in combos.iter().enumerate() {
-        let input_path = input_base.join(format!("tone_{i}.wav"));
+        for eq in [true, false] {
+            let input_path = input_base.join(format!("tone_{i}_{eq}.wav"));
+            write_sine_wav(&input_path, 2.0, 48000, 300.0, 0.4);
+
+            let mut opts = base_opts();
+            opts.automixer = true;
+            opts.automixer_spectral_gate = sg;
+            opts.automixer_nn_dereverb = nn;
+            opts.automixer_expander = exp;
+            opts.automixer_adaptive_eq = eq;
+            opts.output_format = OutputFormat::Pcm24Wav;
+
+            process_single_file(
+                &input_path,
+                &input_base,
+                &output_base,
+                &opts,
+                &ffmpeg_path(),
+            )
+            .unwrap_or_else(|e| panic!("combo sg={sg} nn={nn} exp={exp} eq={eq} failed: {e}"));
+        }
+    }
+}
+
+/// Measures what FFmpeg actually does with the fixed EQ's filters, one at a
+/// time, on sines. Q is not defined the same way everywhere: FFmpeg uses the RBJ
+/// definition and plugins vary, so the table this prints (`--nocapture`) is what
+/// to compare against the plugin the values came from.
+#[test]
+#[ignore]
+fn the_fixed_eq_filters_do_what_their_settings_say() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in.wav");
+    let output = dir.path().join("out.wav");
+
+    let gain_db = |filter: &str, freq: f32| {
+        write_sine_wav(&input, 2.0, 48000, freq, 0.1);
+        let status = std::process::Command::new(ffmpeg_path())
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-i"])
+            .arg(&input)
+            .args(["-af", filter, "-c:a", "pcm_f32le"])
+            .arg(&output)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{filter}");
+        let rms = |s: &[f32]| (s.iter().map(|x| x * x).sum::<f32>() / s.len() as f32).sqrt();
+        // The first second is left out: it holds the filter's settling time.
+        let before = read_wav_samples_f32(&input);
+        let after = read_wav_samples_f32(&output);
+        20.0 * (rms(&after[48000..]) / rms(&before[48000..])).log10()
+    };
+
+    let hpf = "highpass=f=40:poles=2:width_type=q:width=1.0,highpass=f=40:poles=1";
+    let low = "equalizer=f=310:width_type=q:width=0.339:g=-2.5";
+    let high = "equalizer=f=2970:width_type=q:width=0.271:g=1.7";
+    for (name, filter, f) in [
+        ("HPF 40 Hz", hpf, 40.0f32),
+        ("310 Hz -2.5 dB", low, 310.0),
+        ("2970 Hz +1.7 dB", high, 2970.0),
+    ] {
+        let (half, at, double) = (
+            gain_db(filter, f / 2.0),
+            gain_db(filter, f),
+            gain_db(filter, f * 2.0),
+        );
+        println!("{name}: f/2 {half:+.2} dB, f {at:+.2} dB, 2f {double:+.2} dB");
+    }
+
+    // 3rd-order Butterworth: -3 dB at the cutoff, close to -18 dB an octave down.
+    assert!((gain_db(hpf, 40.0) + 3.0).abs() < 0.2);
+    assert!((gain_db(hpf, 20.0) + 18.1).abs() < 0.5);
+    assert!((gain_db(low, 310.0) + 2.5).abs() < 0.05);
+    assert!((gain_db(high, 2970.0) - 1.7).abs() < 0.05);
+}
+
+#[test]
+#[ignore]
+fn the_adaptive_eq_reports_to_the_log_only_when_it_is_on() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input_base = dir.path().join("in");
+    let output_base = dir.path().join("out");
+    std::fs::create_dir_all(&input_base).unwrap();
+
+    for eq in [true, false] {
+        let input_path = input_base.join(format!("tone_{eq}.wav"));
         write_sine_wav(&input_path, 2.0, 48000, 300.0, 0.4);
 
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut opts = base_opts();
         opts.automixer = true;
-        opts.automixer_spectral_gate = sg;
-        opts.automixer_nn_dereverb = nn;
-        opts.automixer_expander = exp;
+        opts.automixer_adaptive_eq = eq;
         opts.output_format = OutputFormat::Pcm24Wav;
-
+        opts.log = Some(tx);
         process_single_file(
             &input_path,
             &input_base,
@@ -299,7 +388,48 @@ fn automixer_toggle_combinations_do_not_error() {
             &opts,
             &ffmpeg_path(),
         )
-        .unwrap_or_else(|e| panic!("combo sg={sg} nn={nn} exp={exp} failed: {e}"));
+        .unwrap();
+
+        let mentioned = rx.try_iter().any(|m| match m {
+            vocan::types::AppMsg::Log(line) => line.contains("adaptive EQ"),
+            _ => false,
+        });
+        assert_eq!(mentioned, eq);
+    }
+}
+
+/// The old fixed Voice EQ had a 10 kHz band, above Nyquist for anything under
+/// 20 kHz, and failed the whole file on it.
+#[test]
+#[ignore]
+fn automixer_handles_low_sample_rate_sources() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input_base = dir.path().join("in");
+    let output_base = dir.path().join("out");
+    std::fs::create_dir_all(&input_base).unwrap();
+
+    for sample_rate in [8_000, 16_000] {
+        for eq in [true, false] {
+            let input_path = input_base.join(format!("tone_{sample_rate}_{eq}.wav"));
+            write_sine_wav(&input_path, 2.0, sample_rate, 300.0, 0.4);
+
+            let mut opts = base_opts();
+            opts.automixer = true;
+            opts.automixer_adaptive_eq = eq;
+            opts.output_format = OutputFormat::Pcm24Wav;
+
+            process_single_file(
+                &input_path,
+                &input_base,
+                &output_base,
+                &opts,
+                &ffmpeg_path(),
+            )
+            .unwrap_or_else(|e| panic!("{sample_rate} Hz eq={eq} failed: {e}"));
+        }
     }
 }
 

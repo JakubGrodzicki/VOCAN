@@ -286,6 +286,8 @@ pub struct ProcessingOptions {
     pub automixer_expander_safety_pct: f32,
     /// Preset reduction depth (Safe/Recommended/Hard/Max).
     pub automixer_expander_reduction_profile: ReductionProfile,
+    /// Module 2: measures each take and corrects four bands by at most 1.5 dB.
+    pub automixer_adaptive_eq: bool,
     /// Trims leading and trailing silence from every file, via FFmpeg's
     /// `silenceremove`.
     ///
@@ -337,6 +339,7 @@ impl Default for ProcessingOptions {
             automixer_expander: false,
             automixer_expander_safety_pct: 50.0,
             automixer_expander_reduction_profile: ReductionProfile::Recommended,
+            automixer_adaptive_eq: true,
             trim_silence: false,
             trim_silence_threshold: SilenceThreshold::Recommended,
             trim_silence_pad: SilencePad::Tight,

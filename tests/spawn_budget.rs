@@ -93,6 +93,25 @@ fn automixer_costs_four_ffmpeg_processes() {
 
 #[test]
 #[ignore]
+fn the_adaptive_eq_costs_no_process() {
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    // It measures the buffer the Rust DSP already holds. Reaching for ffmpeg or
+    // Silero to do that would cost a process on every file in a batch.
+    let with_eq = |automixer_adaptive_eq| ProcessingOptions {
+        target_lufs: Some(-16.0),
+        automixer: true,
+        automixer_adaptive_eq,
+        output_format: OutputFormat::Pcm24Wav,
+        ..Default::default()
+    };
+    assert_eq!(spawns_for(with_eq(true), 5.0), 4);
+    assert_eq!(spawns_for(with_eq(false), 5.0), 4);
+}
+
+#[test]
+#[ignore]
 fn skipping_normalization_removes_the_measurement_pass_only() {
     if skip_if_no_ffmpeg() {
         return;
@@ -178,8 +197,6 @@ fn silero_vad_costs_exactly_one_extra_process_in_either_pipeline() {
     let automixer = ProcessingOptions {
         target_lufs: Some(-16.0),
         automixer: true,
-        // The Automixer's voice EQ needs a source rate above 16 kHz; the 44.1
-        // kHz sine in `spawns_for` is fine.
         automixer_spectral_gate: true,
         trim_silence: true,
         trim_silence_vad: true,
@@ -217,6 +234,37 @@ fn a_quiet_take_costs_one_more_detection_pass() {
     process_single_file(&input, &input_base, &output_base, &opts, &ffmpeg_path()).unwrap();
     // 2 detection passes (the second with a gain) + the encode.
     assert_eq!(spawn_count(), 3);
+}
+
+#[test]
+#[ignore]
+fn normalization_runs_before_detection_so_a_quiet_take_needs_no_rescue_pass() {
+    if common::skip_if_no_vad() {
+        return;
+    }
+    // The same 0.005-amplitude take as above, now with a loudness target. The
+    // model hears the normalized audio, whose level clears the rescue
+    // threshold, so there is a single detection pass:
+    //   probe + loudnorm pass 1 + 1 detection + encode.
+    // Detection ahead of normalization would read the raw take, find it quiet
+    // and add the rescue pass (5).
+    let dir = tempfile::tempdir().unwrap();
+    let input_base = dir.path().join("in");
+    let output_base = dir.path().join("out");
+    std::fs::create_dir_all(&input_base).unwrap();
+    let input = input_base.join("quiet.wav");
+    common::write_sine_wav(&input, 5.0, 44100, 440.0, 0.005);
+
+    let opts = ProcessingOptions {
+        target_lufs: Some(-16.0),
+        trim_silence: true,
+        trim_silence_vad: true,
+        output_format: OutputFormat::Pcm24Wav,
+        ..Default::default()
+    };
+    reset_spawn_count();
+    process_single_file(&input, &input_base, &output_base, &opts, &ffmpeg_path()).unwrap();
+    assert_eq!(spawn_count(), 4);
 }
 
 #[test]

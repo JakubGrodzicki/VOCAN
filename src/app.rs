@@ -1402,12 +1402,13 @@ impl AudioBatchApp {
             .response
             .on_hover_text(
                 "Finds where the speech is instead of listening for a level, so room\n\
-                 noise and breaths no longer decide where the take starts.",
+                 noise no longer decides where the take starts. Errs toward keeping\n\
+                 audio: a breath or a click just before a line stays in.",
             );
             if vad_ready {
                 indented_hint(
                     ui,
-                    "Keeps 150 ms before the first word and 150 ms after the last, with a \
+                    "Keeps 150 ms before the first sound of the line and 150 ms after the last word, with a \
                      75 ms fade at each end, and cuts the rest. Pauses inside the line are \
                      kept. A file with no speech in it is left as it is. Costs one extra \
                      decode of each file (two for a very quiet one).",

@@ -13,9 +13,10 @@
 //! 1. [`detect_speech`] decodes the file to 16 kHz mono in **one extra ffmpeg
 //!    process** (two for a file that is quiet as a whole, which is decoded a
 //!    second time with a gain), streams it through the model frame by frame and
-//!    returns the first start and last end of speech. Only per-frame numbers are
-//!    kept, never the audio, so memory use grows by about a megabyte per
-//!    hour of audio.
+//!    returns the first start and last end of speech, with the start moved back
+//!    to where the sound leading into it begins ([`extend_start`]). Only per-frame
+//!    numbers are kept, never the audio, so memory use grows by about a megabyte
+//!    per hour of audio.
 //! 2. [`plan_trim`] widens that span by [`MARGIN_SECS`] on each side and works
 //!    out the fades.
 //! 3. [`trim_filter`] turns the plan into an `atrim`/`afade` filter string that
@@ -66,6 +67,29 @@ pub const MIN_SPEECH_SECS: f64 = 0.25;
 /// from the rest of the line on a pause the reference bridges, and the word
 /// would then be dropped as too short to count.
 pub const MIN_SILENCE_SECS: f64 = 0.100;
+/// The model is late on the opening of a take: on voice-acting takes it called
+/// the first 100-700 ms of loud voice "no speech" (a sigh, a hum, a first syllable),
+/// or scored a short first word high and had it dropped by [`MIN_SPEECH_SECS`].
+/// So the model only says *that* there is speech, and [`extend_start`] walks the
+/// start back over whatever is still sounding in front of it. A frame sounds when
+/// its peak is no more than this far under the level of the file...
+const ONSET_BELOW_LEVEL_DB: f32 = 40.0;
+/// ...and this far over the noise floor, so that on a noisy take the walk stops
+/// at the voice instead of running through the noise to the start of the file.
+const ONSET_ABOVE_NOISE_DB: f32 = 10.0;
+/// A frame this close under the level always sounds, whatever the noise floor
+/// says. A take that opens on the voice with no quiet in front of it has its
+/// "noise floor" on the voice, and must not lose that voice to it.
+const ONSET_ALWAYS_BELOW_LEVEL_DB: f32 = 10.0;
+/// A pause shorter than this does not stop the walk, so a first word set apart
+/// from the line stays with it. Generous on purpose: a trim that keeps a little
+/// too much costs the editor a moment, one that cuts a word loses it.
+const ONSET_MAX_GAP_SECS: f64 = 0.400;
+/// The percentile of the peaks in front of the model's start taken as the noise
+/// floor there. Only those frames count: the noise that matters is the noise the
+/// walk has to stop at, and a quiet stretch later in the file says nothing about
+/// it. Low, because a tightly cut take has only a few frames of it.
+const NOISE_PERCENTILE: f64 = 0.05;
 
 /// A file whose level is below this (-20 dBFS) is read a second time with a
 /// gain, see [`rescue_gain_db`].
@@ -107,13 +131,19 @@ fn rescue_gain_db(level: f32) -> Option<f32> {
 
 /// The 99th percentile of `peaks` (0 for an empty slice).
 fn level_of(peaks: &[f32]) -> f32 {
-    if peaks.is_empty() {
+    percentile(peaks, 0.99)
+}
+
+/// The value `q` of the way up the sorted `values` (0 for an empty slice).
+fn percentile(values: &[f32], q: f64) -> f32 {
+    if values.is_empty() {
         return 0.0;
     }
-    let mut sorted = peaks.to_vec();
+    let mut sorted = values.to_vec();
     sorted.sort_by(f32::total_cmp);
-    sorted[((sorted.len() - 1) as f64 * 0.99).floor() as usize]
+    sorted[((sorted.len() - 1) as f64 * q).floor() as usize]
 }
+
 /// Audio kept before the first and after the last speech.
 pub const MARGIN_SECS: f64 = 0.150;
 /// Length of the fade-in and fade-out. A fixed value, but never longer than the
@@ -228,6 +258,39 @@ pub fn speech_span(probs: &[f32], total_secs: f64) -> Option<SpeechSpan> {
         start: s as f64 * frame_secs(),
         end: (e as f64 * frame_secs()).min(total_secs),
     })
+}
+
+/// Moves the start of `span` back to where the sound leading into it begins.
+///
+/// `peaks` holds the peak of every model frame. The walk goes back from the
+/// start the model gave, frame by frame, and ends at the first pause longer than
+/// [`ONSET_MAX_GAP_SECS`]; the new start is the earliest sounding frame it saw.
+/// There is deliberately no limit on the distance: where the walk runs far, the
+/// worst outcome is a take with its opening left in for the editor to judge. The
+/// end of the span is left alone, the model is not late there.
+pub fn extend_start(span: SpeechSpan, peaks: &[f32]) -> SpeechSpan {
+    let anchor = ((span.start / frame_secs()).round() as usize).min(peaks.len());
+    let level = level_of(peaks);
+    let from_noise =
+        percentile(&peaks[..anchor], NOISE_PERCENTILE) * 10f32.powf(ONSET_ABOVE_NOISE_DB / 20.0);
+    let sounding = (level * 10f32.powf(-ONSET_BELOW_LEVEL_DB / 20.0))
+        .max(from_noise.min(level * 10f32.powf(-ONSET_ALWAYS_BELOW_LEVEL_DB / 20.0)));
+    let max_gap = (ONSET_MAX_GAP_SECS / frame_secs()).ceil() as usize;
+
+    let mut start = anchor;
+    for i in (0..anchor).rev() {
+        // `>`, not `>=`: with nearly all of a file digital silence the level can
+        // be zero, and zeros must not count as sound.
+        if peaks[i] > sounding {
+            start = i;
+        } else if start - i > max_gap {
+            break;
+        }
+    }
+    SpeechSpan {
+        start: start as f64 * frame_secs(),
+        end: span.end,
+    }
 }
 
 /// The cut and the fades, in seconds.
@@ -438,7 +501,7 @@ pub fn detect_speech_filtered(
 
     let total_secs = pass.samples as f64 / SAMPLE_RATE as f64;
     Ok(Detection {
-        span: speech_span(&pass.probs, total_secs),
+        span: speech_span(&pass.probs, total_secs).map(|s| extend_start(s, &pass.peaks)),
         total_secs,
     })
 }
@@ -447,6 +510,8 @@ pub fn detect_speech_filtered(
 struct Pass {
     /// Speech probability of every frame.
     probs: Vec<f32>,
+    /// Peak of every frame, for [`extend_start`].
+    peaks: Vec<f32>,
     /// Real samples decoded (the zero padding of the last frame excluded).
     samples: u64,
     /// The level of what the model was fed in this pass (see [`QUIET_LEVEL`]).
@@ -542,6 +607,7 @@ fn run_pass(
         probs,
         samples,
         level: level_of(&frame_peaks),
+        peaks: frame_peaks,
     })
 }
 
@@ -826,6 +892,76 @@ mod tests {
     #[test]
     fn hysteresis_a_middling_score_does_not_start_speech() {
         assert_eq!(speech_span(&run(0.35, 50), 50.0 * F), None);
+    }
+
+    // ---- extend_start -----------------------------------------------------
+
+    /// `extend_start` with the model's start at frame `anchor`; the new start,
+    /// in frames.
+    fn walked_from(anchor: usize, peaks: &[f32]) -> f64 {
+        let span = SpeechSpan {
+            start: anchor as f64 * F,
+            end: peaks.len() as f64 * F,
+        };
+        let walked = extend_start(span, peaks);
+        assert_eq!(walked.end, span.end, "the end is not touched");
+        walked.start / F
+    }
+
+    #[test]
+    fn the_start_moves_back_over_loud_sound_the_model_missed() {
+        let p = probs(&[(0.0005, 20), (0.5, 122)]);
+        assert!(near(walked_from(42, &p) * F, 20.0 * F));
+    }
+
+    #[test]
+    fn the_start_stays_put_when_nothing_sounds_in_front_of_it() {
+        let p = probs(&[(0.0005, 42), (0.5, 100)]);
+        assert!(near(walked_from(42, &p) * F, 42.0 * F));
+        // Speech from the very first frame: nowhere to go.
+        assert!(near(walked_from(0, &run(0.5, 50)) * F, 0.0));
+    }
+
+    #[test]
+    fn a_short_pause_does_not_stop_the_walk_and_a_long_one_does() {
+        // ceil(0.4 / 0.032) = 13 frames.
+        let bridged = probs(&[(0.0005, 20), (0.5, 2), (0.0005, 13), (0.5, 100)]);
+        assert!(near(walked_from(35, &bridged) * F, 20.0 * F));
+        let stopped = probs(&[(0.0005, 20), (0.5, 2), (0.0005, 14), (0.5, 100)]);
+        assert!(near(walked_from(36, &stopped) * F, 36.0 * F));
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_voice_on_a_noisy_take() {
+        // Noise 28 dB under the voice: well over the level limit, so only the
+        // noise floor keeps the walk from running to the start of the file.
+        let p = probs(&[(0.02, 60), (0.5, 70)]);
+        assert!(near(walked_from(70, &p) * F, 60.0 * F));
+    }
+
+    #[test]
+    fn the_noise_floor_is_the_one_in_front_of_the_speech() {
+        // Room tone in front, a far quieter stretch later: measured over the
+        // whole file the floor would sit under the room tone and the walk would
+        // run through it.
+        let p = probs(&[(0.02, 60), (0.5, 70), (0.0001, 40)]);
+        assert!(near(walked_from(70, &p) * F, 60.0 * F));
+    }
+
+    #[test]
+    fn a_take_that_opens_on_the_voice_keeps_it() {
+        // No quiet in front of the start, so the floor sits on the voice. The
+        // voice still counts as sound, all the way to the first frame.
+        let p = probs(&[(0.2, 30), (0.5, 100)]);
+        assert!(near(walked_from(30, &p) * F, 0.0));
+    }
+
+    #[test]
+    fn digital_silence_does_not_count_as_sound_even_when_the_level_is_zero() {
+        // Few enough speech frames for the 99th percentile to land on a zero.
+        let p = probs(&[(0.0, 950), (0.5, 9)]);
+        assert_eq!(level_of(&p), 0.0);
+        assert!(near(walked_from(950, &p) * F, 950.0 * F));
     }
 
     #[test]
@@ -1159,6 +1295,11 @@ mod tests {
         assert_eq!(START_THRESHOLD, 0.4);
         assert_eq!(END_THRESHOLD, 0.25);
         assert_eq!(MIN_SPEECH_SECS, 0.25);
+        assert_eq!(ONSET_BELOW_LEVEL_DB, 40.0);
+        assert_eq!(ONSET_ABOVE_NOISE_DB, 10.0);
+        assert_eq!(ONSET_ALWAYS_BELOW_LEVEL_DB, 10.0);
+        assert_eq!(ONSET_MAX_GAP_SECS, 0.400);
+        assert_eq!(NOISE_PERCENTILE, 0.05);
         assert_eq!(MARGIN_SECS, 0.150);
         assert_eq!(FADE_SECS, 0.075);
         assert_eq!(QUIET_LEVEL, 0.1); // -20 dBFS

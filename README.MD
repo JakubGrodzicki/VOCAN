@@ -62,8 +62,8 @@ The threshold trim judges volume. In a noisy room, the noise is louder than the 
 
 In this mode, VOCAN does this to each file:
 
-1. It finds where the first speech starts and where the last speech ends.
-2. It keeps 150 ms before the first speech and 150 ms after the last speech.
+1. It finds where the last speech ends and where the first speech starts, then moves that start back to the first sound leading into it. When in doubt it keeps audio, so a breath or a click just before the line stays in.
+2. It keeps 150 ms before that first sound and 150 ms after the last speech.
 3. It drops everything outside that span.
 4. It fades in and out over 75 ms at the two edges. The fades sit inside the 150 ms margins and never touch the speech.
 
@@ -238,7 +238,7 @@ Do these steps to process a folder of audio files:
 6. To cut the silence off the start and the end of every take, select the **Trim silence** checkbox. This option sits in the **Files** section, with the other settings that apply to every file. It works on its own — you do not need to enable the Automixer for it. Then set:
    - **Silence below**: what counts as silence. Safe (−60 dB), Recommended (−45 dB), Hard (−32 dB), or MAX (−21 dB). If the trim seems to do nothing, your recordings are noisier than the preset expects — move one step up.
    - **Keep**: how much of the original silence stays at each end. Tight (0 ms), Short (0.25 s), Medium (0.5 s), or Long (1 s).
-   - **Detect speech with Silero VAD**: instead of a volume threshold, find the speech with a model. VOCAN keeps 150 ms before the first speech and 150 ms after the last speech, with 75 ms fades at the edges, and does not trim or fade a file with no speech. This mode replaces **Silence below** and **Keep**. It is disabled, with a hint, when the model file is missing. Run the setup script again to download it.
+   - **Detect speech with Silero VAD**: instead of a volume threshold, find the speech with a model. VOCAN keeps 150 ms before the first sound leading into the speech and 150 ms after the last speech, with 75 ms fades at the edges, and does not trim or fade a file with no speech. This mode replaces **Silence below** and **Keep**. It is disabled, with a hint, when the model file is missing. Run the setup script again to download it.
 7. To enable the Automixer, select the **Automixer** checkbox. Then set the Automixer options:
    - **Intelligent noise removal (Spectral Gate)**: select only this option, or only the nnnoiseless option, not both.
    - **Noise reduction (nnnoiseless)**: select only this option, or only the spectral gate option, not both.
@@ -352,11 +352,12 @@ This is the second mode of **Trim silence**. It replaces the threshold filter ch
 2. **Hysteresis.** Speech starts when the probability reaches 0.4. Speech ends only after the probability has stayed below 0.25 for five frames in a row (160 ms). This is Silero's own rule: a pause closes the speech when a quiet frame lies 100 ms after the first quiet one. The two limits and the minimum pause stop a single weak frame, such as a stop consonant, from chopping a word in half.
 3. **Short bursts are ignored.** A speech burst shorter than 250 ms does not count. A click, a cough, or a chair creak cannot anchor the trim.
 4. **One span.** VOCAN takes the start of the first speech burst and the end of the last one. Pauses between them stay, so a breath or a dramatic pause inside a line comes through untouched.
-5. **Margins and fades.** VOCAN keeps 150 ms before the span and 150 ms after it. It applies a 75 ms fade-in at the start and a 75 ms fade-out at the end. Both fades sit inside the margins, so they never fall on speech. If the speech starts or ends closer than 75 ms to the edge of the file, that fade is only as long as the room that is there. Speech at the very first sample gets no fade-in.
-6. **No speech, no change.** If the model finds no speech, VOCAN does not trim or fade the file. Everything else you switched on, such as normalization or the Automixer, still applies. A take shorter than 250 ms counts as no speech. Stereo is mixed to mono for the detection, so a file whose channels cancel each other (opposite phase) also counts as no speech.
-7. **Final chain.** VOCAN adds `atrim` and `afade` to the FFmpeg chain that already writes the output. This works the same with the Automixer on and with the Automixer off. The rest of the audio is not changed.
+5. **The start moves back to the first sound.** The model is often late on the opening of a line: it can miss a sigh, a hum, or a first syllable, and a short first word falls under the 250 ms rule. So VOCAN walks back from the start of the span, over every frame that still sounds. A frame sounds when its peak is at most 40 dB under the level of the file and at least 10 dB over the noise floor in front of the speech (the 5th percentile of the per-frame peaks there). A frame within 10 dB of the level always sounds, so a take that opens on the voice keeps it. A pause of up to about 400 ms does not stop the walk, a longer one does. The end of the span is not moved. When in doubt, this errs toward keeping audio: a sound close in front of the line, such as a breath or a click, stays in for you to judge.
+6. **Margins and fades.** VOCAN keeps 150 ms before the span and 150 ms after it. It applies a 75 ms fade-in at the start and a 75 ms fade-out at the end. Both fades sit inside the margins, so they never fall on speech. If the speech starts or ends closer than 75 ms to the edge of the file, that fade is only as long as the room that is there. Speech at the very first sample gets no fade-in.
+7. **No speech, no change.** If the model finds no speech, VOCAN does not trim or fade the file. Everything else you switched on, such as normalization or the Automixer, still applies. A take shorter than 250 ms counts as no speech. Stereo is mixed to mono for the detection, so a file whose channels cancel each other (opposite phase) also counts as no speech.
+8. **Final chain.** VOCAN adds `atrim` and `afade` to the FFmpeg chain that already writes the output. This works the same with the Automixer on and with the Automixer off. The rest of the audio is not changed.
 
-**Cost.** One extra FFmpeg process per file, for the detection decode. VOCAN keeps only the per-frame probabilities, not the audio, so memory use grows by about one megabyte per hour of audio.
+**Cost.** One extra FFmpeg process per file, for the detection decode. VOCAN keeps only the per-frame probabilities and peaks, not the audio, so memory use grows by about one megabyte per hour of audio.
 
 **Quiet files.** The model judges speech partly by level, and a take recorded very quietly can be detected late, which would cut the start of the first word. So if the level of a file is below -20 dBFS, VOCAN decodes it a second time with a gain that brings that level to about -10 dBFS (at most +40 dB). The level is the 99th percentile of the per-frame peaks, not the single loudest sample, so one bump of the microphone does not hide that the take is quiet. Speech and pauses are raised together, so the model sees the same relation between them. This applies to the detection only. The audio that is written is never changed by it. A very quiet file therefore costs two extra FFmpeg processes instead of one.
 

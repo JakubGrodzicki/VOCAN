@@ -21,7 +21,7 @@
 //! The fixture is Silero's own `tests/data/test.wav`: 60 s of continuous
 //! conversational speech. Its boundaries are not guessed. They are what the
 //! model reports on it frame by frame, measured with the reference
-//! segmentation (threshold 0.4 to enter, 0.25 to leave) and pinned below, so a
+//! segmentation (threshold 0.5 to enter, 0.35 to leave) and pinned below, so a
 //! change in the decode, the framing, the context handling or the model version
 //! moves them and fails these tests:
 //!

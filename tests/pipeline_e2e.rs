@@ -730,3 +730,113 @@ fn trim_silence_reports_a_fully_silent_file_instead_of_writing_an_empty_one() {
         "nothing should have been written"
     );
 }
+
+/// Writes a 16-bit stereo WAV whose two channels carry the same sine
+/// (a "dual-mono" file, which is what most stereo voice recordings are).
+fn write_dual_mono_wav(path: &Path, secs: f32, sample_rate: u32, freq: f32, amp: f32) {
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(path, spec).unwrap();
+    let n = (secs * sample_rate as f32) as usize;
+    for i in 0..n {
+        let t = i as f32 / sample_rate as f32;
+        let s = ((2.0 * std::f32::consts::PI * freq * t).sin() * amp * i16::MAX as f32) as i16;
+        w.write_sample(s).unwrap();
+        w.write_sample(s).unwrap();
+    }
+    w.finalize().unwrap();
+}
+
+/// The audio line of `ffmpeg -i <file>`, e.g.
+/// `Audio: opus, 48000 Hz, mono, fltp`.
+fn audio_stream_line(path: &Path) -> String {
+    let out = std::process::Command::new(ffmpeg_path())
+        .args(["-hide_banner", "-nostdin", "-i"])
+        .arg(path)
+        .output()
+        .expect("run ffmpeg");
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .find(|l| l.contains("Audio:"))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Opus accepts only 8/12/16/24/48 kHz and is always written as mono. A 44.1 kHz
+/// stereo source must come out as `opus, 48000 Hz, mono` -- without the forced
+/// rate FFmpeg refuses to open the encoder -- and the downmix, which sits in the
+/// measured filter prefix, must leave the loudness on target and the peak
+/// below full scale in both pipelines.
+#[test]
+#[ignore]
+fn opus_from_a_stereo_44khz_source_is_48khz_mono_and_on_target() {
+    use vocan::ffmpeg::{get_file_stats, measure_peak_dbfs};
+
+    if skip_if_no_ffmpeg() {
+        return;
+    }
+    if !ffmpeg_has_encoder("libopus") {
+        eprintln!("SKIP: ffmpeg has no 'libopus' encoder in this environment");
+        return;
+    }
+
+    for (automixer, target_lufs) in [
+        (false, Some(-16.0)),
+        (true, Some(-16.0)),
+        (false, None),
+        (true, None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let input_base = dir.path().join("in");
+        let output_base = dir.path().join("out");
+        std::fs::create_dir_all(&input_base).unwrap();
+        let input_path = input_base.join("tone.wav");
+        write_dual_mono_wav(&input_path, 5.0, 44100, 440.0, 0.3);
+
+        let mut opts = base_opts();
+        opts.output_format = OutputFormat::Opus;
+        opts.bitrate_kbps = 32;
+        opts.automixer = automixer;
+        opts.target_lufs = target_lufs;
+
+        process_single_file(
+            &input_path,
+            &input_base,
+            &output_base,
+            &opts,
+            &ffmpeg_path(),
+        )
+        .unwrap_or_else(|e| panic!("automixer={automixer}: processing failed: {e}"));
+
+        let out = output_base.join("tone.opus");
+        let line = audio_stream_line(&out);
+        assert!(
+            line.contains("opus") && line.contains("48000 Hz") && line.contains("mono"),
+            "automixer={automixer}: unexpected stream: {line}"
+        );
+
+        // Without a LUFS target nothing normalizes the level, so only the
+        // stream shape is meaningful.
+        if let Some(target) = target_lufs {
+            let stats = get_file_stats(&out, &ffmpeg_path(), target, None)
+                .expect("ffmpeg ok")
+                .expect("stats for a 5s tone");
+            let lufs: f32 = stats.input_i.parse().expect("integrated loudness");
+            assert!(
+                (lufs - target).abs() < 1.5,
+                "automixer={automixer}: loudness {lufs} LUFS is off the {target} target"
+            );
+        }
+        // The Automixer's compressor makeup lands a pure tone on 0 dBFS even in a
+        // PCM file when nothing normalizes it, so the peak is only checked when
+        // there is a target.
+        if target_lufs.is_some() {
+            let peak = measure_peak_dbfs(&out, &ffmpeg_path(), None).expect("peak");
+            assert!(peak < 0.0, "automixer={automixer}: peak {peak} dBFS clips");
+        }
+    }
+}

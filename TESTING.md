@@ -107,7 +107,8 @@ here. Before a release, or after any GUI-adjacent change, run through:
    nnnoiseless -- mutually exclusive in the UI --, DFN3 dereverb + mix/post-filter,
    Downward Expander with Safety Margin % and each Reduction profile).
 6. Pick each Output Format in turn; confirm the bitrate field only appears
-   for MP3/OGG.
+   for MP3/OGG/Opus. For Opus, confirm the compatibility warning is shown, the
+   list is 16-256 kbps, and switching from MP3 at 320 lands on a valid value.
 7. Click "START PROCESSING" on a small folder; watch the progress bar and
    log pane (colors: red for `[ERROR]` lines).
 8. Click "Stop" mid-run; confirm it actually stops and the UI returns to an

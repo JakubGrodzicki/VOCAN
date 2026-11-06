@@ -76,9 +76,9 @@ pub struct AudioBatchApp {
     /// Whether the DeepFilterNet3 binary that Dereverb runs is present. Looked
     /// up once at startup, like `vad_available`.
     dfn3_available: bool,
-    /// Output format selector (ADPCM, PCM, FLAC, MP3, OGG).
+    /// Output format selector (ADPCM, PCM, FLAC, MP3, OGG, Opus).
     output_format: OutputFormat,
-    /// Bitrate for lossy formats (MP3, OGG).
+    /// Bitrate for lossy formats (MP3, OGG, Opus).
     bitrate_kbps: u32,
     is_processing: bool,
     is_analyzing: bool,
@@ -1152,6 +1152,7 @@ fn format_short(format: OutputFormat, bitrate: u32) -> String {
         OutputFormat::Flac => "FLAC".to_owned(),
         OutputFormat::Mp3 => format!("MP3 {bitrate}k"),
         OutputFormat::Ogg => format!("OGG {bitrate}k"),
+        OutputFormat::Opus => format!("Opus {bitrate}k"),
     }
 }
 
@@ -1252,6 +1253,17 @@ impl AudioBatchApp {
                     });
             });
 
+            // A bitrate the new format does not offer (320 on Opus, 16 on MP3)
+            // would show as selected while matching no entry in the list.
+            if self.output_format.needs_bitrate()
+                && !self
+                    .output_format
+                    .bitrate_options()
+                    .contains(&self.bitrate_kbps)
+            {
+                self.bitrate_kbps = self.output_format.default_bitrate();
+            }
+
             if self.output_format.needs_bitrate() {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -1267,7 +1279,7 @@ impl AudioBatchApp {
                         .width(combo_w - 8.0)
                         .selected_text(format!("{} kbps", self.bitrate_kbps))
                         .show_ui(ui, |ui| {
-                            for &b in &[36, 48, 64, 128, 256, 320] {
+                            for &b in self.output_format.bitrate_options() {
                                 ui.selectable_value(&mut self.bitrate_kbps, b, format!("{b} kbps"));
                             }
                         });
@@ -1278,9 +1290,24 @@ impl AudioBatchApp {
                 ui.add_space(9.0);
                 widgets::hint(ui, "Suggested for video game voice-over");
             }
+
+            if self.output_format == OutputFormat::Opus {
+                ui.add_space(9.0);
+                widgets::hint(ui, "Always mono, tuned for speech");
+            }
         });
 
-        if self.output_format.needs_bitrate() && self.bitrate_kbps <= 48 {
+        if self.output_format == OutputFormat::Opus {
+            ui.add_space(12.0);
+            widgets::notice(
+                ui,
+                "Opus is not supported by every player, game engine or platform. \
+                 Before exporting, check that the medium this audio is for can \
+                 play .opus files.",
+            );
+        }
+
+        if self.output_format.is_low_bitrate(self.bitrate_kbps) {
             ui.add_space(12.0);
             widgets::notice(
                 ui,
@@ -2503,7 +2530,7 @@ mod tests {
         assert!(!app.is_processing);
         assert!(!app.is_analyzing);
         assert_eq!(app.average_lufs, None);
-        assert_eq!(app.output_format, OutputFormat::AdpcmWav);
+        assert_eq!(app.output_format, OutputFormat::Pcm24Wav);
         assert_eq!(
             app.automixer_expander_reduction_profile,
             ReductionProfile::Recommended

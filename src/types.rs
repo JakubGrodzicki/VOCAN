@@ -187,19 +187,20 @@ pub enum AppMsg {
 
 /// Output container/codec selection.
 ///
-/// `AdpcmWav` is the default and the original behaviour of VOCAN -- it produces
-/// 4-bit IMA ADPCM WAV files, the smallest practical format for game voice-over.
+/// `Pcm24Wav` is the default -- 24-bit PCM WAV, the industry-standard bit depth
+/// for professional audio.
 ///
-/// The other variants let users re-normalize or export without the lossy 4-bit
-/// quantization step, or pick a different distribution format.
+/// `AdpcmWav` produces 4-bit IMA ADPCM WAV files, the smallest practical format
+/// for game voice-over, at the cost of lossy 4-bit quantization. The other
+/// variants pick a different distribution format.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum OutputFormat {
-    /// 4-bit IMA ADPCM WAV -- suggested for video game voice-over (default).
-    #[default]
+    /// 4-bit IMA ADPCM WAV -- suggested for video game voice-over.
     AdpcmWav,
     /// 16-bit PCM WAV -- universal compatibility.
     Pcm16Wav,
-    /// 24-bit PCM WAV -- industry-standard bit depth for professional audio.
+    /// 24-bit PCM WAV -- industry-standard bit depth for professional audio (default).
+    #[default]
     Pcm24Wav,
     /// FLAC -- lossless compression.
     Flac,
@@ -207,6 +208,8 @@ pub enum OutputFormat {
     Mp3,
     /// OGG Vorbis -- lossy, good quality at low bitrates.
     Ogg,
+    /// Opus -- lossy, the smallest files for speech. Always mono, always 48 kHz.
+    Opus,
 }
 
 impl OutputFormat {
@@ -219,6 +222,7 @@ impl OutputFormat {
             Self::Flac => "flac",
             Self::Mp3 => "libmp3lame",
             Self::Ogg => "libvorbis",
+            Self::Opus => "libopus",
         }
     }
 
@@ -229,12 +233,48 @@ impl OutputFormat {
             Self::Flac => "flac",
             Self::Mp3 => "mp3",
             Self::Ogg => "ogg",
+            Self::Opus => "opus",
         }
     }
 
     /// Returns `true` if this format is lossy and needs a bitrate argument.
     pub fn needs_bitrate(&self) -> bool {
-        matches!(self, Self::Mp3 | Self::Ogg)
+        matches!(self, Self::Mp3 | Self::Ogg | Self::Opus)
+    }
+
+    /// Returns `true` if the encoder is always fed a single channel.
+    ///
+    /// At 16-32 kbps a stereo stream splits the bit budget between two
+    /// channels, which audibly hurts speech.
+    pub fn forces_mono(&self) -> bool {
+        matches!(self, Self::Opus)
+    }
+
+    /// Bitrates (kbps) offered in the UI for this format; empty for formats
+    /// without a bitrate setting.
+    pub fn bitrate_options(&self) -> &'static [u32] {
+        match self {
+            Self::Mp3 | Self::Ogg => &[36, 48, 64, 128, 256, 320],
+            Self::Opus => &[16, 20, 24, 32, 48, 64, 96, 128, 256],
+            _ => &[],
+        }
+    }
+
+    /// Bitrate selected when the current one is not offered by this format.
+    pub fn default_bitrate(&self) -> u32 {
+        match self {
+            Self::Opus => 32,
+            _ => 128,
+        }
+    }
+
+    /// `true` when `kbps` is low enough that the result needs a listening check.
+    pub fn is_low_bitrate(&self, kbps: u32) -> bool {
+        match self {
+            Self::Mp3 | Self::Ogg => kbps <= 48,
+            Self::Opus => kbps <= 24,
+            _ => false,
+        }
     }
 
     /// Human-readable label for the UI dropdown.
@@ -246,6 +286,7 @@ impl OutputFormat {
             Self::Flac => "FLAC (lossless)",
             Self::Mp3 => "MP3",
             Self::Ogg => "OGG Vorbis",
+            Self::Opus => "Opus (smallest files for speech)",
         }
     }
 
@@ -258,6 +299,7 @@ impl OutputFormat {
             Self::Flac,
             Self::Mp3,
             Self::Ogg,
+            Self::Opus,
         ]
     }
 }
@@ -307,7 +349,7 @@ pub struct ProcessingOptions {
     /// `trim_silence` is off. See `crate::vad`.
     pub trim_silence_vad: bool,
     pub output_format: OutputFormat,
-    /// Bitrate in kbps for lossy formats (MP3, OGG). Ignored for lossless.
+    /// Bitrate in kbps for lossy formats (MP3, OGG, Opus). Ignored for lossless.
     pub bitrate_kbps: u32,
     /// Optional channel back to the UI log, for conditions the caller should
     /// see but that are not errors -- currently only the memory gate making a
@@ -344,7 +386,7 @@ impl Default for ProcessingOptions {
             trim_silence_threshold: SilenceThreshold::Recommended,
             trim_silence_pad: SilencePad::Tight,
             trim_silence_vad: false,
-            output_format: OutputFormat::AdpcmWav,
+            output_format: OutputFormat::Pcm24Wav,
             bitrate_kbps: 128,
             log: None,
         }
@@ -457,6 +499,7 @@ mod tests {
             (OutputFormat::Flac, "flac", "flac", false),
             (OutputFormat::Mp3, "mp3", "libmp3lame", true),
             (OutputFormat::Ogg, "ogg", "libvorbis", true),
+            (OutputFormat::Opus, "opus", "libopus", true),
         ];
         for (format, extension, codec, needs_bitrate) in cases {
             assert_eq!(format.extension(), *extension, "{format:?} extension");
@@ -471,11 +514,65 @@ mod tests {
 
     #[test]
     fn output_format_all_lists_every_variant_once() {
-        assert_eq!(OutputFormat::all().len(), 6);
+        assert_eq!(OutputFormat::all().len(), 7);
     }
 
     #[test]
-    fn output_format_default_is_adpcm_wav() {
-        assert_eq!(OutputFormat::default(), OutputFormat::AdpcmWav);
+    fn bitrate_options_exist_exactly_for_formats_that_need_a_bitrate() {
+        for &format in OutputFormat::all() {
+            assert_eq!(
+                !format.bitrate_options().is_empty(),
+                format.needs_bitrate(),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn opus_offers_the_requested_bitrates() {
+        let opts = OutputFormat::Opus.bitrate_options();
+        for kbps in [16, 20, 24, 32, 64, 128, 256] {
+            assert!(opts.contains(&kbps), "{kbps}");
+        }
+        assert!(opts.windows(2).all(|w| w[0] < w[1]), "ascending: {opts:?}");
+    }
+
+    #[test]
+    fn default_bitrate_is_offered_by_every_lossy_format() {
+        for &format in OutputFormat::all() {
+            if format.needs_bitrate() {
+                assert!(
+                    format.bitrate_options().contains(&format.default_bitrate()),
+                    "{format:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn low_bitrate_threshold_keeps_mp3_and_ogg_behaviour() {
+        assert!(OutputFormat::Mp3.is_low_bitrate(48));
+        assert!(!OutputFormat::Mp3.is_low_bitrate(64));
+        assert!(OutputFormat::Ogg.is_low_bitrate(36));
+        assert!(!OutputFormat::Ogg.is_low_bitrate(64));
+        assert!(OutputFormat::Opus.is_low_bitrate(24));
+        assert!(!OutputFormat::Opus.is_low_bitrate(32));
+        assert!(!OutputFormat::Flac.is_low_bitrate(1));
+    }
+
+    #[test]
+    fn only_opus_forces_mono() {
+        for &format in OutputFormat::all() {
+            assert_eq!(
+                format.forces_mono(),
+                format == OutputFormat::Opus,
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_format_default_is_pcm24_wav() {
+        assert_eq!(OutputFormat::default(), OutputFormat::Pcm24Wav);
     }
 }

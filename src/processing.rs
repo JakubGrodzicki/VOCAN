@@ -457,7 +457,9 @@ fn norm_result(decision: &NormDecision) -> NormResult {
 /// Adds codec and bitrate arguments to the FFmpeg command based on the output format.
 fn add_format_args(cmd: &mut std::process::Command, format: OutputFormat, bitrate_kbps: u32) {
     cmd.args(["-c:a", format.ffmpeg_codec()]);
-    if format.needs_bitrate() {
+    if format == OutputFormat::Opus {
+        add_opus_args(cmd, bitrate_kbps);
+    } else if format.needs_bitrate() {
         if format == OutputFormat::Ogg && bitrate_kbps <= 36 {
             cmd.args(["-q:a", "-1"]);
         } else if format == OutputFormat::Ogg && bitrate_kbps <= 48 {
@@ -466,6 +468,55 @@ fn add_format_args(cmd: &mut std::process::Command, format: OutputFormat, bitrat
             cmd.args(["-b:a", &format!("{}k", bitrate_kbps)]);
         }
     }
+}
+
+/// Opus is encoded with `-application voip` up to this bitrate and `audio`
+/// above it. Provisional: `voip` biases libopus towards SILK/hybrid, which
+/// should suit speech at low rates, but that is to be confirmed by ear. Flip
+/// `OPUS_LOW_RATE_APPLICATION` to "audio" if it does not sound more natural.
+const OPUS_VOIP_MAX_KBPS: u32 = 48;
+const OPUS_LOW_RATE_APPLICATION: &str = "voip";
+
+/// Filter that turns whatever the source has into one channel. It belongs in
+/// the filter prefix that the loudness measurement also sees, so that
+/// normalization corrects whatever level the downmix produces (a bare `-ac 1`
+/// at encode time would run after the loudnorm and peak limiting).
+/// `aformat` rather than `pan=mono|...c1`, which fails on mono sources.
+const MONO_DOWNMIX_FILTER: &str = "aformat=channel_layouts=mono";
+
+/// Flags that make the smallest Opus file that still sounds natural for speech.
+///
+/// - `-vbr on`: full VBR, the best quality per byte.
+/// - `-frame_duration 60` at low rates: fewer packets, so less TOC/Ogg overhead.
+/// - `-compression_level 10`: maximum encoder effort; the files are short.
+/// - `-ac 1`: safety net; the mono conversion itself is in the filter prefix.
+/// - `-ar 48000`: libopus rejects anything but 8/12/16/24/48 kHz, and the
+///   pipeline has already appended `-ar <source rate>` (the last `-ar` wins).
+/// - no metadata and bitexact muxing: drops input tags and the Lavf version.
+fn add_opus_args(cmd: &mut std::process::Command, bitrate_kbps: u32) {
+    let low_rate = bitrate_kbps <= OPUS_VOIP_MAX_KBPS;
+    cmd.args(["-b:a", &format!("{}k", bitrate_kbps)]);
+    cmd.args(["-vbr", "on", "-compression_level", "10"]);
+    cmd.args([
+        "-application",
+        if low_rate {
+            OPUS_LOW_RATE_APPLICATION
+        } else {
+            "audio"
+        },
+    ]);
+    if low_rate {
+        cmd.args(["-frame_duration", "60"]);
+    }
+    cmd.args(["-ac", "1", "-ar", "48000"]);
+    cmd.args([
+        "-map_metadata",
+        "-1",
+        "-fflags",
+        "+bitexact",
+        "-flags:a",
+        "+bitexact",
+    ]);
 }
 
 /// The scratch name the encoder writes to before the result is committed.
@@ -1038,10 +1089,21 @@ pub fn process_single_file(
     // Silero VAD is not part of the prefix: it is cut from the *normalized*
     // take, so it follows the normalization instead (see below), and the
     // measurements see the whole take.
-    let trim_prefix = match &trim {
-        Trim::Threshold(chain) => Some(chain.as_str()),
-        Trim::Off | Trim::Vad(_) => None,
-    };
+    //
+    // For a format that is always mono the downmix leads the prefix, for the
+    // same reason: every measurement and the encode must hear the mono signal.
+    let mono = opts
+        .output_format
+        .forces_mono()
+        .then(|| MONO_DOWNMIX_FILTER.to_string());
+    let prefix_owned = join_filters(
+        mono.clone(),
+        match &trim {
+            Trim::Threshold(chain) => Some(chain.clone()),
+            Trim::Off | Trim::Vad(_) => None,
+        },
+    );
+    let trim_prefix = prefix_owned.as_deref();
 
     let norm_result = if let Some(lufs) = opts.target_lufs {
         // One probe process yields both values; they come from the same stderr.
@@ -1079,9 +1141,12 @@ pub fn process_single_file(
         //
         // Nothing is normalized, so the model hears the file as it is.
         let cut = match &trim {
-            Trim::Threshold(chain) => Some(chain.clone()),
-            Trim::Vad(model) => vad_trim_chain(input, input, model, None, ffmpeg, opts)?,
-            Trim::Off => None,
+            Trim::Threshold(_) => prefix_owned.clone(),
+            Trim::Vad(model) => join_filters(
+                mono.clone(),
+                vad_trim_chain(input, input, model, None, ffmpeg, opts)?,
+            ),
+            Trim::Off => mono.clone(),
         };
         if let Some(cut) = cut {
             cmd.args(["-af", &cut]);
@@ -1197,6 +1262,75 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn format_args_of(format: OutputFormat, kbps: u32) -> Vec<String> {
+        let mut cmd = Command::new("ffmpeg");
+        add_format_args(&mut cmd, format, kbps);
+        args_of(&cmd)
+    }
+
+    fn has_pair(args: &[String], key: &str, value: &str) -> bool {
+        args.windows(2).any(|w| w[0] == key && w[1] == value)
+    }
+
+    #[test]
+    fn opus_at_a_low_bitrate_uses_voip_long_frames_mono_and_48khz() {
+        let a = format_args_of(OutputFormat::Opus, 16);
+        assert!(has_pair(&a, "-c:a", "libopus"), "{a:?}");
+        assert!(has_pair(&a, "-b:a", "16k"), "{a:?}");
+        assert!(has_pair(&a, "-vbr", "on"), "{a:?}");
+        assert!(has_pair(&a, "-compression_level", "10"), "{a:?}");
+        assert!(
+            has_pair(&a, "-application", OPUS_LOW_RATE_APPLICATION),
+            "{a:?}"
+        );
+        assert!(has_pair(&a, "-frame_duration", "60"), "{a:?}");
+        assert!(has_pair(&a, "-ac", "1"), "{a:?}");
+        assert!(has_pair(&a, "-ar", "48000"), "{a:?}");
+        assert!(has_pair(&a, "-map_metadata", "-1"), "{a:?}");
+        assert!(has_pair(&a, "-fflags", "+bitexact"), "{a:?}");
+    }
+
+    #[test]
+    fn opus_at_a_high_bitrate_uses_audio_and_default_frames() {
+        let a = format_args_of(OutputFormat::Opus, 128);
+        assert!(has_pair(&a, "-b:a", "128k"), "{a:?}");
+        assert!(has_pair(&a, "-application", "audio"), "{a:?}");
+        assert!(!a.contains(&"-frame_duration".to_string()), "{a:?}");
+        // The sample rate is forced at every bitrate: libopus rejects 44.1 kHz.
+        assert!(has_pair(&a, "-ar", "48000"), "{a:?}");
+    }
+
+    #[test]
+    fn opus_forces_the_sample_rate_after_the_one_the_pipeline_appended() {
+        // The last `-ar` wins in FFmpeg, so ours must come after the source rate.
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-ar", "44100"]);
+        add_format_args(&mut cmd, OutputFormat::Opus, 24);
+        let a = args_of(&cmd);
+        let last_ar = a.iter().rposition(|x| x == "-ar").unwrap();
+        assert_eq!(a[last_ar + 1], "48000", "{a:?}");
+    }
+
+    #[test]
+    fn mp3_and_ogg_format_args_are_unchanged() {
+        assert_eq!(
+            format_args_of(OutputFormat::Mp3, 64),
+            ["-c:a", "libmp3lame", "-b:a", "64k"]
+        );
+        assert_eq!(
+            format_args_of(OutputFormat::Ogg, 36),
+            ["-c:a", "libvorbis", "-q:a", "-1"]
+        );
+        assert_eq!(
+            format_args_of(OutputFormat::Ogg, 48),
+            ["-c:a", "libvorbis", "-q:a", "0"]
+        );
+        assert_eq!(
+            format_args_of(OutputFormat::Ogg, 128),
+            ["-c:a", "libvorbis", "-b:a", "128k"]
+        );
     }
 
     #[test]

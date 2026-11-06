@@ -10,7 +10,7 @@ VOCAN applies these processes to each audio file:
 - Dereverberation
 - Loudness normalization
 
-VOCAN writes the output files in a format that you select. The default format is 4-bit IMA ADPCM WAV. VOCAN can also write PCM, FLAC, MP3, and OGG files.
+VOCAN writes the output files in a format that you select. The default format is 24-bit PCM WAV. VOCAN can also write PCM, FLAC, MP3, OGG, and Opus files.
 
 VOCAN is written in Rust. The graphical interface uses the `egui` library. VOCAN sends the audio encoding tasks to FFmpeg and, for some tasks, to external DSP tools. VOCAN also has its own DSP modules for the spectral gate, the equalizer, and the expander.
 
@@ -90,12 +90,13 @@ The Automixer applies these processes, in this order:
 
 VOCAN can write these formats:
 
-- 4-bit IMA ADPCM WAV. This is the default format. Use this format for game voice-over.
+- 4-bit IMA ADPCM WAV. Use this format for game voice-over.
 - 16-bit PCM WAV.
-- 24-bit PCM WAV. This is the standard bit depth for professional audio work.
+- 24-bit PCM WAV. This is the default format. It is the standard bit depth for professional audio work.
 - FLAC. This format uses lossless compression.
-- MP3. You can set the bitrate, from 64 to 320 kbps.
-- OGG Vorbis. You can set the bitrate, from 64 to 320 kbps.
+- MP3. You can set the bitrate, from 36 to 320 kbps.
+- OGG Vorbis. You can set the bitrate, from 36 to 320 kbps.
+- Opus. You can set the bitrate, from 16 to 256 kbps. This format gives the smallest files for speech. VOCAN always writes Opus as mono at 48 kHz, strips the metadata, and tunes the encoder for speech. Not every player, game engine or platform can play Opus, so check that the medium for your audio supports it.
 
 ### Analysis mode
 
@@ -234,7 +235,7 @@ Do these steps to process a folder of audio files:
 2. Set the source folder and the output folder.
 3. To measure the average loudness of the source files, click **Analyze folder loudness...**. To apply this value as the target, click **Set as target**.
 4. To enable loudness normalization, select the **Normalize volume** checkbox. Set the target LUFS value and the target peak dBFS value. VOCAN uses the target peak value only as a fallback, when the LUFS measurement fails.
-5. Select an output format. If you select MP3 or OGG, also set the bitrate.
+5. Select an output format. If you select MP3, OGG or Opus, also set the bitrate.
 6. To cut the silence off the start and the end of every take, select the **Trim silence** checkbox. This option sits in the **Files** section, with the other settings that apply to every file. It works on its own — you do not need to enable the Automixer for it. Then set:
    - **Silence below**: what counts as silence. Safe (−60 dB), Recommended (−45 dB), Hard (−32 dB), or MAX (−21 dB). If the trim seems to do nothing, your recordings are noisier than the preset expects — move one step up.
    - **Keep**: how much of the original silence stays at each end. Tight (0 ms), Short (0.25 s), Medium (0.5 s), or Long (1 s).
@@ -279,7 +280,7 @@ It also includes tests for Silero VAD speech detection. These tests need the mod
 
 When Automixer is on, each file goes through a pipeline of Rust steps and FFmpeg steps. Every Rust DSP step uses mono, 32-bit float audio.
 
-VOCAN runs the Rust chain at the **source sample rate**. Two steps are the exception: nnnoiseless and DeepFilterNet3 are models trained at 48 kHz and require it. When you enable either one, VOCAN converts the whole Rust chain to 48 kHz instead. VOCAN restores the original sample rate at the final encoding step in every case. This means a 44.1 kHz file with neither of those two steps enabled is never resampled at all.
+VOCAN runs the Rust chain at the **source sample rate**. Two steps are the exception: nnnoiseless and DeepFilterNet3 are models trained at 48 kHz and require it. When you enable either one, VOCAN converts the whole Rust chain to 48 kHz instead. VOCAN restores the original sample rate at the final encoding step in every case, with one exception: Opus can only be written at 48 kHz (and VOCAN writes it as mono), so Opus files are always 48 kHz. This means a 44.1 kHz file with neither of those two steps enabled is never resampled at all.
 
 1. **De-esser**: the FFmpeg `deesser` filter (`i=0.4:m=0.5:f=0.5:s=o`) processes the file. FFmpeg sends the output to Rust, as mono f32le audio at the pipeline rate described above. If nothing comes back at all — the file was silent from end to end, and the trim removed all of it — VOCAN fails that file with an error instead of writing an empty output.
 2. **Noise floor estimation**: this step runs only when the expander is on. VOCAN measures the windowed RMS level of the signal. The window is 25 ms long, with 50% overlap and a Hann shape. VOCAN normalizes the windowed energy by the sum of squares of the window itself, so the result is a true RMS level. VOCAN takes the 12th percentile of the result. This step runs on the signal after the de-esser step and before the dereverb step. This order stops the dereverb step from changing the noise floor estimate. If the file is too short or too quiet, VOCAN skips the expander step for that file.
@@ -304,7 +305,7 @@ VOCAN runs the Rust chain at the **source sample rate**. Two steps are the excep
    - A compressor. The threshold is about −12 dBFS. The ratio is 4:1. The attack time is 5 ms. The release time is 80 ms. The makeup gain is 4 dB.
    - The **silence trim**, if it is on. It comes last in this chain, so the threshold judges the signal after every cleaning step has finished with it. See "Silence trimming" below.
 8. **Normalization**: VOCAN uses the two-pass linear EBU R128 method, with padding for short files, or peak normalization. See "Loudness normalization fallback" below. VOCAN measures the pass-1 stats on the processed temporary WAV file. This method keeps the pass-1 measurement and the pass-2 normalization on the same signal.
-9. **Encoding**: VOCAN writes the file in the format that you selected. VOCAN restores the original sample rate.
+9. **Encoding**: VOCAN writes the file in the format that you selected. VOCAN restores the original sample rate (Opus is always 48 kHz mono).
 
 ### Silence trimming
 

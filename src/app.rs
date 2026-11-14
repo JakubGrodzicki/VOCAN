@@ -857,23 +857,30 @@ impl eframe::App for AudioBatchApp {
             .show(ctx, |ui| {
                 self.ui_pane_header(ui);
                 let section = self.section;
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .id_source("pane_scroll")
-                    .show(ui, |ui| {
-                        // Settings are visible but not editable while a batch
-                        // runs. The log is exempt: it is the one thing the user
-                        // has any reason to interact with mid-run.
-                        ui.add_enabled_ui(!self.is_processing || section == Section::Logs, |ui| {
-                            match section {
-                                Section::Files => self.ui_files(ui),
-                                Section::CleanUp => self.ui_cleanup(ui),
-                                Section::Loudness => self.ui_loudness(ui, ctx),
-                                Section::Logs => self.ui_logs(ui),
-                            }
+                if section == Section::Logs {
+                    // The log pane scrolls itself and fills the rest of the
+                    // pane. Nesting it in `pane_scroll` gives it unbounded
+                    // height, which produced a second, outer scrollbar.
+                    self.ui_logs(ui);
+                } else {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .id_source("pane_scroll")
+                        .show(ui, |ui| {
+                            // Settings are visible but not editable while a batch
+                            // runs.
+                            ui.add_enabled_ui(!self.is_processing, |ui| {
+                                match section {
+                                    Section::Files => self.ui_files(ui),
+                                    Section::CleanUp => self.ui_cleanup(ui),
+                                    Section::Loudness => self.ui_loudness(ui, ctx),
+                                    // Handled above.
+                                    Section::Logs => {}
+                                }
+                            });
+                            ui.add_space(14.0);
                         });
-                        ui.add_space(14.0);
-                    });
+                }
             });
     }
 }
@@ -1764,23 +1771,28 @@ impl AudioBatchApp {
             return;
         }
 
-        egui::Frame::none()
-            .fill(theme::INPUT)
-            .stroke(egui::Stroke::new(1.0, theme::LINE))
-            .rounding(egui::Rounding::same(theme::R_CARD))
-            .inner_margin(egui::Margin::symmetric(4.0, 8.0))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .id_source("log_scroll")
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        for log in &self.logs {
-                            log_line(ui, log);
-                        }
-                    });
-            });
+        // Fill the pane down to a 14px bottom gap, the same space the outer
+        // scroll area used to leave, so the log box stays inside the window.
+        let height = (ui.available_height() - 14.0).max(0.0);
+        ui.allocate_ui(egui::vec2(ui.available_width(), height), |ui| {
+            egui::Frame::none()
+                .fill(theme::INPUT)
+                .stroke(egui::Stroke::new(1.0, theme::LINE))
+                .rounding(egui::Rounding::same(theme::R_CARD))
+                .inner_margin(egui::Margin::symmetric(4.0, 8.0))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .id_source("log_scroll")
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            for log in &self.logs {
+                                log_line(ui, log);
+                            }
+                        });
+                });
+        });
     }
 
     // -----------------------------------------------------------------------
